@@ -1,0 +1,35 @@
+# LakeLens app runtime config.
+#
+# When deployed via the Databricks Asset Bundle (../databricks.yml), the bundle's
+# `config.env` OVERRIDES the values here — so you normally set warehouse/catalog in
+# databricks.yml (or via --var), not in this file. This file is the fallback for a
+# plain `databricks apps deploy` (no bundle) and documents the env the app reads.
+command:
+  - uvicorn
+  - app:app
+  - --host
+  - "0.0.0.0"
+  - --port
+  - "8000"
+
+env:
+  # REQUIRED — the SQL warehouse the app runs every query against.
+  #   databricks warehouses list
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: ""            # set by the bundle; or fill in for a non-bundle deploy
+  # REQUIRED — a catalog the app's users can CREATE in (persists scans + the Genie
+  # space id). e.g. a dedicated `lakelens` catalog, or `main`. If empty, the app still
+  # runs but scan results aren't shared/persisted.
+  - name: RESULTS_CATALOG
+    value: ""
+  - name: RESULTS_SCHEMA
+    value: "lakelens"
+  # Model-serving endpoint for the plain-English explainers (a cheap tier is plenty).
+  #   databricks serving-endpoints list
+  - name: AI_ENDPOINT
+    value: "databricks-gpt-5-4-mini"
+  # Published DBU/1M-token rate (input,output) for that endpoint — used to price the
+  # scan's own ai_query cost from the rate card. Override if you point AI_ENDPOINT
+  # at a pricier model.
+  - name: AI_ENDPOINT_DBU
+    value: "7.5,30"

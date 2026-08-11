@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="LakeLens">
+  <!-- LakeLens mark: ascending lakehouse-layer bars (data/cost stacking up) examined by a
+       magnifying lens — "a lens on your lakehouse cost". Navy base + Lava, crisp at 28px. -->
+  <!-- the stacked layers (same DNA as before, so the rebrand still reads as the same product) -->
+  <rect x="3"  y="20" width="20" height="3.6" rx="1.8" fill="#0B2026"/>
+  <rect x="5"  y="14.4" width="15" height="3.6" rx="1.8" fill="#FF3621"/>
+  <rect x="7"  y="8.8"  width="10" height="3.6" rx="1.8" fill="#FF3621" opacity="0.72"/>
+  <!-- the lens: ring + handle, overlaid lower-right, examining the layers -->
+  <circle cx="21" cy="17" r="6.4" fill="none" stroke="#0B2026" stroke-width="2.6"/>
+  <circle cx="21" cy="17" r="6.4" fill="none" stroke="#FF3621" stroke-width="1.4"/>
+  <line x1="25.9" y1="21.9" x2="30" y2="26" stroke="#FF3621" stroke-width="2.8" stroke-linecap="round"/>
+</svg>

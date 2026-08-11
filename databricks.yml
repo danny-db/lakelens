@@ -1,0 +1,98 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LakeLens — Databricks Asset Bundle
+#
+# Deploy the LakeLens FinOps app into ANY Databricks workspace with two commands:
+#
+#   databricks bundle deploy -t prod \
+#     --var="warehouse_id=<your-sql-warehouse-id>" \
+#     --var="results_catalog=<a-catalog-you-can-write-to>"
+#   databricks bundle run lakelens -t prod
+#
+# Nothing workspace-specific is hardcoded — every value is a variable below. See
+# README.md for the full guide (permissions, first-run, troubleshooting).
+# ─────────────────────────────────────────────────────────────────────────────
+bundle:
+  name: lakelens
+
+variables:
+  warehouse_id:
+    description: "SQL warehouse ID the app runs every query against (databricks warehouses list)."
+    # no default — must be provided per workspace (--var or in a target below)
+  results_catalog:
+    description: "Catalog the app's users can CREATE in — persists scans + the Genie space id (e.g. main, or a dedicated lakelens catalog)."
+  results_schema:
+    description: "Schema inside results_catalog for LakeLens tables."
+    default: "lakelens"
+  ai_endpoint:
+    description: "Model-serving endpoint for the plain-English explainers (a cheap tier is plenty)."
+    default: "databricks-gpt-5-4-mini"
+  ai_endpoint_dbu:
+    description: "Published DBU/1M-token rate (input,output) for ai_endpoint — used to price the scan's own AI cost."
+    default: "7.5,30"
+
+resources:
+  apps:
+    lakelens:
+      name: "lakelens"
+      description: "LakeLens — FinOps for the Lakehouse. See every dollar. Spot every saving."
+      source_code_path: ./app
+
+      # OBO scopes: the app runs every query AS THE LOGGED-IN USER. `sql` for the
+      # warehouse/system tables; `dashboards.genie` + `genie` for the Ask (Genie) tab.
+      # (Requires Databricks CLI >= 0.246.0 to set these from the bundle.)
+      user_api_scopes:
+        - sql
+        - dashboards.genie
+        - genie
+
+      # Runtime config — OVERRIDES app/app.yaml. This is where the app gets its env.
+      config:
+        command:
+          - uvicorn
+          - app:app
+          - --host
+          - "0.0.0.0"
+          - --port
+          - "8000"
+        env:
+          - name: DATABRICKS_WAREHOUSE_ID
+            value: ${var.warehouse_id}
+          - name: RESULTS_CATALOG
+            value: ${var.results_catalog}
+          - name: RESULTS_SCHEMA
+            value: ${var.results_schema}
+          - name: AI_ENDPOINT
+            value: ${var.ai_endpoint}
+          - name: AI_ENDPOINT_DBU
+            value: ${var.ai_endpoint_dbu}
+
+      # Bind the warehouse to the app (grants the app's service principal CAN_USE so
+      # the app can reach it; queries still run as the user via OBO).
+      resources:
+        - name: warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+
+targets:
+  # Reference/dev target — a Databricks demo workspace LakeLens was
+  # built on. A customer copies the `prod` target and points it at their workspace.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://<your-workspace>.cloud.databricks.com
+    variables:
+      warehouse_id: "<your-sql-warehouse-id>"
+      results_catalog: "main"
+      results_schema: "cost_optimiser"
+
+  # Customer/prod target — set host + pass --var for warehouse_id and results_catalog,
+  # or fill them in here.
+  prod:
+    mode: production
+    workspace:
+      host: https://<your-workspace>.cloud.databricks.com
+    # variables:
+    #   warehouse_id: "<your-sql-warehouse-id>"
+    #   results_catalog: "main"
