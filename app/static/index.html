@@ -329,6 +329,52 @@
   .board-table a.ws-link:hover { text-decoration: underline; }
   .panel-note { font-size: 11.5px; color: var(--muted-2); margin-top: 10px; line-height: 1.5; }
 
+  /* ── PDF export (client-side print) ── */
+  .pdf-btn { font-size: 11.5px; padding: 5px 11px; border-radius: 7px; cursor: pointer; font-family: inherit;
+             border: 1px solid var(--border); background: transparent; color: var(--muted); white-space: nowrap; }
+  .pdf-btn:hover { border-color: var(--accent); color: var(--fg); }
+  .hunt-actions .pdf-btn { margin-top: 6px; }
+  #print-area { display: none; }
+  @media print {
+    /* show only the report */
+    .app { display: none !important; }
+    #print-area { display: block !important; }
+    @page { size: A4 landscape; margin: 1.1cm; }   /* landscape = room for wide, many-column tables */
+    html, body { background: #fff !important; }
+    #print-area, #print-area * { color: #111 !important; box-shadow: none !important; }
+    /* report chrome */
+    .print-report { font-family: "DM Sans", system-ui, sans-serif; font-size: 12px; line-height: 1.5; }
+    .print-head { border-bottom: 2px solid #FF3621; padding-bottom: 10px; margin-bottom: 16px; }
+    .print-brand { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: #FF3621 !important; font-weight: 700; }
+    .print-title { font-size: 20px; font-weight: 700; margin-top: 4px; }
+    .print-sub { font-size: 11px; color: #555 !important; margin-top: 3px; }
+    .print-foot { margin-top: 18px; padding-top: 8px; border-top: 1px solid #ddd; font-size: 10px; color: #777 !important; }
+    /* hide interactive chrome inside the cloned content */
+    #print-area .btn, #print-area .pdf-btn, #print-area .run-btn, #print-area .explain-btn,
+    #print-area .details-toggle, #print-area .alert-toggle, #print-area .triage-row,
+    #print-area .narrate-btn, #print-area .measure-link, #print-area .measure-jump, #print-area .filter-group { display: none !important; }
+    /* force collapsed detail sections OPEN so the report is complete */
+    #print-area .hunt-details, #print-area .alert-detail { display: block !important; max-height: none !important; overflow: visible !important; opacity: 1 !important; }
+    /* keep a card from splitting across pages where possible */
+    #print-area .card, #print-area .hunt, #print-area .alert-card, #print-area .cat-block { break-inside: avoid; page-break-inside: avoid; border: 1px solid #ddd !important; background: #fff !important; margin: 0 0 12px !important; }
+    /* TABLES: show every column. The on-screen tables scroll horizontally
+       (.tbl-wrap/.board-table-wrap = overflow-x:auto, cells = white-space:nowrap),
+       but print can't scroll — so un-clip the wrappers and let cells WRAP, so a
+       many-column table shrinks to fit the page instead of running off the edge. */
+    #print-area .tbl-wrap, #print-area .board-table-wrap,
+    #print-area .result, #print-area .measure-result, #print-area .result-inner {
+      overflow: visible !important; border: 0 !important; border-radius: 0 !important; max-height: none !important; }
+    #print-area table { border-collapse: collapse; width: 100% !important; table-layout: auto; font-size: 9px; }
+    #print-area th, #print-area td {
+      border: 1px solid #e2e2e2 !important; padding: 3px 5px; text-align: left; vertical-align: top;
+      white-space: normal !important; word-break: break-word; overflow-wrap: anywhere; }
+    /* keep flowing prose readable despite the wide (landscape) page */
+    #print-area .print-head, #print-area .eli5, #print-area .what, #print-area .detail-row .v,
+    #print-area .aexplain, #print-area .explain-box, #print-area .alert-summary, #print-area p { max-width: 23cm; }
+    #print-area a { color: #1B6FB3 !important; text-decoration: none; }
+    #print-area .cat-head .ic, #print-area .alert-sev, #print-area .status-pill, #print-area .trend-badge { border: 0 !important; }
+  }
+
   /* ── Ask / Genie ── */
   .ask-setup { text-align: center; padding: 36px 24px; }
   .ask-setup h3 { font-size: 18px; margin-bottom: 8px; }
@@ -622,6 +668,7 @@
     <div class="card scan-bar">
       <div class="scan-bar-left">
         <button class="btn primary big" id="scanBtn">🚨 Run full cost scan</button>
+        <button class="pdf-btn" id="scanExportBtn" style="display:none;">⤓ Export report (PDF)</button>
         <div class="scan-status" id="scanStatus">Ready.</div>
       </div>
       <div class="scan-summary" id="scanSummary"></div>
@@ -666,6 +713,8 @@
       <p>Each card below is one check. Read the plain-English summary, hit <b>Run check</b> to see what it
          finds in your workspace, then <b>Explain</b> for a neutral read of the numbers. An empty result is
          good news — it means that pattern isn't costing you anything right now.</p>
+      <button class="pdf-btn" id="spotExportBtn">⤓ Export page (PDF)</button>
+      <span class="panel-note" style="margin-left:8px;">Exports every check you've run on this page. Run the checks you want included first.</span>
     </div>
     <div id="spotCategories"></div>
   </section>
@@ -851,10 +900,60 @@
 </div><!-- .content -->
 </div><!-- .app -->
 
+<!-- PDF export target: the report content is cloned in here, then window.print() shows only this -->
+<div id="print-area"></div>
+
 <script>
 const $ = (s, el=document) => el.querySelector(s);
 const $$ = (s, el=document) => [...el.querySelectorAll(s)];
 let META = null;
+
+// ── PDF export (client-side print — no library, works in the Apps sandbox/CSP) ──
+// Clone the given node(s) into #print-area with a LakeLens report header, then
+// window.print(); the print stylesheet shows ONLY #print-area. Canvas charts are
+// snapshotted to <img> (a cloned <canvas> would be blank). The browser's "Save as
+// PDF" produces the file; document.title seeds the filename.
+function exportPdf(sources, opts = {}) {
+  const area = $("#print-area");
+  if (!area) return;
+  const nodes = Array.isArray(sources) ? sources : [sources];
+  const stamp = new Date().toLocaleString();
+  const report = document.createElement("div");
+  report.className = "print-report";
+  report.innerHTML =
+    `<div class="print-head">
+       <div class="print-brand">LakeLens · FinOps for the Lakehouse</div>
+       <div class="print-title">${escapeHtml(opts.title || "Report")}</div>
+       <div class="print-sub">${opts.subtitle ? escapeHtml(opts.subtitle) + " · " : ""}Generated ${escapeHtml(stamp)} · list-price DBU cost, read-only</div>
+     </div>`;
+  nodes.forEach(n => {
+    if (!n) return;
+    const clone = n.cloneNode(true);
+    // a cloned <canvas> is blank — replace each with a snapshot <img> from the live chart
+    const liveCanvases = n.querySelectorAll("canvas");
+    const cloneCanvases = clone.querySelectorAll("canvas");
+    liveCanvases.forEach((cv, i) => {
+      try {
+        const img = document.createElement("img");
+        img.src = cv.toDataURL("image/png"); img.style.maxWidth = "100%";
+        cloneCanvases[i]?.replaceWith(img);
+      } catch (e) { /* tainted/blank — leave as-is */ }
+    });
+    report.appendChild(clone);
+  });
+  report.insertAdjacentHTML("beforeend",
+    `<div class="print-foot">LakeLens — reads system tables only · no data leaves your workspace · list-price DBU cost, read relative to your contract</div>`);
+  area.innerHTML = "";
+  area.appendChild(report);
+
+  const prevTitle = document.title;
+  document.title = (opts.filename || opts.title || "LakeLens report").replace(/[\/\\]/g, "-");
+  const cleanup = () => { area.innerHTML = ""; document.title = prevTitle; window.removeEventListener("afterprint", cleanup); };
+  window.addEventListener("afterprint", cleanup);
+  setTimeout(() => { window.print(); }, 60);   // let the DOM paint before printing
+  setTimeout(cleanup, 60000);                    // safety cleanup if afterprint never fires
+}
+const todayStr = () => new Date().toISOString().slice(0,10);
 const charts = {};
 let chosenModel = localStorage.getItem("costopt_model") || null;   // explainer model override
 
@@ -962,6 +1061,19 @@ function renderTable(columns, rows, total) {
 function buildSpot() {
   const host = $("#spotCategories");
   host.innerHTML = "";
+  const sx = $("#spotExportBtn");
+  if (sx && !sx.dataset.wired) {
+    sx.dataset.wired = "1";
+    sx.addEventListener("click", () => {
+      const ran = $$("#spotCategories .card.hunt").filter(c => $(".result", c)?.classList.contains("open"));
+      const nodes = ran.length ? ran : [host];   // ran checks, else the whole page as reference
+      exportPdf(nodes, {
+        title: "Spot — waste-pattern checks",
+        subtitle: ran.length ? `${ran.length} check${ran.length!==1?'s':''} run` : "reference (no checks run yet)",
+        filename: `LakeLens Spot ${todayStr()}`,
+      });
+    });
+  }
   META.categories.forEach(cat => {
     const hunts = META.hunts.filter(h => h.category === cat.id);
     if (!hunts.length) return;
@@ -996,6 +1108,7 @@ function huntCard(h) {
       <div class="hunt-actions">
         <button class="btn primary run-btn">Run check</button>
         ${h.has_explainer ? '<button class="btn ghost explain-btn" disabled>✨ Explain</button>' : ''}
+        <button class="pdf-btn card-pdf-btn" style="display:none;">⤓ PDF</button>
       </div>
     </div>
     <div class="hunt-details">
@@ -1013,6 +1126,9 @@ function huntCard(h) {
   });
   $(".run-btn", card).addEventListener("click", () => runHunt(h, card));
   if (h.has_explainer) $(".explain-btn", card).addEventListener("click", () => explainHunt(h, card));
+  $(".card-pdf-btn", card).addEventListener("click", () =>
+    exportPdf(card, { title: `${h.id} · ${h.title}`, subtitle: "Spot — single check",
+                      filename: `LakeLens ${h.id} ${todayStr()}` }));
   return card;
 }
 
@@ -1054,6 +1170,8 @@ async function runHunt(h, card) {
   } catch (e) {
     res.innerHTML = `<div class="result-status err">✕ ${e.message}</div>`;
   }
+  const pb = $(".card-pdf-btn", card);   // check has run — offer a per-check PDF
+  if (pb) pb.style.display = "";
   btn.disabled = false; btn.textContent = "Run check";
 }
 
@@ -1295,6 +1413,7 @@ function buildAlerts() {
   const nSignals = (META.alert_hunts || []).length;
   $("#scanStatus").textContent = `Ready — scans ${nSignals} waste signals across your workspace.`;
   $("#scanBtn").addEventListener("click", startScan);
+  $("#scanExportBtn").addEventListener("click", exportAlertsReport);
   // Overview CTA → jump to Alerts tab and start the scan
   const ov = $("#scanBtnOverview");
   if (ov) ov.addEventListener("click", () => {
@@ -1315,6 +1434,21 @@ function buildAlerts() {
 }
 function setActive(grp, btn){ $$(grp+" .fbtn").forEach(b=>b.classList.remove("active")); btn.classList.add("active"); }
 
+// Gather the visible pieces of a completed scan into one PDF report.
+function exportAlertsReport() {
+  const nodes = [];
+  const sum = $("#scanSummary"); if (sum && sum.innerHTML.trim()) nodes.push(sum);
+  const sc  = $("#selfCostCard"); if (sc && sc.style.display !== "none") nodes.push(sc);
+  const q   = $("#alertQueue"); if (q && q.children.length) nodes.push(q);
+  if (!nodes.length) { $("#scanStatus").textContent = "Run a scan first — nothing to export yet."; return; }
+  const c = (SCAN.meta && SCAN.meta.counts) || {};
+  exportPdf(nodes, {
+    title: "Cost scan report",
+    subtitle: `${(SCAN.findings||[]).length} findings · ${c.high||0} high · ${c.medium||0} medium`,
+    filename: `LakeLens cost scan ${todayStr()}`,
+  });
+}
+
 async function loadLatestScan() {
   try {
     const d = await (await fetch("/api/scan/latest")).json();
@@ -1322,6 +1456,7 @@ async function loadLatestScan() {
     SCAN = { id: d.scan_id, poll: null, findings: d.findings, status: "complete", meta: d };
     $("#alertEmpty").style.display = "none";
     $("#alertFilters").style.display = d.findings.length ? "flex" : "none";
+    $("#scanExportBtn").style.display = "";   // a scan exists → offer the PDF export
     renderSummary(d); renderQueue();
     let when = "";
     if (d.started_at) {
