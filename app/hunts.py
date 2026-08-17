@@ -996,6 +996,70 @@ ORDER BY candidate_delta_tables DESC
 LIMIT 50
 """,
     },
+
+    # ── H22 · config (serverless jobs in performance-optimized mode) ──────────
+    {
+        "id": "H22",
+        "category": "config",
+        "title": "Serverless jobs in Performance-optimized mode",
+        "eli5": "Finds serverless jobs running in Performance-optimized mode. That mode starts and "
+                "runs faster but burns more DBUs — worth it for time-critical pipelines, but "
+                "non-urgent jobs can switch to Standard mode and pay for fewer DBUs.",
+        "what": "Serverless jobs have two performance modes. Both bill at the SAME $/DBU rate — the "
+                "difference is DBU consumption: Performance-optimized (the default) prioritises fast "
+                "startup and runs on quicker capacity, so it consumes more DBUs; Standard tolerates a "
+                "slower cold start (Databricks quotes ~4–6 minutes) and uses fewer DBUs for the same "
+                "work. Each row is a serverless job currently billing in Performance-optimized mode, "
+                "with its list-price cost and DBUs over the last 30 days. perf_optimized_usd is the "
+                "spend exposed to a Standard-mode switch — not a guaranteed saving.",
+        "action": "For latency-tolerant jobs — scheduled batch, backfills, overnight ETL, anything with "
+                  "no downstream deadline — turn OFF ‘Performance optimization’ on the job's serverless "
+                  "compute (Job → task → Compute → Serverless → Performance optimized). That accepts a "
+                  "slower cold start in exchange for fewer DBUs. Keep Performance-optimized only where a "
+                  "run has a real SLA or a waiting consumer. Prove the change with M6 (the job's "
+                  "Performance-optimized line should fall, replaced by a smaller Standard line).",
+        "measure": "M6",
+        "explain_hunt_desc": "serverless jobs running in Performance-optimized mode (faster start, more DBUs) that may not need it",
+        "explain_rubric": (
+            "each row is a serverless job billing in PERFORMANCE_OPTIMIZED mode over the last 30 days. "
+            "Ground the read on the real mechanic: BOTH modes bill at the same $/DBU rate — "
+            "performance-optimized just consumes MORE DBUs to start and run faster (Standard tolerates a "
+            "~4–6 min slower cold start for fewer DBUs). perf_optimized_usd is the 30-day list-price spend "
+            "in this mode; dbus is the volume; active_days shows how regularly it runs. Name the biggest-$ "
+            "jobs as the candidates to move to Standard, and note that a frequently-run job (high active_days) "
+            "compounds the saving. DO NOT quote a fixed % saving — the realised saving depends on the "
+            "workload, and the tradeoff is a slower start; flag that genuinely time-critical / SLA jobs "
+            "should stay Performance-optimized. The job name often hints at urgency (e.g. ‘15min Refresh’ "
+            "may be deliberately fast; a nightly ‘datagen’ or ‘backfill’ usually is not)."
+        ),
+        "sql": """
+WITH price AS (
+  SELECT sku_name, cloud, price_start_time, price_end_time,
+         pricing.effective_list.default AS unit_usd FROM system.billing.list_prices
+),
+job_name AS (SELECT workspace_id, job_id, max(name) AS name FROM system.lakeflow.jobs GROUP BY 1, 2)
+SELECT u.workspace_id,
+       coalesce(jn.name, CAST(u.usage_metadata.job_id AS STRING))          AS job_name,
+       u.usage_metadata.job_id                                             AS job_id,
+       round(sum(u.usage_quantity * pr.unit_usd), 2)                       AS perf_optimized_usd,
+       round(sum(u.usage_quantity), 1)                                     AS dbus,
+       count(DISTINCT u.usage_date)                                        AS active_days
+FROM system.billing.usage u
+JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
+  AND u.usage_start_time >= pr.price_start_time
+  AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
+LEFT JOIN job_name jn ON u.workspace_id = jn.workspace_id
+                     AND u.usage_metadata.job_id = jn.job_id
+WHERE u.billing_origin_product = 'JOBS'
+  AND u.product_features.performance_target = 'PERFORMANCE_OPTIMIZED'
+  AND u.usage_metadata.job_id IS NOT NULL
+  AND u.usage_date >= current_date() - INTERVAL 30 DAYS
+GROUP BY 1, 2, 3
+HAVING perf_optimized_usd > 0
+ORDER BY perf_optimized_usd DESC
+LIMIT 50
+""",
+    },
 ]
 
 # ── The measures (Prove page) ────────────────────────────────────────────────
@@ -1201,6 +1265,58 @@ LIMIT 200
 """,
     },
     {
+        "id": "M6",
+        "group": "job", "order": 2,
+        "use_when": "you switched a serverless job from Performance-optimized to Standard mode (H22) — "
+                    "watch that job's Performance-optimized column fall, replaced by a smaller Standard column.",
+        "title": "Serverless job cost by performance mode",
+        "eli5": "For the top serverless jobs: weekly dollars split into Performance-optimized vs "
+                "Standard mode — the direct before/after for a performance-mode change.",
+        "what": "Both modes bill at the same $/DBU rate, so this splits each job's weekly serverless "
+                "spend by performance_target to make a mode change visible. Before a change, a job's "
+                "spend sits entirely in the Performance-optimized column; after you disable performance "
+                "optimization, subsequent weeks shift into the Standard column at a lower DBU total for "
+                "the same work. Limited to the top jobs by Performance-optimized spend so the table "
+                "stays legible. List-price DBU cost, directly attributed by job_id.",
+        "chart": "table",
+        "sql": """
+WITH price AS (
+  SELECT sku_name, cloud, price_start_time, price_end_time,
+         pricing.effective_list.default AS unit_usd FROM system.billing.list_prices
+),
+job_name AS (SELECT workspace_id, job_id, max(name) AS name FROM system.lakeflow.jobs GROUP BY 1, 2),
+sj AS (
+  SELECT u.workspace_id,
+         u.usage_metadata.job_id                    AS job_id,
+         u.product_features.performance_target      AS mode,
+         date_trunc('WEEK', u.usage_date)           AS week,
+         u.usage_quantity                           AS dbus,
+         u.usage_quantity * pr.unit_usd             AS usd
+  FROM system.billing.usage u
+  JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
+    AND u.usage_start_time >= pr.price_start_time
+    AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
+  WHERE u.billing_origin_product = 'JOBS'
+    AND u.product_features.performance_target IS NOT NULL   -- serverless jobs only
+    AND u.usage_metadata.job_id IS NOT NULL
+    AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
+),
+top_jobs AS (
+  SELECT job_id FROM sj WHERE mode = 'PERFORMANCE_OPTIMIZED'
+  GROUP BY 1 ORDER BY sum(usd) DESC LIMIT 12
+)
+SELECT coalesce(jn.name, CAST(sj.job_id AS STRING))                              AS job_name,
+       sj.week,
+       round(sum(CASE WHEN sj.mode = 'PERFORMANCE_OPTIMIZED' THEN sj.usd ELSE 0 END), 2) AS perf_optimized_usd,
+       round(sum(CASE WHEN sj.mode = 'STANDARD'              THEN sj.usd ELSE 0 END), 2) AS standard_usd,
+       round(sum(sj.dbus), 1)                                                    AS dbus
+FROM sj JOIN top_jobs USING (job_id)
+LEFT JOIN job_name jn ON sj.workspace_id = jn.workspace_id AND sj.job_id = jn.job_id
+GROUP BY 1, 2
+ORDER BY job_name, sj.week
+""",
+    },
+    {
         "id": "M5",
         "group": "warehouse", "order": 4,
         "use_when": "you set (or plan to set) a statement timeout — baseline the over-cap runners now, "
@@ -1329,5 +1445,8 @@ ALERT_SPECS = {
     "H21": {"metric_col": "candidate_delta_tables", "metric_label": "Likely-snappy tables (top schema)",
             "unit": "count", "high": 50, "medium": 10, "usd_col": None,
             "summary": "{n} schemas hold Delta tables predating the zstd default — top schema has {metric} candidates to recompress."},
+    "H22": {"metric_col": "perf_optimized_usd", "metric_label": "Performance-optimized spend (top job, 30d)",
+            "unit": "usd", "high": 5000, "medium": 1000, "usd_col": "perf_optimized_usd",
+            "summary": "{n} serverless jobs run in Performance-optimized mode — top job {metric} over 30d that non-urgent runs could move to Standard."},
 }
 
