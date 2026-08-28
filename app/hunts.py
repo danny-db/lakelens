@@ -1060,6 +1060,78 @@ ORDER BY perf_optimized_usd DESC
 LIMIT 50
 """,
     },
+
+    # ── H23 · spend ──────────────────────────────────────────────────────────
+    {
+        "id": "H23",
+        "category": "spend",
+        "title": "Predictive Optimization cost drivers",
+        "eli5": "Finds the tables driving your Predictive Optimization bill up — the ones whose "
+                "auto-maintenance (compaction, clustering, vacuum) burned the most EXTRA DBUs in the "
+                "last 7 days versus the 7 before.",
+        "what": "Predictive Optimization is the automatic maintenance Databricks runs on your Unity "
+                "Catalog managed tables — OPTIMIZE/compaction, liquid clustering, VACUUM and stats. You "
+                "pay per DBU of that work, so the bill tracks how much data is being written and "
+                "reorganised. Each row is one table + operation type, with its PO DBUs in the last 7 "
+                "complete days, the prior 7, and the change. Sorted by biggest increase, so the tables "
+                "pushing the cost up sit at the top. dbu_increase is in DBUs, not dollars — multiply by "
+                "your PO SKU rate for an approximate cost. (The two windows are trailing complete 7-day "
+                "periods, not calendar weeks, so today's partial day never distorts the comparison.)",
+        "action": "Trace the top risers to a cause: (1) more ingestion / writes into that table → "
+                  "expected if it is genuine new data; (2) a table or whole schema newly brought under "
+                  "PO → confirm you actually want PO managing it; (3) a move to liquid clustering or a "
+                  "clustering-key change → a one-off re-cluster that settles after a week or two. Then "
+                  "right-size the SCOPE: enabling PO across prod usually makes sense, but for "
+                  "dev/staging/lower environments decide per use-case — you can leave PO off there and "
+                  "instead run table maintenance (OPTIMIZE/VACUUM) on a schedule, less often. Re-run this "
+                  "check next week; a one-off re-cluster or a narrowed PO scope should pull the top "
+                  "table's dbu_increase back down.",
+        "explain_hunt_desc": "tables whose Predictive Optimization DBU consumption rose most over the "
+                             "last 7 days vs the prior 7 — the driver of a PO cost increase",
+        "explain_rubric": (
+            "each row is a (table, operation_type) whose Predictive Optimization work changed "
+            "week-over-week; dbu_increase = last-7-days minus prior-7-days in ESTIMATED_DBUs (the unit "
+            "PO bills in). operation_type tells you WHICH maintenance grew: COMPACTION = many small "
+            "files being written, so more bin-packing; CLUSTERING / AUTO_CLUSTERING_COLUMN_SELECTION = "
+            "liquid-clustering re-organisation, often a one-off after clustering is enabled or keys "
+            "change; VACUUM = garbage-collecting deleted files; ANALYZE = statistics. A large rise "
+            "usually means one of: higher ingestion volume into that table, a table/schema newly brought "
+            "under PO, or a clustering-key change forcing a re-cluster. Name the top tables and their "
+            "operation types as the drivers. Values are DBUs, NOT dollars — do not fabricate a cost; the "
+            "bill is DBUs x the PO SKU rate. If the top operation is CLUSTERING right after enablement, "
+            "call it a likely one-off that settles."
+        ),
+        "sql": """
+WITH ops AS (
+  SELECT catalog_name, schema_name, table_name, operation_type, usage_quantity,
+         CASE
+           WHEN start_time >= current_date() - INTERVAL 7 DAYS  AND start_time < current_date()
+             THEN 'last7'
+           WHEN start_time >= current_date() - INTERVAL 14 DAYS AND start_time < current_date() - INTERVAL 7 DAYS
+             THEN 'prev7'
+         END AS bucket
+  FROM system.storage.predictive_optimization_operations_history
+  WHERE usage_unit = 'ESTIMATED_DBU'
+    AND start_time >= current_date() - INTERVAL 14 DAYS
+    AND start_time <  current_date()
+),
+agg AS (
+  SELECT catalog_name, schema_name, table_name, operation_type,
+         round(sum(CASE WHEN bucket = 'prev7' THEN usage_quantity END), 1) AS dbus_prev_7d,
+         round(sum(CASE WHEN bucket = 'last7' THEN usage_quantity END), 1) AS dbus_last_7d
+  FROM ops
+  GROUP BY 1, 2, 3, 4
+)
+SELECT catalog_name, schema_name, table_name, operation_type,
+       coalesce(dbus_prev_7d, 0)                                       AS dbus_prev_7d,
+       coalesce(dbus_last_7d, 0)                                       AS dbus_last_7d,
+       round(coalesce(dbus_last_7d, 0) - coalesce(dbus_prev_7d, 0), 1) AS dbu_increase
+FROM agg
+WHERE coalesce(dbus_last_7d, 0) + coalesce(dbus_prev_7d, 0) > 0
+ORDER BY dbu_increase DESC
+LIMIT 50
+""",
+    },
 ]
 
 # ── The measures (Prove page) ────────────────────────────────────────────────
@@ -1448,5 +1520,8 @@ ALERT_SPECS = {
     "H22": {"metric_col": "perf_optimized_usd", "metric_label": "Performance-optimized spend (top job, 30d)",
             "unit": "usd", "high": 5000, "medium": 1000, "usd_col": "perf_optimized_usd",
             "summary": "{n} serverless jobs run in Performance-optimized mode — top job {metric} over 30d that non-urgent runs could move to Standard."},
+    "H23": {"metric_col": "dbu_increase", "metric_label": "PO DBU increase, top table (7d vs prior 7d)",
+            "unit": "count", "high": 2000, "medium": 500, "usd_col": None,
+            "summary": "Predictive Optimization work is climbing — the table with the biggest rise added {metric} DBUs in the last 7 days vs the prior 7."},
 }
 
