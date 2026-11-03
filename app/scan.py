@@ -124,7 +124,7 @@ ANOMALY_MEDIUM_X = float(os.getenv("ANOMALY_MEDIUM_X", "2"))
 
 class Grade(NamedTuple):
     severity: str           # high | medium | low
-    reading: str            # anomaly | new | presence | threshold
+    reading: str            # anomaly | new | presence
     x: Optional[float]      # vs_normal, for anomaly rows
 
 
@@ -143,23 +143,13 @@ def _grade_presence(spec: dict, row: list, ci: dict) -> Grade:
     return Grade("medium", "presence", None)
 
 
-def _grade_threshold(spec: dict, row: list, ci: dict) -> Grade:
-    v = _num(row[ci[spec["metric_col"]]])
-    if v is not None and v >= spec["high"]:
-        return Grade("high", "threshold", None)
-    if v is not None and v >= spec["medium"]:
-        return Grade("medium", "threshold", None)
-    return Grade("low", "threshold", None)
-
-
 GRADERS: dict[str, Callable[[dict, list, dict], Grade]] = {
     "anomaly": _grade_anomaly,
     "presence": _grade_presence,
-    "threshold": _grade_threshold,
 }
 
 # Columns each kind needs in the hunt result, beyond the spec's own column names.
-REQUIRED_COLS = {"anomaly": ("vs_normal", "baseline"), "presence": (), "threshold": ()}
+REQUIRED_COLS = {"anomaly": ("vs_normal", "baseline"), "presence": ()}
 
 
 def _fmt_metric(value: float, unit: str) -> str:
