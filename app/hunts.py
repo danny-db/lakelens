@@ -81,6 +81,31 @@ CATEGORIES = [
 #   explain_hunt_desc    — short description of the hunt for the AI prompt
 #   caution              — optional warning banner (e.g. H15 reads customer data)
 
+# ── The "versus its own normal" columns every anomaly hunt returns ───────────
+# Each anomaly hunt computes, per row, `own_normal` (the entity's statistic over
+# the prior 28 days, NULL when it has none) and `ws_normal` (the same statistic
+# across every entity: the workspace's own floor, so a tiny normal can't turn
+# noise into a huge multiple). These two helpers turn that into the contract
+# ALERT_SPECS grades on. An entity with no history is NEW (vs_normal NULL) only
+# when it is at least the workspace normal; a smaller newcomer is scored against
+# the workspace normal instead, so it can't raise an alert on its own.
+def _vs_normal(metric: str) -> str:
+    new = f"(own_normal IS NULL AND {metric} > 0 AND {metric} >= coalesce(ws_normal, 0))"
+    base = "CASE WHEN own_normal IS NOT NULL THEN greatest(own_normal, ws_normal) ELSE ws_normal END"
+    return (f"CASE WHEN {new} THEN NULL ELSE {base} END AS baseline,\n"
+            f"       CASE WHEN {new} THEN NULL\n"
+            f"            ELSE coalesce(round(try_divide({metric}, {base}), 2), 0) END AS vs_normal,\n"
+            f"       CASE WHEN {new} THEN 'none (new)'\n"
+            f"            WHEN own_normal IS NULL THEN 'workspace (no own history)'\n"
+            f"            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from")
+
+
+def _most_unusual(metric: str) -> str:
+    """ORDER BY key: most times its normal first; a NEW row ranks by its multiple of
+    the workspace normal."""
+    return f"coalesce(vs_normal, try_divide({metric}, ws_normal)) DESC NULLS LAST"
+
+
 HUNTS = [
     # ── H0 · AI ──────────────────────────────────────────────────────────────
     {
@@ -116,7 +141,7 @@ HUNTS = [
             "account's own 7-day effective $/1M-token rate), read it relative, not as "
             "an invoice. source = AI_QUERY marks a SQL ai_query() call."
         ),
-        "sql": """
+        "sql": f"""
 WITH billing_dollars AS (
   SELECT u.usage_metadata.endpoint_name AS model,
          sum(u.usage_quantity * p.pricing.default) AS usd
@@ -163,20 +188,16 @@ cur AS (
   GROUP BY 1,2,3,4,5
 ),
 graded AS (
-  SELECT c.*, c.in_tok + c.out_tok AS tokens, o.own_normal, w.ws_normal,
-         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  SELECT c.*, c.in_tok + c.out_tok AS tokens, o.own_normal, w.ws_normal
   FROM cur c LEFT JOIN own o ON c.endpoint_name <=> o.endpoint_name AND c.requester <=> o.requester
   CROSS JOIN ws w
 )
 SELECT hr, source, endpoint_name, requester, requester_type, in_tok, out_tok, est_usd_rough,
-       endpoint_name || ' / ' || requester    AS caller,
-       tokens, baseline,
-       round(tokens / baseline, 2)            AS vs_normal,
-       CASE WHEN baseline IS NULL THEN 'none (new)'
-            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+       endpoint_name || ' / ' || coalesce(requester, 'unknown caller') AS caller,
+       tokens,
+       {_vs_normal("tokens")}
 FROM graded
-WHERE tokens > 0 AND tokens >= coalesce(baseline, ws_normal, 0)
-ORDER BY coalesce(tokens / baseline, tokens / ws_normal) DESC
+ORDER BY {_most_unusual("tokens")}
 LIMIT 20
 """,
     },
@@ -214,10 +235,11 @@ LIMIT 20
             "source query); if reads are approximately 2x the target size, the merge scans "
             "the whole target in both its match and rewrite phases."
         ),
-        "sql": """
+        "sql": f"""
 WITH merges AS (
   SELECT statement_id, executed_by, start_time, read_bytes, written_bytes, total_duration_ms,
-         coalesce(nullif(regexp_extract(statement_text, '(?i)MERGE\\s+INTO\\s+([`\\w.]+)', 1), ''),
+         read_bytes/POW(1024,4) AS read_tib,
+         coalesce(nullif(regexp_extract(statement_text, '(?i)MERGE\\\\s+INTO\\\\s+([`\\\\w.]+)', 1), ''),
                   'job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
                   executed_by) AS merge_target
   FROM system.query.history
@@ -225,27 +247,21 @@ WITH merges AS (
     AND start_time >= current_date() - INTERVAL 35 DAYS
 ),
 prior AS (SELECT * FROM merges WHERE start_time < current_date() - INTERVAL 7 DAYS),
-own AS (SELECT merge_target, percentile_approx(read_bytes, 0.5) AS own_normal FROM prior GROUP BY 1),
-ws AS (SELECT percentile_approx(read_bytes, 0.95) AS ws_normal FROM prior),
+own AS (SELECT merge_target, percentile_approx(read_tib, 0.5) AS own_normal FROM prior GROUP BY 1),
+ws AS (SELECT percentile_approx(read_tib, 0.95) AS ws_normal FROM prior),
 cur AS (
-  SELECT m.*, o.own_normal, w.ws_normal,
-         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS base_bytes
+  SELECT m.*, o.own_normal, w.ws_normal
   FROM merges m LEFT JOIN own o USING (merge_target) CROSS JOIN ws w
   WHERE m.start_time >= current_date() - INTERVAL 7 DAYS
   QUALIFY row_number() OVER (PARTITION BY m.merge_target ORDER BY m.read_bytes DESC) = 1
 )
-SELECT statement_id, executed_by, merge_target,
-       read_bytes/POW(1024,4)               AS read_tib,
+SELECT statement_id, executed_by, merge_target, read_tib,
        written_bytes/POW(1024,3)            AS written_gib,
        CAST(read_bytes AS DOUBLE)/NULLIF(written_bytes,0) AS read_write_ratio,
        total_duration_ms/60000.0            AS mins,
-       base_bytes/POW(1024,4)               AS baseline,
-       round(read_bytes / base_bytes, 2)    AS vs_normal,
-       CASE WHEN base_bytes IS NULL THEN 'none (new)'
-            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+       {_vs_normal("read_tib")}
 FROM cur
-WHERE read_bytes >= coalesce(base_bytes, ws_normal, 0)
-ORDER BY coalesce(read_bytes / base_bytes, read_bytes / ws_normal) DESC
+ORDER BY {_most_unusual("read_tib")}
 LIMIT 20
 """,
     },
@@ -281,9 +297,10 @@ LIMIT 20
             "join instead of before, unbounded lookback windows. Spill roughly proportional to "
             "input on a well-shaped query is a sizing problem."
         ),
-        "sql": """
+        "sql": f"""
 WITH spills AS (
-  SELECT statement_id, start_time, executed_by, spilled_local_bytes, read_bytes, total_duration_ms,
+  SELECT statement_id, start_time, executed_by, read_bytes, total_duration_ms,
+         spilled_local_bytes/POW(1024,4) AS spill_tib,
          coalesce('job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
                   'query ' || query_source.sql_query_id, 'dashboard ' || query_source.dashboard_id,
                   executed_by) AS source
@@ -292,26 +309,20 @@ WITH spills AS (
     AND start_time >= current_date() - INTERVAL 35 DAYS
 ),
 prior AS (SELECT * FROM spills WHERE start_time < current_date() - INTERVAL 7 DAYS),
-own AS (SELECT source, percentile_approx(spilled_local_bytes, 0.5) AS own_normal FROM prior GROUP BY 1),
-ws AS (SELECT percentile_approx(spilled_local_bytes, 0.5) AS ws_normal FROM prior),
+own AS (SELECT source, percentile_approx(spill_tib, 0.5) AS own_normal FROM prior GROUP BY 1),
+ws AS (SELECT percentile_approx(spill_tib, 0.5) AS ws_normal FROM prior),
 cur AS (
-  SELECT s.*, o.own_normal, w.ws_normal,
-         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS base_bytes
+  SELECT s.*, o.own_normal, w.ws_normal
   FROM spills s LEFT JOIN own o USING (source) CROSS JOIN ws w
   WHERE s.start_time >= current_date() - INTERVAL 7 DAYS
-  QUALIFY row_number() OVER (PARTITION BY s.source ORDER BY s.spilled_local_bytes DESC) = 1
+  QUALIFY row_number() OVER (PARTITION BY s.source ORDER BY s.spill_tib DESC) = 1
 )
-SELECT statement_id, start_time, executed_by, source,
-       spilled_local_bytes/POW(1024,4)      AS spill_tib,
+SELECT statement_id, start_time, executed_by, source, spill_tib,
        read_bytes/POW(1024,3)               AS read_gib,
        total_duration_ms/60000.0            AS mins,
-       base_bytes/POW(1024,4)               AS baseline,
-       round(spilled_local_bytes / base_bytes, 2) AS vs_normal,
-       CASE WHEN base_bytes IS NULL THEN 'none (new)'
-            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+       {_vs_normal("spill_tib")}
 FROM cur
-WHERE spilled_local_bytes >= coalesce(base_bytes, ws_normal, 0)
-ORDER BY coalesce(spilled_local_bytes / base_bytes, spilled_local_bytes / ws_normal) DESC
+ORDER BY {_most_unusual("spill_tib")}
 LIMIT 20
 """,
     },
@@ -344,7 +355,7 @@ LIMIT 20
             "baseline_from says which). A client several times its own normal is the pattern; NULL "
             "vs_normal = a client first seen this week."
         ),
-        "sql": """
+        "sql": f"""
 WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL),
 weekly AS (
   SELECT compute.warehouse_id, statement_type, executed_by, client_application, client_driver,
@@ -361,8 +372,7 @@ weekly AS (
 own AS (SELECT k, percentile_approx(stmts, 0.5) AS own_normal FROM weekly WHERE wk BETWEEN 1 AND 4 GROUP BY 1),
 ws AS (SELECT percentile_approx(stmts, 0.95) AS ws_normal FROM weekly WHERE wk BETWEEN 1 AND 4),
 q AS (
-  SELECT c.*, o.own_normal, w.ws_normal,
-         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  SELECT c.*, o.own_normal, w.ws_normal
   FROM weekly c LEFT JOIN own o USING (k) CROSS JOIN ws w
   WHERE c.wk = 0
 )
@@ -370,13 +380,9 @@ SELECT coalesce(wh.warehouse_name, q.warehouse_id) AS warehouse, q.statement_typ
        q.client_application, q.client_driver, q.stmts, q.sessions, q.stmts_per_session,
        coalesce(q.client_application, q.client_driver, 'unknown client') || ' (' || q.executed_by
          || ') on ' || coalesce(wh.warehouse_name, q.warehouse_id, 'a cluster') AS client,
-       q.baseline,
-       round(q.stmts / q.baseline, 2) AS vs_normal,
-       CASE WHEN q.baseline IS NULL THEN 'none (new)'
-            WHEN q.own_normal >= q.ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+       {_vs_normal("stmts")}
 FROM q LEFT JOIN wh ON q.warehouse_id = wh.warehouse_id
-WHERE q.stmts >= coalesce(q.baseline, q.ws_normal, 0)
-ORDER BY coalesce(q.stmts / q.baseline, q.stmts / q.ws_normal) DESC
+ORDER BY {_most_unusual("stmts")}
 LIMIT 50
 """,
     },
@@ -449,7 +455,7 @@ ORDER BY 1, 2
             "reads = a hung statement (we found two that executed 21.7 h while reading 6 MB - "
             "check execution_status and the query profile). Large queued_min = a capacity problem (see H8)."
         ),
-        "sql": """
+        "sql": f"""
 WITH stmts AS (
   SELECT statement_id, start_time, executed_by, total_duration_ms, waiting_at_capacity_duration_ms,
          waiting_for_compute_duration_ms, execution_duration_ms, read_files, read_bytes,
@@ -467,8 +473,7 @@ daily AS (
 own AS (SELECT source, percentile_approx(longest_min, 0.5) AS own_normal FROM daily GROUP BY 1),
 ws AS (SELECT percentile_approx(longest_min, 0.95) AS ws_normal FROM daily),
 cur AS (
-  SELECT s.*, s.total_duration_ms/60000.0 AS total_min, o.own_normal, w.ws_normal,
-         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS base_min
+  SELECT s.*, s.total_duration_ms/60000.0 AS total_min, o.own_normal, w.ws_normal
   FROM stmts s LEFT JOIN own o USING (source) CROSS JOIN ws w
   WHERE s.total_duration_ms > 4*3600*1000
     AND s.start_time >= current_date() - INTERVAL 7 DAYS
@@ -479,12 +484,9 @@ SELECT statement_id, start_time, source,
        waiting_for_compute_duration_ms/60000.0 AS provisioning_min,
        execution_duration_ms/60000.0           AS exec_min,
        read_files, read_bytes/POW(1024,3)      AS read_gib,
-       round(base_min, 1)                      AS baseline,
-       round(total_min / base_min, 2)          AS vs_normal,
-       CASE WHEN base_min IS NULL THEN 'none (new)'
-            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+       {_vs_normal("total_min")}
 FROM cur
-ORDER BY coalesce(total_min / base_min, total_min / ws_normal) DESC
+ORDER BY {_most_unusual("total_min")}
 """,
     },
 
@@ -517,7 +519,7 @@ ORDER BY coalesce(total_min / base_min, total_min / ws_normal) DESC
             "many scans in the hour is usually one incident hunt re-paying a full scan per "
             "refinement. Open the statements in the Query History UI to confirm the shape."
         ),
-        "sql": """
+        "sql": f"""
 WITH hourly AS (
   SELECT executed_by, date_trunc('HOUR', start_time) AS hour,
          count(*)                          AS scans,
@@ -532,20 +534,15 @@ prior AS (SELECT * FROM hourly WHERE hour < current_date() - INTERVAL 7 DAYS),
 own AS (SELECT executed_by, percentile_approx(read_tib, 0.95) AS own_normal FROM prior GROUP BY 1),
 ws AS (SELECT percentile_approx(read_tib, 0.95) AS ws_normal FROM prior),
 cur AS (
-  SELECT h.*, o.own_normal, w.ws_normal,
-         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  SELECT h.*, o.own_normal, w.ws_normal
   FROM hourly h LEFT JOIN own o USING (executed_by) CROSS JOIN ws w
   WHERE h.hour >= current_date() - INTERVAL 7 DAYS
   QUALIFY row_number() OVER (PARTITION BY h.executed_by ORDER BY h.read_tib DESC) = 1
 )
 SELECT executed_by, hour, scans, read_tib, longest_hours,
-       round(baseline, 4)                 AS baseline,
-       round(read_tib / baseline, 2)      AS vs_normal,
-       CASE WHEN baseline IS NULL THEN 'none (new)'
-            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+       {_vs_normal("read_tib")}
 FROM cur
-WHERE read_tib >= coalesce(baseline, ws_normal, 0)
-ORDER BY coalesce(read_tib / baseline, read_tib / ws_normal) DESC
+ORDER BY {_most_unusual("read_tib")}
 LIMIT 50
 """,
     },
@@ -581,7 +578,7 @@ LIMIT 50
             "queue/provisioning). When all query_source IDs are NULL the group is unattributed - "
             "unrelated short SELECTs can collapse into one row, so do not assert it is a poller."
         ),
-        "sql": """
+        "sql": f"""
 WITH polls AS (
   SELECT executed_by, client_application,
          query_source.sql_query_id            AS sql_query_id,
@@ -619,21 +616,16 @@ cur AS (
   GROUP BY 1, 2, 3, 4, 5, 6, 7
 ),
 graded AS (
-  SELECT c.*, o.own_normal, w.ws_normal,
-         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  SELECT c.*, o.own_normal, w.ws_normal
   FROM cur c LEFT JOIN own o USING (k) CROSS JOIN ws w
 )
 SELECT executed_by, owner_type, client_application, sql_query_id, dashboard_id, job_id,
        execs, p50_exec_ms, execution_hours, example_statement_id, more_example_ids, status,
        coalesce('query ' || sql_query_id, 'dashboard ' || dashboard_id, 'job ' || job_id,
                 client_application, 'unattributed') || ' (' || executed_by || ')' AS poller,
-       baseline,
-       round(execs / baseline, 2) AS vs_normal,
-       CASE WHEN baseline IS NULL THEN 'none (new)'
-            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+       {_vs_normal("execs")}
 FROM graded
-WHERE execs >= coalesce(baseline, ws_normal, 0)
-ORDER BY coalesce(execs / baseline, execs / ws_normal) DESC
+ORDER BY {_most_unusual("execs")}
 LIMIT 50
 """,
     },
@@ -669,7 +661,7 @@ LIMIT 50
             "max cluster count is too low for peaks. Zero queueing with low utilisation (H14 for "
             "clusters, warehouse monitoring for DBSQL) means there is room to downsize."
         ),
-        "sql": """
+        "sql": f"""
 WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL),
 weekly AS (
   SELECT compute.warehouse_id,
@@ -685,23 +677,15 @@ prior AS (SELECT * FROM weekly WHERE wk BETWEEN 1 AND 4 AND queued_hours > 0),
 own AS (SELECT warehouse_id, percentile_approx(queued_hours, 0.5) AS own_normal FROM prior GROUP BY 1),
 ws AS (SELECT percentile_approx(queued_hours, 0.95) AS ws_normal FROM prior),
 q AS (
-  SELECT c.*, o.own_normal, w.ws_normal,
-         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  SELECT c.*, o.own_normal, w.ws_normal
   FROM weekly c LEFT JOIN own o ON c.warehouse_id <=> o.warehouse_id CROSS JOIN ws w
   WHERE c.wk = 0
 )
 SELECT coalesce(wh.warehouse_name, q.warehouse_id) AS warehouse,
        q.stmts_queued_over_1m, q.queued_hours, q.exec_hours,
-       q.baseline,
-       -- every warehouse stays listed; one with no queueing history is NEW only when it now
-       -- queues at least the workspace normal, otherwise it is scored against that normal
-       CASE WHEN q.baseline IS NOT NULL THEN round(q.queued_hours / q.baseline, 2)
-            WHEN q.queued_hours > 0 AND q.queued_hours >= coalesce(q.ws_normal, 0) THEN NULL
-            ELSE coalesce(round(q.queued_hours / q.ws_normal, 2), 0) END AS vs_normal,
-       CASE WHEN q.baseline IS NULL THEN 'none (new)'
-            WHEN q.own_normal >= q.ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+       {_vs_normal("queued_hours")}
 FROM q LEFT JOIN wh ON q.warehouse_id = wh.warehouse_id
-ORDER BY coalesce(q.queued_hours / q.baseline, q.queued_hours / q.ws_normal) DESC NULLS LAST, q.queued_hours DESC
+ORDER BY {_most_unusual("queued_hours")}, queued_hours DESC
 """,
     },
 
@@ -973,7 +957,10 @@ LIMIT 10
         "what": "All-Purpose compute is for interactive notebook work and bills ~3.7× more than Jobs "
                 "compute ($0.55 vs $0.15 per DBU). A job pinned to an always-on All-Purpose cluster "
                 "pays that premium AND the idle time between runs. Each row is a job + the All-Purpose "
-                "cluster it ran on (cluster_source UI/API = interactive; JOB = proper jobs compute). "
+                "cluster it ran on (cluster_source UI/API = interactive; JOB = proper jobs compute), with "
+                "its runs this week set against its usual week (the median of its prior four). vs_normal "
+                "is how many times that usual it ran, and that sets the alert, so a job newly moved onto "
+                "an All-Purpose cluster or suddenly running there far more often stands out. "
                 "The pct_saving column is the rate saving from moving it.",
         "action": "Move the job to Jobs Compute (an ephemeral cluster that spins up per run and "
                   "terminates after) or Serverless Jobs. That drops the rate to $0.15/DBU and removes "
@@ -983,11 +970,14 @@ LIMIT 10
         "explain_rubric": (
             "each row is a job that ran on an ALL-PURPOSE cluster (cluster_source UI or API), which "
             "bills $0.55/DBU vs $0.15/DBU on Jobs compute — a 3.7x markup. run_count is how many times "
-            "it ran that way. Name the jobs with the most runs on all-purpose as the migration targets; "
+            "it ran that way this week; vs_normal = run_count / baseline, where baseline is the median of "
+            "its prior four weeks on that cluster (floored at the workspace's median job-week on all-purpose; "
+            "baseline_from says which), and NULL vs_normal = a job first seen on all-purpose this week. Name "
+            "the jobs furthest above their own normal, then the most runs, as the migration targets; "
             "the fix is Jobs Compute / Serverless Jobs. Do not overstate — the saving is the rate delta "
             "on that job's DBUs, not the whole cluster."
         ),
-        "sql": """
+        "sql": f"""
 WITH latest_clusters AS (
   SELECT workspace_id, cluster_id, cluster_name, cluster_source, owned_by
   FROM system.compute.clusters
@@ -997,25 +987,40 @@ job_names AS (
   SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2
 ),
 runs_on_cluster AS (
-  SELECT t.workspace_id, t.job_id, exploded.cluster_id, count(DISTINCT t.run_id) AS run_count
+  SELECT t.workspace_id, t.job_id, exploded.cluster_id,
+         floor((unix_timestamp(current_timestamp()) - unix_timestamp(t.period_start_time)) / 604800) AS wk,
+         count(DISTINCT t.run_id) AS run_count
   FROM system.lakeflow.job_task_run_timeline t
   LATERAL VIEW explode(t.compute_ids) exploded AS cluster_id
-  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS
+  WHERE t.period_start_time >= current_timestamp() - INTERVAL 35 DAYS
     AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
-  GROUP BY 1,2,3
+  GROUP BY 1,2,3,4
+),
+all_purpose AS (
+  SELECT r.*, c.cluster_name, c.cluster_source
+  FROM runs_on_cluster r
+  JOIN latest_clusters c ON r.workspace_id=c.workspace_id AND r.cluster_id=c.cluster_id
+  WHERE c.cluster_source IN ('UI','API')                     -- all-purpose only
+),
+own AS (SELECT workspace_id, job_id, cluster_id, percentile_approx(run_count, 0.5) AS own_normal
+        FROM all_purpose WHERE wk BETWEEN 1 AND 4 GROUP BY 1,2,3),
+ws AS (SELECT percentile_approx(run_count, 0.5) AS ws_normal FROM all_purpose WHERE wk BETWEEN 1 AND 4),
+cur AS (
+  SELECT a.*, o.own_normal, w.ws_normal
+  FROM all_purpose a LEFT JOIN own o USING (workspace_id, job_id, cluster_id) CROSS JOIN ws w
+  WHERE a.wk = 0
 )
 SELECT r.workspace_id,
        coalesce(jn.job_name, CAST(r.job_id AS STRING)) AS job_name,
-       c.cluster_name,
-       c.cluster_source,                                   -- UI / API = all-purpose
+       r.cluster_name,
+       r.cluster_source,                                   -- UI / API = all-purpose
        r.run_count,
        0.55 AS all_purpose_usd_dbu, 0.15 AS jobs_usd_dbu,
-       '73% cheaper on Jobs' AS pct_saving
-FROM runs_on_cluster r
-JOIN latest_clusters c ON r.workspace_id=c.workspace_id AND r.cluster_id=c.cluster_id
+       '73% cheaper on Jobs' AS pct_saving,
+       {_vs_normal("run_count")}
+FROM cur r
 LEFT JOIN job_names jn ON r.workspace_id=jn.workspace_id AND r.job_id=jn.job_id
-WHERE c.cluster_source IN ('UI','API')                     -- all-purpose only
-ORDER BY r.run_count DESC
+ORDER BY {_most_unusual("run_count")}, run_count DESC
 LIMIT 50
 """,
     },
@@ -1061,7 +1066,11 @@ ORDER BY min_clusters DESC, warehouse_size DESC
         "title": "Idle interactive clusters (low CPU)",
         "eli5": "Finds persistent All-Purpose clusters sitting at low CPU most of the time — "
                 "you're paying for big machines that mostly idle (the ds_highmem pattern).",
-        "what": "Over the last 7 days this measures each interactive cluster's average CPU and how much "
+        "what": "Each row is an interactive cluster that averaged under 20% CPU this week, with its "
+                "node-minutes set against its usual week (the median of its prior four). vs_normal is how "
+                "many times that usual it ran, and that sets the alert: a cluster left running idle far "
+                "longer than it normally runs is the one to catch. "
+                "Over the last 7 days this measures each interactive cluster's average CPU and how much "
                 "of the time it sat under 10% (effectively idle). A cluster running for days at sub-20% "
                 "average CPU — especially a high-memory one — is paying for cores that do nothing. "
                 "avg_cpu_pct and pct_time_idle are the read; verdict flags the worst.",
@@ -1074,10 +1083,13 @@ ORDER BY min_clusters DESC, warehouse_size DESC
             "each row is an interactive (all-purpose) cluster with its 7-day avg CPU and the % of time "
             "it was effectively idle (<10% CPU). Sustained low avg_cpu_pct with high total runtime = "
             "idle cores you are paying for; a high-mem node makes it worse. verdict flags "
-            "severely-underutilised / underutilised. Name the worst and recommend right-sizing or "
+            "severely-underutilised / underutilised. vs_normal = node_minutes / baseline, where baseline is "
+            "the cluster's median week over the prior four (floored at the workspace's median "
+            "interactive cluster-week; baseline_from says which); NULL vs_normal = a cluster first seen "
+            "this week. Name the worst and recommend right-sizing or "
             "moving to Jobs compute. Confirm the cluster isn't a deliberately-warm interactive one before acting."
         ),
-        "sql": """
+        "sql": f"""
 WITH latest_clusters AS (
   SELECT workspace_id, cluster_id, cluster_name, cluster_source, owned_by, auto_termination_minutes, delete_time
   FROM system.compute.clusters
@@ -1085,23 +1097,36 @@ WITH latest_clusters AS (
 ),
 cpu AS (
   SELECT workspace_id, cluster_id,
+         floor((unix_timestamp(current_timestamp()) - unix_timestamp(start_time)) / 604800) AS wk,
          count(*) AS samples,
          round(avg(cpu_user_percent + cpu_system_percent), 1) AS avg_cpu_pct,
          round(max(cpu_user_percent + cpu_system_percent), 1) AS peak_cpu_pct,
          round(sum(CASE WHEN (cpu_user_percent + cpu_system_percent) < 10 THEN 1 ELSE 0 END)*100.0/count(*), 1) AS pct_time_idle
   FROM system.compute.node_timeline
-  WHERE start_time >= current_date() - INTERVAL 7 DAYS
-  GROUP BY 1,2
+  WHERE start_time >= current_timestamp() - INTERVAL 35 DAYS
+  GROUP BY 1,2,3
+),
+interactive AS (
+  SELECT cpu.*, c.cluster_name, c.cluster_source, c.auto_termination_minutes
+  FROM cpu JOIN latest_clusters c USING (workspace_id, cluster_id)
+  WHERE c.cluster_source IN ('UI','API') AND c.delete_time IS NULL
+),
+own AS (SELECT workspace_id, cluster_id, percentile_approx(samples, 0.5) AS own_normal
+        FROM interactive WHERE wk BETWEEN 1 AND 4 GROUP BY 1,2),
+ws AS (SELECT percentile_approx(samples, 0.5) AS ws_normal FROM interactive WHERE wk BETWEEN 1 AND 4),
+cur AS (
+  SELECT i.*, i.samples AS node_minutes, o.own_normal, w.ws_normal
+  FROM interactive i LEFT JOIN own o USING (workspace_id, cluster_id) CROSS JOIN ws w
+  WHERE i.wk = 0 AND i.avg_cpu_pct < 20
 )
-SELECT coalesce(c.cluster_name, c.cluster_id) AS cluster,
-       c.cluster_source, c.auto_termination_minutes,
-       cpu.avg_cpu_pct, cpu.peak_cpu_pct, cpu.pct_time_idle, cpu.samples AS node_minutes,
-       CASE WHEN cpu.avg_cpu_pct < 10 AND cpu.peak_cpu_pct < 30 THEN 'severely-underutilised'
-            WHEN cpu.avg_cpu_pct < 20 THEN 'underutilised' ELSE 'ok' END AS verdict
-FROM cpu JOIN latest_clusters c USING (workspace_id, cluster_id)
-WHERE c.cluster_source IN ('UI','API') AND c.delete_time IS NULL
-  AND cpu.avg_cpu_pct < 20 AND cpu.samples > 500
-ORDER BY cpu.samples DESC
+SELECT coalesce(cluster_name, cluster_id) AS cluster,
+       cluster_source, auto_termination_minutes,
+       avg_cpu_pct, peak_cpu_pct, pct_time_idle, node_minutes,
+       CASE WHEN avg_cpu_pct < 10 AND peak_cpu_pct < 30 THEN 'severely-underutilised'
+            WHEN avg_cpu_pct < 20 THEN 'underutilised' ELSE 'ok' END AS verdict,
+       {_vs_normal("node_minutes")}
+FROM cur
+ORDER BY {_most_unusual("node_minutes")}, node_minutes DESC
 LIMIT 50
 """,
     },
@@ -1115,8 +1140,10 @@ LIMIT 50
                 "whether or not anyone is using them.",
         "what": "A Databricks App bills DBUs while deployed and running, regardless of traffic. An app "
                 "that shows usage on 25+ of the last 30 days is effectively always-on. Each row is an "
-                "app with its days billed and total/average daily DBUs. High DBU + always-on + little "
-                "real traffic = a stop-or-consolidate candidate.",
+                "app with its days billed and total/average daily DBUs, plus its DBUs this week set "
+                "against its usual week (the median of its prior four). vs_normal is how many times that "
+                "usual it burned, and that sets the alert, so an app that scaled up or started burning "
+                "more stands out. High DBU + always-on + little real traffic = a stop-or-consolidate candidate.",
         "action": "Audit per-app traffic (Apps UI Insights, or OAuth-consent as a breadth signal); stop "
                   "or undeploy apps no one uses, and consolidate per-workspace/per-env duplicates. Apps "
                   "that only need business-hours availability don't need to run overnight.",
@@ -1124,24 +1151,50 @@ LIMIT 50
         "explain_hunt_desc": "Databricks Apps billing nearly every day (always-on regardless of traffic)",
         "explain_rubric": (
             "each row is a Databricks App with days_billed (of last 30) and its DBUs. days_billed >= 25 "
-            "means it's effectively always-on; high total_dbus makes it costly. Name the biggest "
+            "means it's effectively always-on; high total_dbus makes it costly. vs_normal = dbus_7d / "
+            "baseline, where baseline is the app's median week over the prior four (floored at the "
+            "workspace's median app-week; baseline_from says which). Name the apps furthest above their "
+            "own normal first, then the biggest "
             "always-on apps as stop/consolidate candidates — but note billing shows it's RUNNING, not "
             "whether it's USED, so recommend confirming traffic (Apps Insights) before stopping."
         ),
-        "sql": """
-SELECT usage_metadata.app_name                              AS app_name,
-       workspace_id,
-       count(DISTINCT usage_date)                           AS days_billed_30d,
-       round(sum(usage_quantity), 1)                        AS total_dbus_30d,
-       round(sum(usage_quantity)/count(DISTINCT usage_date), 2) AS avg_daily_dbus,
-       max(usage_date)                                      AS last_billed
-FROM system.billing.usage
-WHERE billing_origin_product = 'APPS'
-  AND usage_date >= current_date() - INTERVAL 30 DAYS
-  AND usage_metadata.app_name IS NOT NULL
-GROUP BY 1, 2
-HAVING count(DISTINCT usage_date) >= 25
-ORDER BY total_dbus_30d DESC
+        "sql": f"""
+WITH daily AS (
+  SELECT usage_metadata.app_name AS app_name, workspace_id, usage_date,
+         sum(usage_quantity) AS dbus
+  FROM system.billing.usage
+  WHERE billing_origin_product = 'APPS'
+    AND usage_date >= current_date() - INTERVAL 34 DAYS
+    AND usage_metadata.app_name IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+weekly AS (
+  SELECT app_name, workspace_id, floor(datediff(current_date(), usage_date) / 7) AS wk, sum(dbus) AS dbus
+  FROM daily GROUP BY 1, 2, 3
+),
+own AS (SELECT app_name, workspace_id, percentile_approx(dbus, 0.5) AS own_normal
+        FROM weekly WHERE wk BETWEEN 1 AND 4 GROUP BY 1, 2),
+ws AS (SELECT percentile_approx(dbus, 0.5) AS ws_normal FROM weekly WHERE wk BETWEEN 1 AND 4),
+apps AS (
+  SELECT app_name, workspace_id,
+         count(*)                                       AS days_billed_30d,
+         round(sum(dbus), 1)                            AS total_dbus_30d,
+         round(sum(dbus)/count(*), 2)                   AS avg_daily_dbus,
+         max(usage_date)                                AS last_billed,
+         round(sum(CASE WHEN usage_date > current_date() - INTERVAL 7 DAYS THEN dbus ELSE 0 END), 1) AS dbus_7d
+  FROM daily
+  WHERE usage_date >= current_date() - INTERVAL 30 DAYS
+  GROUP BY 1, 2
+  HAVING count(*) >= 25
+),
+graded AS (
+  SELECT a.*, o.own_normal, w.ws_normal
+  FROM apps a LEFT JOIN own o USING (app_name, workspace_id) CROSS JOIN ws w
+)
+SELECT app_name, workspace_id, days_billed_30d, total_dbus_30d, avg_daily_dbus, last_billed, dbus_7d,
+       {_vs_normal("dbus_7d")}
+FROM graded
+ORDER BY {_most_unusual("dbus_7d")}, total_dbus_30d DESC
 LIMIT 50
 """,
     },
@@ -1154,9 +1207,12 @@ LIMIT 50
         "eli5": "Finds jobs that fail repeatedly — every failed run still burns compute on "
                 "setup and partial execution before it dies.",
         "what": "A job that fails often wastes the DBUs of every failed attempt (startup + however far "
-                "it got). Each row is a job with its 30-day run count, failed-run count, failure rate, "
-                "and the hours of compute spent on runs that failed. A high failure rate on a frequent "
-                "job is both a reliability problem and a steady cost leak.",
+                "it got). Each row is a job that failed this week with its run count, failed-run count, "
+                "failure rate, and the hours of compute spent on runs that failed, set against its usual "
+                "failing week (the median of its prior four weeks that had failures). vs_normal is how many "
+                "times that usual it wasted, and that sets the alert; a job with no failures in the prior "
+                "four weeks shows as NEW. A high failure rate on a frequent job is both a reliability "
+                "problem and a steady cost leak.",
         "action": "Root-cause the recurring failures (read the termination reason and the run logs); "
                   "add an early-abort timeout so a doomed run dies fast instead of burning a full "
                   "window; and pause or fix broken schedules that never succeed.",
@@ -1164,30 +1220,43 @@ LIMIT 50
         "explain_hunt_desc": "jobs failing frequently (compute wasted on failed runs)",
         "explain_rubric": (
             "each row is a job with total_runs, failed_runs, failure_rate_pct and wasted_hours (compute "
-            "spent on runs that ended in ERROR/FAILED/TIMED_OUT/CANCELLED over 30 days). High "
+            "spent on runs that ended in ERROR/FAILED/TIMED_OUT/CANCELLED this week). vs_normal = "
+            "wasted_hours / baseline, where baseline is the job's median failing week over the prior four "
+            "(floored at the workspace's 95th-percentile failing job-week; baseline_from says which); NULL "
+            "vs_normal = a job that started failing this week. High "
             "failure_rate_pct with meaningful wasted_hours = a reliability-and-cost problem. Name the "
             "worst offenders; the fix is root-causing the failures and adding early-abort timeouts. A "
             "few cancellations are normal — focus on the chronic high-rate ones."
         ),
-        "sql": """
+        "sql": f"""
 WITH job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
-stats AS (
+weekly AS (
   SELECT workspace_id, job_id,
+         floor((unix_timestamp(current_timestamp()) - unix_timestamp(period_start_time)) / 604800) AS wk,
          count(*) AS total_runs,
          count_if(result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED')) AS failed_runs,
          round(count_if(result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED'))*100.0/count(*), 1) AS failure_rate_pct,
-         round(sum(CASE WHEN result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED')
-                        THEN timestampdiff(SECOND, period_start_time, period_end_time) ELSE 0 END)/3600.0, 1) AS wasted_hours
+         sum(CASE WHEN result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED')
+                  THEN timestampdiff(SECOND, period_start_time, period_end_time) ELSE 0 END)/3600.0 AS wasted_hours
   FROM system.lakeflow.job_run_timeline
-  WHERE period_start_time >= current_date() - INTERVAL 30 DAYS
-  GROUP BY 1,2
-  HAVING count_if(result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED')) >= 5
+  WHERE period_start_time >= current_timestamp() - INTERVAL 35 DAYS
+  GROUP BY 1, 2, 3
+),
+own AS (SELECT workspace_id, job_id, percentile_approx(wasted_hours, 0.5) AS own_normal
+        FROM weekly WHERE wk BETWEEN 1 AND 4 AND wasted_hours > 0 GROUP BY 1, 2),
+ws AS (SELECT percentile_approx(wasted_hours, 0.95) AS ws_normal
+       FROM weekly WHERE wk BETWEEN 1 AND 4 AND wasted_hours > 0),
+cur AS (
+  SELECT s.*, o.own_normal, w.ws_normal
+  FROM weekly s LEFT JOIN own o USING (workspace_id, job_id) CROSS JOIN ws w
+  WHERE s.wk = 0 AND s.failed_runs > 0
 )
 SELECT s.workspace_id,
        coalesce(jn.job_name, CAST(s.job_id AS STRING)) AS job_name,
-       s.total_runs, s.failed_runs, s.failure_rate_pct, s.wasted_hours
-FROM stats s LEFT JOIN job_names jn ON s.workspace_id=jn.workspace_id AND s.job_id=jn.job_id
-ORDER BY s.wasted_hours DESC, s.failure_rate_pct DESC
+       s.total_runs, s.failed_runs, s.failure_rate_pct, round(s.wasted_hours, 1) AS wasted_hours,
+       {_vs_normal("s.wasted_hours")}
+FROM cur s LEFT JOIN job_names jn ON s.workspace_id=jn.workspace_id AND s.job_id=jn.job_id
+ORDER BY {_most_unusual("s.wasted_hours")}, s.failure_rate_pct DESC
 LIMIT 50
 """,
     },
@@ -1810,21 +1879,36 @@ ALERT_SPECS: dict[str, AlertSpec] = {
            "new_summary": "NEW: {entity} started queueing this window ({metric} waiting this week).",
            "usd_col": None},
     # ── H16–H20 (Aug 2026 thread additions) ──
-    "H16": {"kind": "threshold", "metric_col": "run_count", "metric_label": "Runs on All-Purpose (top job)",
-            "unit": "count", "high": 100, "medium": 20, "usd_col": None,
-            "summary": "{n} jobs ran on All-Purpose compute ($0.55/DBU vs $0.15 on Jobs) — top job {metric} runs."},
+    "H16": {"kind": "anomaly", "entity_col": "job_name", "metric_col": "run_count",
+            "metric_label": "All-Purpose runs this week", "unit": "count",
+            "baseline": "median of the job's prior four weeks on that cluster, floored at the "
+                        "workspace's median job-week on All-Purpose",
+            "summary": "{entity}: {x} its usual All-Purpose runs (normal ~{baseline}/week).",
+            "new_summary": "NEW: {entity} first seen on All-Purpose compute this window ({metric} runs this week).",
+            "usd_col": None},
     "H17": {"kind": "presence", "entity_col": "warehouse_name",
             "metric_label": "Classic warehouses with auto-stop off", "usd_col": None,
             "summary": "{n} classic warehouse(s) never auto-stop, including {entity}."},
-    "H18": {"kind": "threshold", "metric_col": "node_minutes", "metric_label": "Idle-cluster runtime (top)",
-            "unit": "count", "high": 5000, "medium": 1000, "usd_col": None,
-            "summary": "{n} interactive clusters sit at low CPU — the busiest idled for {metric} node-minutes."},
-    "H19": {"kind": "threshold", "metric_col": "total_dbus_30d", "metric_label": "Always-on App DBUs (30d, top)",
-            "unit": "count", "high": 500, "medium": 100, "usd_col": None,
-            "summary": "{n} Databricks Apps run always-on — the top burned {metric} DBUs over 30 days."},
-    "H20": {"kind": "threshold", "metric_col": "wasted_hours", "metric_label": "Compute on failed runs (top job)",
-            "unit": "hours", "high": 20, "medium": 5, "usd_col": None,
-            "summary": "{n} jobs fail repeatedly — the worst wasted {metric} of compute on failed runs."},
+    "H18": {"kind": "anomaly", "entity_col": "cluster", "metric_col": "node_minutes",
+            "metric_label": "Low-CPU node-minutes this week", "unit": "count",
+            "baseline": "median of the cluster's prior four weeks, floored at the workspace's median "
+                        "interactive cluster-week",
+            "summary": "{entity}: idled {x} its usual runtime ({metric} node-minutes this week, normal ~{baseline}/week).",
+            "new_summary": "NEW: {entity} first seen this window, idling for {metric} node-minutes.",
+            "usd_col": None},
+    "H19": {"kind": "anomaly", "entity_col": "app_name", "metric_col": "dbus_7d",
+            "metric_label": "Always-on App DBUs this week", "unit": "count",
+            "baseline": "median of the app's prior four weeks, floored at the workspace's median app-week",
+            "summary": "{entity}: {x} its usual DBUs ({metric} this week, normal ~{baseline}/week).",
+            "new_summary": "NEW: {entity} first seen billing this window ({metric} DBUs this week).",
+            "usd_col": None},
+    "H20": {"kind": "anomaly", "entity_col": "job_name", "metric_col": "wasted_hours",
+            "metric_label": "Compute on failed runs this week", "unit": "hours",
+            "baseline": "median of the job's prior four weeks that had failures, floored at the "
+                        "workspace's 95th-percentile failing job-week",
+            "summary": "{entity}: wasted {x} its usual on failed runs ({metric} this week, normal ~{baseline}/week).",
+            "new_summary": "NEW: {entity} started failing this window ({metric} of compute on failed runs).",
+            "usd_col": None},
     "H21": {"kind": "presence", "entity_col": "schema_name",
             "metric_label": "Schemas with likely-snappy Delta tables", "usd_col": None,
             "summary": "{n} schema(s) hold Delta tables that predate the zstd default, including {entity}."},
