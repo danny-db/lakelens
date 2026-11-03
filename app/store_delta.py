@@ -272,8 +272,10 @@ def compare_runs(current: dict, previous: Optional[dict]) -> dict:
             continue
         f["prev_metric_value"] = p.get("metric_value")
         cur_n, prev_n = metric_num(f), metric_num(p)
-        if cur_n is None or prev_n is None or prev_n == 0:
+        if cur_n is None or prev_n is None:
             f["trend"] = "flat"
+        elif prev_n == 0:
+            f["trend"] = "worse" if cur_n > 0 else "flat"
         else:
             change = (cur_n - prev_n) / abs(prev_n)
             # For every alerting metric here, LOWER is better (less waste/spend/wait).
