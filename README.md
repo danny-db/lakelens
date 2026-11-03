@@ -1,219 +1,177 @@
-# LakeLens — FinOps for the Lakehouse
+# LakeLens: FinOps for the Lakehouse
 
-*See every dollar. Spot every saving. (formerly "LakeLedger" / "Databricks Cost Optimiser")*
+**See every dollar. Spot every saving.**
 
-A self-service Databricks App that turns the `weekly-cost-hunt` notebook into a
-guided, plain-English cost review. It runs the **customer's own** `system.*`
-tables — no data leaves the workspace, and it never changes a setting.
+LakeLens is a Databricks App that runs a plain-English cost review of your workspace. It reads only your own `system.*` tables, runs every query as the signed-in user, and never changes a setting. The one exception is tagging, which only writes when you confirm it.
 
-**Runs entirely in your own workspace** — see **[Deploying LakeLens in your workspace](#deploying-lakelens-in-your-workspace-databricks-asset-bundle)** below.
+- **23 cost hunts** find waste across AI, idle compute, heavy reads, long-running work, config and spend trends
+- **One-click scan** turns the results into a triaged alert queue with severity, explanation, fix and proof
+- **4 observability boards** (19 panels) flag anomalies above each chart
+- **7 measures** prove the saving before and after a fix
+- **Ask** tab: a Genie space over your cost tables that shows the SQL behind every answer
 
-## What it does
+Deploys in two commands as a Databricks Asset Bundle. Nothing workspace-specific is hardcoded.
 
-The app is organised into four sections: **① Optimise** (the audit→spot→tune→prove
-workflow), **② Observability** (spot the anomaly across Usage, Jobs, DBSQL, and
-Model Serving), **③ Attribute** (tagging), and **④ Estimate** (tokenomics) — plus
-an **Ask** tab (embedded Genie) for natural-language cost questions.
+```mermaid
+flowchart LR
+    U(["👤 Signed-in user"]) -->|SSO + consent| UI
 
-### Ask (embedded Genie)
-A natural-language assistant over the customer's own cost system tables. Because
-the app runs in the customer's workspace, it can't hardcode a Genie `space_id`
-(and there is no space-less Genie REST API), so a **one-time "Create cost Genie
-space" button** provisions a space (seeded with the billing/compute/query/lakeflow
-system tables), persists the returned `space_id` to a Delta config table, and
-routes all chat through the Conversations API — everything on-behalf-of-user.
-Every answer shows **the SQL Genie ran** and the result table, so numbers are
-verifiable. Requires the app's `genie` + `sql` user API scopes (adding a scope to
-a live app needs the user to **re-authorize** to mint a token with it).
+    subgraph APP["Databricks App: LakeLens"]
+        UI["Single-page UI<br/>static/index.html"] -->|/api/*| API["FastAPI<br/>app.py"]
+        API --> CAT["Cost catalogue<br/>23 hunts · 7 measures · 19 panels<br/>hunts.py · boards.py · tune.py"]
+        API --> SCAN["Scan engine<br/>scan.py (background thread)"]
+        API --> TOOLS["Tagging · Tokenomics<br/>tagging.py · tokenomics.py"]
+        API --> ASK["Ask (Genie)<br/>genie_cost.py"]
+        SCAN --> STORE["Results store<br/>store_delta.py"]
+    end
 
-The front door is a **workflow**, not a notebook: one scan builds a triaged alert
-queue for the FinOps team. The Spot / Tune / Prove / Tokenomics tabs are the
-reference + drill-down behind it.
+    subgraph WS["Your workspace (everything runs as the user)"]
+        WH[("SQL warehouse")]
+        SYS[("system.billing · compute<br/>query · lakeflow · access")]
+        DELTA[("results_catalog.lakelens<br/>runs · findings · triage")]
+        FM["Model serving<br/>ai_query() explainers"]
+        GENIE["Genie space"]
+    end
 
-| Section | Goal | Contents |
-|---|---|---|
-| **🚨 Alerts** | **The workflow** | One **"Run full cost scan"** button runs every waste-signal hunt asynchronously. Each result comes back as a pre-triaged **alert**: a deterministic **severity**, a plain-English **explanation** (from your chosen model), the **recommended fix**, and **which measure proves the before/after**. A FinOps admin works the queue: **acknowledge → in progress → resolve / dismiss**. Results **persist to Delta** (shared across users, survive restarts) and every run is **compared to the previous one** — each finding shows a NEW / ▲ WORSE / ▼ BETTER / = FLAT badge and its prior value, plus a "cleared since last scan" section. **"What did this scan cost?"** self-attributes the scan's own DBSQL + ai_query() cost. **Export the finished report** (summary + self-cost + every alert) **to PDF** with one click. |
-| **📊 Observability** | **Spot the anomaly, not just the graph** | Four boards — **Usage** (spend trend / by-SKU / by-workspace / **AI_FORECAST**), **Jobs** (potential savings, low-CPU, high-memory, fixed-workers, outdated-DBR), **DBSQL** (cost by user / source-type / query / trend), **Model Serving** (batch inference / pay-per-token / provisioned-throughput / by-endpoint). Every panel runs a **deterministic anomaly detector** (spike vs history, dominant outlier, new entity, threshold) and leads with plain-English callouts *above* the chart; an optional AI pass narrates what to do. Grounded in the labs Account-Usage-Dashboard-v2, the DBSQL cost-per-query PrPr, and the model-serving cost-attribution dashboard. |
-| **🏷️ Tagging** | Cost attribution | Finds **untagged** warehouses, clusters, and spend-by-product (read-only) — the foundation of attribution (deck Step 1). **Set a tag** right from the UI (the one action that writes to the workspace: explicit, confirmed, runs as you so it's permission-gated). |
-| **Overview** | Orient | A scan CTA + live KPIs (30-day spend, idle warehouse cost, top product, # checks) + the Spot/Tune/Prove loop + the 4-step maturity model. |
-| **① Spot** | Find the waste | 15 "hunts" (H0–H14) grouped into 6 plain-English categories: AI & Model Serving · Idle Compute · Heavy Reads & Spill · Long-Running & Repetitive · Right-Sizing & Config · Spend Trends & Attribution. Each card = ELI5 summary + live results + an optional AI "explain in plain English". **Export a single check, or the whole page, to PDF.** |
-| **② Tune** | Use Databricks well | 12 best-practice cards (Job-vs-All-Purpose 2–3×, Serverless 25%+, Photon caveat, Liquid Clustering/PO/Zstd, statement timeouts, compute policies, spot, AI guardrails, tagging, budgets, billing admin), grouped by the maturity model. |
-| **③ Prove** | Measure the saving | The M-queries: M3 "After Scoreboard" (weekly $/warehouse chart), M1b idle cost, M2 exact $/job+pipeline, M5 timeout scoreboard — with the honest three-currencies framing. |
-| **💠 Tokenomics** | Estimate AI cost *ahead* of the bill | Interactive calculator (model / tokens / volume / cache / discount → cost per task/day/month + a live tokens→DBU→$ breakdown), model comparison on your task, workload menu, rate card with a live `list_prices` verify button, actual 30-day model-serving spend per endpoint, and the caching + AI-Gateway pricing explainers. Ported from an internal token cost-estimator notebook. |
-
-Every hunt (H0–H14) has an "✨ Explain" button — a neutral, cost-aware plain-English
-gloss over its own result, via `ai_query()`. (`ai_query` is the right tool for a text
-gloss: it runs in the SQL engine with the rows inline and needs no extra scope. The
-Tokenomics tab's live-call proof is the one place FMAPI-direct would be used instead,
-because it needs the token counts back — which `ai_query` strips.)
-
-The hunt/measure SQL is transcribed **verbatim** from the live-validated notebook
-(a live-validated `weekly-cost-hunt` notebook). H15
-(the one hunt that reads customer data) is intentionally excluded — the app is
-system-tables-only.
-
-## Architecture
-
-- **FastAPI** backend (`app/app.py`) + single self-contained `static/index.html`
-  + vendored Chart.js. No build step.
-- **Persistence & sharing** (`app/store_delta.py`): completed scans, findings, and
-  triage are written to Delta tables in `RESULTS_CATALOG.RESULTS_SCHEMA` (set per
-  workspace via the bundle; schema default `lakelens`) as the logged-in user. `/api/scan/latest` reads the
-  most recent run back with run-over-run comparison, so the queue is **shared** and
-  **survives restarts/redeploys**. Findings are written first and the run row last (a
-  commit marker) so a reader never sees a half-written run. Falls back to in-memory if
-  the schema isn't writable.
-- **Multi-worker note:** Databricks Apps runs several worker processes; scan IDs are
-  UUIDs (not a per-process counter) and the frontend falls back to the shared
-  `/api/scan/latest` when a `/scan/{id}` poll lands on a worker that didn't own the run.
-- **The scan workflow** (`app/scan.py`): `POST /api/scan/start` captures the OBO
-  client on the request thread, spawns a **background thread** that runs every
-  alerting hunt, and returns a `scan_id` instantly. The browser polls
-  `GET /api/scan/{id}` and streams findings in as they complete — so no single
-  request is ever held past the ~120s app cap. Severity is **deterministic**
-  (rule-based, in `hunts.ALERT_SPECS`); the AI only narrates. Triage
-  (`POST /api/finding/{hunt_id}/triage`) is keyed by hunt id and stored in an
-  in-memory `Store` (demo-scoped — swap for Delta/Lakebase to persist).
-- **Auth = on-behalf-of-user (OBO).** Every query runs as the logged-in user via
-  the `x-forwarded-access-token` header, so each user sees exactly the cost data
-  their own governance allows — no service-principal grant, no account-admin
-  dependency. Requires the app's `sql` user API scope. Falls back to the ambient
-  client locally so `uvicorn` dev runs work.
-- **No held-open requests.** Queries submit with a short wait then poll to
-  completion, so nothing hits the Databricks Apps ~120s request cap.
-- **Row cap.** The backend ships only the top ~200 rows to the browser (the UI
-  shows 100) but reports the true total — a hunt returning 150k rows never fully
-  crosses the wire. Chart measures are the only unbounded callers.
-- `/api/whoami` is a diagnostic that confirms OBO is working (auth mode + who the
-  SQL path resolves to).
+    API -->|OBO token| WH
+    CAT -. SQL .-> WH
+    SCAN -. SQL .-> WH
+    WH --> SYS
+    WH --> FM
+    STORE -->|write| DELTA
+    ASK -->|Conversations API| GENIE
+    GENIE --> SYS
+```
 
 ---
 
-# Deploying LakeLens in your workspace (Databricks Asset Bundle)
+## What's inside
 
-LakeLens ships as a **Databricks Asset Bundle** (`databricks.yml`), so you can
-deploy it into your own workspace with two commands. Nothing workspace-specific
-is hardcoded — you pass your warehouse and catalog as variables.
+| Tab | What it does |
+|---|---|
+| 🚨 **Alerts** | **Run full cost scan** runs every hunt in the background and builds an alert queue: severity, plain-English explanation, recommended fix, and the measure that proves it. Work it as *acknowledge → in progress → resolve / dismiss*. Results are saved to Delta and shared. Each run is compared with the last (NEW / WORSE / BETTER / FLAT). It also shows what the scan itself cost, and exports to PDF. |
+| 📊 **Observability** | **Usage** (trend, SKU, workspace, AI forecast), **Jobs** (savings, low CPU, high memory, fixed workers, old DBR), **DBSQL** (by user, source, query, trend), **Model Serving** (batch, pay-per-token, provisioned, by endpoint). |
+| ① **Spot** | The 23 hunts, grouped into 6 categories. Each card has a short summary, live results, an ✨ Explain button and PDF export. |
+| ② **Tune** | 12 best-practice cards: job vs all-purpose compute, serverless, Photon, liquid clustering / PO / zstd, timeouts, policies, spot, AI guardrails, tagging, budgets. |
+| ③ **Prove** | 7 measures that show the saving (see below). |
+| 🏷️ **Tagging** | Finds untagged warehouses, clusters and spend. You can set a tag in place (confirmed, runs as you). |
+| 💠 **Tokenomics** | Estimates AI cost before the bill: tokens → DBU → $, model comparison, live `list_prices` check, actual 30-day serving spend. |
+| 💬 **Ask** | Natural-language cost questions through Genie. A one-time button creates the space. |
 
-## Prerequisites
+### The 23 hunts
 
-1. **Databricks CLI ≥ 0.246.0** (`databricks --version`). Earlier versions can't set
-   the app's OBO scopes from the bundle. Install/upgrade:
-   `brew install databricks` or see the [CLI docs](https://docs.databricks.com/dev-tools/cli/install).
-2. **Authenticate** the CLI to your workspace:
-   `databricks auth login --host https://<your-workspace>.cloud.databricks.com`
-   (creates a profile you pass with `-p <profile>`).
-3. **A SQL warehouse** the app will run queries on — get its id from
-   `databricks warehouses list` (Serverless is ideal). This is `warehouse_id`.
-4. **A catalog you can `CREATE` in** — LakeLens persists scan results + the Genie
-   space-id here (e.g. `main`, or a dedicated `lakelens` catalog). This is
-   `results_catalog`. Skip it and the app still runs, just without shared/persisted
-   scans.
-5. **Permission to create Databricks Apps** in the workspace (the CLI user, or the
-   bundle's run-as principal).
+| Category | Hunts |
+|---|---|
+| 🤖 AI & Model Serving | H0 Runaway AI spend |
+| 💤 Idle Compute | H3 Chatter keeps warehouses awake · H4 Warehouses that never sleep · H14 Idle cores · H16 Jobs on all-purpose compute · H18 Idle interactive clusters · H19 Always-on Databricks Apps |
+| 📖 Heavy Reads & Spill | H1 Read amplification · H2 Disk spill · H6 The scan paid five times · H21 Tables still on snappy (not zstd) |
+| ⏱️ Long-Running & Repetitive | H5 Runaway statements (over 4 hours) · H7 Polling every 20 seconds |
+| ⚙️ Right-Sizing & Config | H8 Queue pressure vs capacity · H9 Warehouse config audit · H17 Auto-stop disabled · H22 Serverless jobs in performance-optimised mode |
+| 📈 Spend Trends & Attribution | H10 Spend by product (SKU) · H11 Jobs: weekly movers · H12 Jobs: who got slower? · H13 Cost per pipeline · H20 Frequently failing jobs · H23 Predictive Optimisation cost drivers |
 
-## Two-command deploy
+H15 is left out on purpose. It's the only hunt that reads customer data, and LakeLens reads system tables only.
+
+### The 7 measures (Prove)
+
+M1 Per-query cost on shared warehouses · M1b Warehouse idle cost · M2 Exact $ per job and pipeline · M3 "After" scoreboard (weekly $ per warehouse) · M4 Benchmark a fix week over week · M5 Timeout guardrail scoreboard · M6 Serverless job cost by performance mode
+
+---
+
+## Deploy in your workspace
+
+**You need:**
+- Databricks CLI **0.246.0 or later** (`databricks --version`)
+- A SQL warehouse (serverless is best). This is `warehouse_id`.
+- A catalog you can `CREATE` in, to save scans. This is `results_catalog`. It's optional: without it, scans aren't saved.
+- Permission to create Databricks Apps
 
 ```bash
-# from the repo root (where databricks.yml lives)
+databricks auth login --host https://<your-workspace>.cloud.databricks.com
 
-# 1. Deploy the bundle: uploads the app source + creates/updates the app resource,
-#    wired to your warehouse + catalog and with the OBO scopes (sql, genie) set.
+# 1. Deploy (uploads the app, wires the warehouse + catalog, sets the OBO scopes)
 databricks bundle deploy -t prod -p <profile> \
   --var="warehouse_id=<your-sql-warehouse-id>" \
   --var="results_catalog=<a-catalog-you-can-write-to>"
 
-# 2. Start (or restart) the app with the deployed code.
+# 2. Start the app (prints the URL)
 databricks bundle run lakelens -t prod -p <profile>
 ```
 
-`bundle run` prints the app URL (`https://lakelens-<workspace-id>.aws.databricksapps.com`).
-That's it — no separate `apps create` / `sync` / `apps deploy` needed; the bundle
-does all of it.
+Tip: pin `host`, `warehouse_id` and `results_catalog` in the `prod` target of `databricks.yml` and skip the `--var`s.
 
-> **Tip:** instead of `--var` each time, edit the `prod` target in `databricks.yml`
-> to pin your `host`, `warehouse_id`, and `results_catalog`, then just
-> `databricks bundle deploy -t prod`.
+### First run
+1. Open the app URL and **Accept** the consent screen (SQL + Genie scopes).
+2. Optional: add `/api/whoami` to the URL. You should see `"sql_ok": true` and your email.
+3. **Alerts → Run full cost scan.**
+4. **Ask → Create cost Genie space** (once).
 
-## Configuration surface
-
-All config is bundle **variables** (in `databricks.yml`, override with `--var` or per
-target). The bundle passes them to the app as env vars — you never edit code.
+### Settings
 
 | Variable | Required | Default | What it is |
 |---|---|---|---|
-| `warehouse_id` | **yes** | — | SQL warehouse the app runs every query on |
-| `results_catalog` | **yes*** | — | Catalog for persisted scans + Genie space-id (*app runs without it, just no persistence) |
+| `warehouse_id` | yes | none | SQL warehouse every query runs on |
+| `results_catalog` | recommended | none | Where scans, triage and the Genie space id are saved |
 | `results_schema` | no | `lakelens` | Schema inside that catalog |
-| `ai_endpoint` | no | `databricks-gpt-5-4-mini` | Model-serving endpoint for the plain-English explainers |
-| `ai_endpoint_dbu` | no | `7.5,30` | Published DBU/1M-token rate (in,out) of `ai_endpoint`, to price the scan's own AI cost |
+| `ai_endpoint` | no | `databricks-gpt-5-4-mini` | Model for the plain-English explanations |
+| `ai_endpoint_dbu` | no | `7.5,30` | That model's DBU per 1M tokens (in,out), used to price the scan |
 
-## Permissions your users need (OBO model)
+### What users need
+Every query runs as the signed-in user (on-behalf-of-user), so there are no service-principal grants. Each user needs:
+- `SELECT` on `system.billing`, `system.compute`, `system.query`, `system.lakeflow`, `system.access`
+- `CAN USE` on the SQL warehouse
+- `CREATE` on `results_catalog` (for saving scans)
+- Permission to create a Genie space (for the Ask tab's first run)
 
-LakeLens runs **every query as the signed-in user** (on-behalf-of-user), so it needs
-no blanket service-principal grants. Each user who opens the app needs, in their own
-right:
+---
 
-- **`SELECT` on the `system` schemas** it reads: `system.billing`, `system.compute`,
-  `system.query`, `system.lakeflow`, `system.access`. (Grant with
-  `GRANT USE SCHEMA ON SCHEMA system.billing TO \`<group>\`` etc., or enable the
-  system schemas for the account.)
-- **`CAN USE`** on the SQL warehouse (the bundle grants the *app* this; users also
-  need it for their own token).
-- **`CREATE`** on `results_catalog` (only for persistence — first scan creates the
-  schema + tables).
-- For the **Ask (Genie)** tab: the `genie` + `dashboards.genie` scopes are set by the
-  bundle; the user also needs permission to create a Genie space (first-run button).
+## Troubleshooting
 
-## First run
+| Symptom | Fix |
+|---|---|
+| Scans return an auth error | User lacks `SELECT` on a `system.*` schema or `CAN USE` on the warehouse. Check `/api/whoami`. |
+| "No warehouse configured" | Redeploy with `--var="warehouse_id=..."`. |
+| Scans don't save or aren't shared | `results_catalog` unset, or the user can't `CREATE` there. The app still works in memory. |
+| Ask: "token does not have required scopes: genie" | Old consent. See *Changing scopes* below. |
+| `bundle deploy` rejects `user_api_scopes` | Upgrade the CLI to 0.246.0 or later. |
 
-1. Open the app URL, complete SSO — you'll see a **consent screen** listing the
-   scopes (SQL, Genie). Click **Accept**.
-2. Hit **`/api/whoami`** (append to the URL) to confirm OBO: expect
-   `"sql_ok": true` and your email as `sql_runs_as`.
-3. Go to **Alerts → Run full cost scan** to populate the queue.
-4. Go to **Ask** → click **"Create cost Genie space"** once (provisions the Genie
-   space, seeded with the cost system tables). Subsequent visits skip straight to chat.
+<details>
+<summary><b>Changing scopes after first deploy</b></summary>
 
-### ⚠️ If you change the app's scopes later
-Adding a `user_api_scope` to an already-authorized app does **not** update an existing
-user's consent — their token keeps the old scopes (clearing cookies won't fix it,
-because the workspace SSO session silently re-issues the old grant). To force
-re-consent, an admin deletes the stale grant:
+Adding a scope to an app that users already authorised doesn't update their consent. Their token keeps the old scopes, even after clearing cookies. An admin can reset it:
+
 ```bash
 CLIENT_ID=$(databricks apps get lakelens -p <profile> | jq -r .oauth2_app_client_id)
 databricks api delete "/api/2.0/oauth-app-integrations/$CLIENT_ID/user-consent/me" -p <profile>
 ```
-then the user reopens the app in a **fresh/incognito** window and re-accepts. (Setting
-all scopes at first deploy — as this bundle does — avoids this entirely.)
 
-## Local development
+Then reopen the app in an incognito window and accept again. This bundle sets all scopes at first deploy, so you shouldn't need this.
+</details>
+
+<details>
+<summary><b>How it works (architecture)</b></summary>
+
+- **FastAPI** backend (`app/app.py`) and a single `static/index.html` with vendored Chart.js. No build step.
+- **Scans run in the background** (`app/scan.py`). `POST /api/scan/start` returns a scan id at once. The browser polls and streams findings in, so no request comes near the ~120s app limit. Severity is rule-based (`hunts.ALERT_SPECS`); the AI only writes the explanation.
+- **Saved to Delta** (`app/store_delta.py`): runs, findings and triage are saved in `results_catalog.results_schema`. The run row is written last, so readers never see a half-written run. If the schema isn't writable, the app falls back to memory.
+- **Multi-worker safe:** scan ids are UUIDs, and polls fall back to `/api/scan/latest` if they hit a different worker.
+- **Row cap:** only the top ~200 rows go to the browser, with the true total shown.
+- **✨ Explain** uses `ai_query()`, which runs in the SQL engine with the rows inline and needs no extra scope.
+- **Ask** creates a Genie space seeded with the billing, compute, query and lakeflow system tables. It saves the space id to Delta and chats through the Conversations API as the user.
+- The hunt and measure SQL comes from a live-validated `weekly-cost-hunt` notebook.
+</details>
+
+<details>
+<summary><b>Local development and SQL validation</b></summary>
 
 ```bash
 cd app
 export DATABRICKS_CONFIG_PROFILE=<profile>
 export DATABRICKS_WAREHOUSE_ID=<warehouse_id>
 export RESULTS_CATALOG=<catalog>
-export AI_ENDPOINT=databricks-gpt-5-4-mini
 python3 -m uvicorn app:app --host 127.0.0.1 --port 8771
 ```
-Without a forwarded user token the app runs queries as your CLI profile, so local
-runs behave like the deployed app minus per-user OBO.
 
-## Validate the SQL
+Locally, queries run as your CLI profile (no per-user OBO).
 
-`python3 validate.py` runs every hunt/explainer/measure and `python3 validate_boards.py`
-runs every Observability panel — against the configured warehouse, failing loudly on any
-error. Run after editing any SQL. (Both use a `PROFILE`/`WAREHOUSE` constant near the top
-— point them at your workspace.)
-
-## Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| App shows but scans return an auth error | User lacks `SELECT` on a `system.*` schema, or `CAN USE` on the warehouse. Check `/api/whoami`. |
-| "No warehouse configured" | `warehouse_id` variable not set — redeploy with `--var="warehouse_id=…"`. |
-| Scans run but don't persist / not shared | `results_catalog` unset, or the user lacks `CREATE` on it. App still works in-memory. |
-| Ask tab: "token does not have required scopes: genie" | Stale consent grant — see the re-consent box above. |
-| Genie space create fails | User lacks permission to create a Genie space, or the `genie` scope isn't consented yet. |
-| `bundle deploy` rejects `user_api_scopes` | CLI < 0.246.0 — upgrade the Databricks CLI. |
+After editing any SQL, run `python3 validate.py` (every hunt, explainer and measure) and `python3 validate_boards.py` (every Observability panel). Both fail loudly on errors. Set the `PROFILE` / `WAREHOUSE` constants at the top first.
+</details>

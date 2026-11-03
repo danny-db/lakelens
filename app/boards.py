@@ -22,7 +22,7 @@ Same verbatim-when-possible rule as hunts.py. Where a public source existed
 forecast = Account Usage Dashboard v2) the core logic is transcribed and only
 de-parameterised (the dashboards are parameter-bound; the app is not).
 """
-from typing import Optional, Any
+from typing import Optional
 
 # ── Anomaly detectors ─────────────────────────────────────────────────────────
 # Each is pure Python over the panel's returned rows. They return a list of
@@ -252,7 +252,7 @@ def _threshold(spec, ci, rows):
     return [{
         "severity": "medium",
         "headline": f"{n} {label} crossed the {'below' if op == 'lt' else 'above'}-{_fmt(bar, unit)} line",
-        "detail": f"These are the rows worth acting on first.",
+        "detail": "These are the rows worth acting on first.",
     }]
 
 

@@ -21,7 +21,7 @@ Design notes:
 import threading
 import traceback
 from datetime import datetime, timezone
-from typing import Optional, Any, Callable
+from typing import Optional, Callable
 
 import hunts as catalogue
 

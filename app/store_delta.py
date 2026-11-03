@@ -18,7 +18,7 @@ in-memory Store and the app still works — just not shared/durable.
 """
 import json
 import logging
-from typing import Optional, Any, Callable
+from typing import Optional, Callable
 
 logger = logging.getLogger("uvicorn.error")
 

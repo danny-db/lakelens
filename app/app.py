@@ -1,5 +1,5 @@
 """
-Databricks Cost Optimiser — FastAPI backend.
+LakeLens (formerly Databricks Cost Optimiser) — FastAPI backend.
 
 A self-service layer over the `weekly-cost-hunt` notebook. It runs the SAME
 system-table queries the notebook runs — against the CUSTOMER'S OWN
@@ -7,9 +7,10 @@ system.* tables — and presents them as guided "hunts" (find waste),
 "tune" guidance (use Databricks cost-effectively), and "measures"
 (prove the saving).
 
-Auth model: the app's service principal (WorkspaceClient with no arguments
-picks up the ambient OAuth in the Apps runtime). All queries run as the SP,
-so the SP — not each end user — needs SELECT on the system schemas.
+Auth model: on-behalf-of-user (OBO). Each request builds a WorkspaceClient
+from the `x-forwarded-access-token` header, so every query runs as the
+signed-in user and needs that user's own SELECT on the system schemas.
+Locally (no forwarded token) it falls back to the ambient client.
 
 Timeout model: Databricks Apps cut a single HTTP request at ~120s (hard).
 Some hunts scan 14 days of query history. So every query is submitted with
