@@ -1663,7 +1663,7 @@ function alertCard(f) {
   // How the headline row compares with its own normal. Older saved scans have no `vs`.
   const vs = f.vs || {};
   const vsBadge = vs.reading === "anomaly" && vs.x != null
-      ? `<span class="vs-normal ${f.severity==='high'?'high':''}" title="this window versus the entity's own usual">${vs.x.toFixed(1)}x normal</span>`
+      ? `<span class="vs-normal ${f.severity==='high'?'high':''}" title="this window versus the entity's own usual">${vs.x >= 10 ? Math.round(vs.x).toLocaleString() : vs.x.toFixed(1)}x normal</span>`
     : vs.reading === "new" ? `<span class="vs-normal new" title="no history for this entity in the prior 28 days">NEW, first seen</span>`
     : vs.reading === "presence" ? `<span class="vs-normal presence" title="a configuration state, graded by presence">config present</span>` : "";
   const metricLine = vs.reading === "presence" ? ""

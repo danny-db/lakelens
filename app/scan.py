@@ -177,7 +177,7 @@ def _fmt_metric(value: float, unit: str) -> str:
     if unit == "count":
         return f"{v:,.0f}"
     if unit == "tib":
-        return f"{v:,.2f} TiB"
+        return f"{v:,.2f} TiB" if v >= 0.01 else f"{v * 1024:,.2f} GiB"
     if unit == "hours":
         return f"{v:,.1f} h"
     if unit == "minutes":
@@ -198,7 +198,7 @@ def _headline(spec: dict, g: Grade, row: list, ci: dict, total: int, metric_str:
     entity = str(row[ci[spec["entity_col"]]]) if spec.get("entity_col") in ci else ""
     if g.reading == "new":
         return spec["new_summary"].format(entity=entity, metric=metric_str, n=total)
-    x = f"{g.x:,.1f}x" if g.x is not None else ""
+    x = "" if g.x is None else f"{g.x:,.0f}x" if g.x >= 10 else f"{g.x:.1f}x"
     return spec["summary"].format(entity=entity, x=x, baseline=baseline_str, metric=metric_str, n=total)
 
 

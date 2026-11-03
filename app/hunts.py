@@ -157,10 +157,15 @@ LIMIT 20
         "title": "Read amplification",
         "eli5": "Finds MERGE statements that read enormously more data than they write "
                 "— an “incremental” job quietly re-scanning everything.",
-        "what": "A read-to-write ratio in the thousands is the red flag. If the target "
-                "table is small but the reads are huge, the cost is upstream (the source "
-                "query has no date filter). If reads are about twice the target size, the "
-                "merge is scanning the whole target every run.",
+        "what": "Each row is one MERGE target (or the job, notebook or person behind it) "
+                "with its heaviest run this week, set against the bytes a run of that same "
+                "MERGE usually reads. vs_normal is how many times its usual this run read, "
+                "and that sets the alert: an incremental MERGE that suddenly reads several "
+                "times its normal has started re-scanning. A high read-to-write ratio says "
+                "the same thing in another way. If the target table is small but the reads "
+                "are huge, the cost is upstream (the source query has no date filter). If "
+                "reads are about twice the target size, the merge is scanning the whole "
+                "target every run.",
         "action": "Bound the source with an incremental watermark so it only reads new "
                   "rows; bound the target with incremental_predicates on a date column; "
                   "cluster the target on that same column so old data can be skipped; and "
@@ -168,22 +173,48 @@ LIMIT 20
         "measure": "M4",
         "explain_hunt_desc": "MERGE statements that read far more than they write (read amplification)",
         "explain_rubric": (
-            "read_write_ratio in the thousands is the red flag. Then compare read_tib per "
+            "each row is a MERGE target's heaviest run this week. vs_normal = read_tib / baseline, "
+            "where baseline is the median bytes a run of the same MERGE read over the prior 28 days "
+            "(floored at the workspace's 95th-percentile MERGE; baseline_from says which). A NULL vs_normal "
+            "means a MERGE first seen this week. A run several times its own normal has started "
+            "re-scanning; read_write_ratio corroborates it. Then compare read_tib per "
             "run against the target's actual size (DESCRIBE DETAIL <target> -> sizeInBytes, "
             "see H15): if the target is small but reads are huge, the cost is upstream (the "
             "source query); if reads are approximately 2x the target size, the merge scans "
             "the whole target in both its match and rewrite phases."
         ),
         "sql": """
-SELECT statement_id, executed_by,
+WITH merges AS (
+  SELECT statement_id, executed_by, start_time, read_bytes, written_bytes, total_duration_ms,
+         coalesce(nullif(regexp_extract(statement_text, '(?i)MERGE\\s+INTO\\s+([`\\w.]+)', 1), ''),
+                  'job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
+                  executed_by) AS merge_target
+  FROM system.query.history
+  WHERE statement_type = 'MERGE' AND read_bytes > 0
+    AND start_time >= current_date() - INTERVAL 35 DAYS
+),
+prior AS (SELECT * FROM merges WHERE start_time < current_date() - INTERVAL 7 DAYS),
+own AS (SELECT merge_target, percentile_approx(read_bytes, 0.5) AS own_normal FROM prior GROUP BY 1),
+ws AS (SELECT percentile_approx(read_bytes, 0.95) AS ws_normal FROM prior),
+cur AS (
+  SELECT m.*, o.own_normal, w.ws_normal,
+         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS base_bytes
+  FROM merges m LEFT JOIN own o USING (merge_target) CROSS JOIN ws w
+  WHERE m.start_time >= current_date() - INTERVAL 7 DAYS
+  QUALIFY row_number() OVER (PARTITION BY m.merge_target ORDER BY m.read_bytes DESC) = 1
+)
+SELECT statement_id, executed_by, merge_target,
        read_bytes/POW(1024,4)               AS read_tib,
        written_bytes/POW(1024,3)            AS written_gib,
        CAST(read_bytes AS DOUBLE)/NULLIF(written_bytes,0) AS read_write_ratio,
-       total_duration_ms/60000.0            AS mins
-FROM system.query.history
-WHERE statement_type = 'MERGE'
-  AND start_time >= current_date() - INTERVAL 7 DAYS
-ORDER BY read_bytes DESC
+       total_duration_ms/60000.0            AS mins,
+       base_bytes/POW(1024,4)               AS baseline,
+       round(read_bytes / base_bytes, 2)    AS vs_normal,
+       CASE WHEN base_bytes IS NULL THEN 'none (new)'
+            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+FROM cur
+WHERE read_bytes >= coalesce(base_bytes, ws_normal, 0)
+ORDER BY coalesce(read_bytes / base_bytes, read_bytes / ws_normal) DESC
 LIMIT 20
 """,
     },
@@ -195,7 +226,11 @@ LIMIT 20
         "title": "Disk spill",
         "eli5": "Finds queries that ran out of memory and had to write working data to "
                 "disk — far slower, and you pay for the extra time.",
-        "what": "Compare spill to the input size. Spill much LARGER than the input (we have "
+        "what": "Each row is one source of spilling statements (a job, notebook, saved query, "
+                "dashboard or person) with its worst spill this week, set against how much a "
+                "spilling statement from that source usually spills. vs_normal is how many times "
+                "its usual, and that sets the alert. "
+                "Compare spill to the input size. Spill much LARGER than the input (we have "
                 "seen 46×) is a query-shape problem — a CTE recomputed many times, "
                 "de-duplication done after a join instead of before, or an unbounded lookback. "
                 "Spill roughly equal to the input is a sizing problem.",
@@ -206,20 +241,46 @@ LIMIT 20
         "measure": "M4",
         "explain_hunt_desc": "statements spilling intermediate data to disk (memory pressure)",
         "explain_rubric": (
+            "each row is a source's worst-spilling statement this week. vs_normal = spill_tib / "
+            "baseline, where baseline is the source's median spill per spilling statement over the "
+            "prior 28 days (floored at the workspace median; baseline_from says which). NULL "
+            "vs_normal = a source first seen spilling this week. "
             "compare spill_tib to read_gib. Spill far larger than the input (we saw 46x) is a "
             "query-shape problem: re-used CTEs recomputed per reference, deduplication after a "
             "join instead of before, unbounded lookback windows. Spill roughly proportional to "
             "input on a well-shaped query is a sizing problem."
         ),
         "sql": """
-SELECT statement_id, start_time, executed_by,
+WITH spills AS (
+  SELECT statement_id, start_time, executed_by, spilled_local_bytes, read_bytes, total_duration_ms,
+         coalesce('job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
+                  'query ' || query_source.sql_query_id, 'dashboard ' || query_source.dashboard_id,
+                  executed_by) AS source
+  FROM system.query.history
+  WHERE spilled_local_bytes > 0
+    AND start_time >= current_date() - INTERVAL 35 DAYS
+),
+prior AS (SELECT * FROM spills WHERE start_time < current_date() - INTERVAL 7 DAYS),
+own AS (SELECT source, percentile_approx(spilled_local_bytes, 0.5) AS own_normal FROM prior GROUP BY 1),
+ws AS (SELECT percentile_approx(spilled_local_bytes, 0.5) AS ws_normal FROM prior),
+cur AS (
+  SELECT s.*, o.own_normal, w.ws_normal,
+         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS base_bytes
+  FROM spills s LEFT JOIN own o USING (source) CROSS JOIN ws w
+  WHERE s.start_time >= current_date() - INTERVAL 7 DAYS
+  QUALIFY row_number() OVER (PARTITION BY s.source ORDER BY s.spilled_local_bytes DESC) = 1
+)
+SELECT statement_id, start_time, executed_by, source,
        spilled_local_bytes/POW(1024,4)      AS spill_tib,
        read_bytes/POW(1024,3)               AS read_gib,
-       total_duration_ms/60000.0            AS mins
-FROM system.query.history
-WHERE spilled_local_bytes > 0
-  AND start_time >= current_date() - INTERVAL 7 DAYS
-ORDER BY spilled_local_bytes DESC
+       total_duration_ms/60000.0            AS mins,
+       base_bytes/POW(1024,4)               AS baseline,
+       round(spilled_local_bytes / base_bytes, 2) AS vs_normal,
+       CASE WHEN base_bytes IS NULL THEN 'none (new)'
+            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+FROM cur
+WHERE spilled_local_bytes >= coalesce(base_bytes, ws_normal, 0)
+ORDER BY coalesce(spilled_local_bytes / base_bytes, spilled_local_bytes / ws_normal) DESC
 LIMIT 20
 """,
     },
@@ -308,7 +369,12 @@ ORDER BY 1, 2
         "title": "Runaway statements (over 4 hours)",
         "eli5": "Finds any statement that ran longer than four hours, and splits its time "
                 "into waiting-for-capacity vs starting-up vs actually-running.",
-        "what": "The split tells you which of three problems you have. Long execution time "
+        "what": "Each row is a statement that ran over four hours this week, set against the "
+                "longest statement its source (job, notebook, saved query, or person) usually runs "
+                "in a day. vs_normal is how many times that usual length this one ran, and that "
+                "sets the alert: a nightly six-hour job is normal for itself, while a four-hour "
+                "statement from a source that usually finishes in minutes is not. "
+                "The split tells you which of three problems you have. Long execution time "
                 "plus a huge read = a genuine heavy scan. Long execution time plus tiny reads "
                 "= a HUNG statement (we found two that ‘ran’ 21.7 hours while reading "
                 "6 MB). A large queued time = a capacity problem (see Queue Pressure).",
@@ -319,21 +385,50 @@ ORDER BY 1, 2
         "measure": "M5",
         "explain_hunt_desc": "statements running over 4 hours, split into queued vs executing",
         "explain_rubric": (
+            "vs_normal = total_min / baseline, where baseline is the source's median daily longest "
+            "statement over the prior 28 days (floored at the workspace's 95th percentile; baseline_from says "
+            "which). A statement near 1x is that source's normal long run; a high multiple is a "
+            "runaway or a hang. NULL vs_normal = a source first seen this week. "
             "long exec_min + huge read_gib = a genuine heavy scan (see H6). Long exec_min + tiny "
             "reads = a hung statement (we found two that executed 21.7 h while reading 6 MB - "
             "check execution_status and the query profile). Large queued_min = a capacity problem (see H8)."
         ),
         "sql": """
-SELECT statement_id, start_time,
-       total_duration_ms/60000.0               AS total_min,
+WITH stmts AS (
+  SELECT statement_id, start_time, executed_by, total_duration_ms, waiting_at_capacity_duration_ms,
+         waiting_for_compute_duration_ms, execution_duration_ms, read_files, read_bytes,
+         coalesce('job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
+                  'query ' || query_source.sql_query_id, 'dashboard ' || query_source.dashboard_id,
+                  executed_by) AS source
+  FROM system.query.history
+  WHERE start_time >= current_date() - INTERVAL 35 DAYS
+),
+daily AS (
+  SELECT source, date(start_time) AS day, max(total_duration_ms)/60000.0 AS longest_min
+  FROM stmts WHERE start_time < current_date() - INTERVAL 7 DAYS
+  GROUP BY 1, 2
+),
+own AS (SELECT source, percentile_approx(longest_min, 0.5) AS own_normal FROM daily GROUP BY 1),
+ws AS (SELECT percentile_approx(longest_min, 0.95) AS ws_normal FROM daily),
+cur AS (
+  SELECT s.*, s.total_duration_ms/60000.0 AS total_min, o.own_normal, w.ws_normal,
+         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS base_min
+  FROM stmts s LEFT JOIN own o USING (source) CROSS JOIN ws w
+  WHERE s.total_duration_ms > 4*3600*1000
+    AND s.start_time >= current_date() - INTERVAL 7 DAYS
+)
+SELECT statement_id, start_time, source,
+       total_min,
        waiting_at_capacity_duration_ms/60000.0 AS queued_min,
        waiting_for_compute_duration_ms/60000.0 AS provisioning_min,
        execution_duration_ms/60000.0           AS exec_min,
-       read_files, read_bytes/POW(1024,3)      AS read_gib
-FROM system.query.history
-WHERE total_duration_ms > 4*3600*1000
-  AND start_time >= current_date() - INTERVAL 7 DAYS
-ORDER BY total_duration_ms DESC
+       read_files, read_bytes/POW(1024,3)      AS read_gib,
+       round(base_min, 1)                      AS baseline,
+       round(total_min / base_min, 2)          AS vs_normal,
+       CASE WHEN base_min IS NULL THEN 'none (new)'
+            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+FROM cur
+ORDER BY coalesce(total_min / base_min, total_min / ws_normal) DESC
 """,
     },
 
@@ -341,36 +436,61 @@ ORDER BY total_duration_ms DESC
     {
         "id": "H6",
         "category": "reads",
-        "title": "The scan paid five times",
-        "eli5": "Finds several multi-terabyte scans by the same person within one hour — "
-                "the signature of an investigation re-scanning a raw table over and over.",
-        "what": "Three or more heavy scans in one hour from one person is almost always a "
-                "single incident hunt — someone searching a raw event table with "
-                "‘LIKE %some-id%’ and re-paying the full scan on every refinement. "
-                "Open the statements in Query History to confirm the shape.",
+        "title": "Unusually heavy scan hours by one person",
+        "eli5": "Finds an hour in which one person scanned far more data than they usually do "
+                "in a busy hour, often an investigation re-scanning a raw table over and over.",
+        "what": "Each row is one person's heaviest scanning hour this week, set against their "
+                "own busy hour (the 95th percentile of their active hours over the prior 28 "
+                "days). vs_normal is how many times that normal this hour read, and that sets "
+                "the alert. Many scans in that hour (the scans column) is usually a single "
+                "incident hunt: someone searching a raw event table with ‘LIKE %some-id%’ "
+                "and re-paying the full scan on every refinement. Open the statements in Query "
+                "History to confirm the shape.",
         "action": "Give investigators a two-line template: first, time-bound the opening scan "
                   "on the table's date column; second, stage that first pass into a temp table "
                   "and run every refinement against the small staged copy — five scans become "
                   "one. Longer term, promote the searched fields to real clustered columns, or "
                   "evaluate a full-text search index.",
         "measure": "M1",
-        "explain_hunt_desc": "repeated multi-TiB scans by one principal in an hour (a re-paid investigation scan)",
+        "explain_hunt_desc": "hours in which one principal scanned far more than their own normal busy hour (often a re-paid investigation scan)",
         "explain_rubric": (
-            "3+ heavy scans in an hour from one principal is almost always one incident hunt. "
-            "Open the statements in the Query History UI to confirm the shape."
+            "each row is one principal's heaviest scanning hour this week. vs_normal = read_tib / "
+            "baseline, where baseline is that principal's 95th-percentile active hour over the prior "
+            "28 days (floored at the workspace's 95th-percentile person-hour; baseline_from says "
+            "which). NULL vs_normal = someone first seen scanning this week. A high multiple with "
+            "many scans in the hour is usually one incident hunt re-paying a full scan per "
+            "refinement. Open the statements in the Query History UI to confirm the shape."
         ),
         "sql": """
-SELECT executed_by, date_trunc('HOUR', start_time) AS hour,
-       count(*)                          AS scans,
-       sum(read_bytes)/POW(1024,4)       AS read_tib,
-       max(total_duration_ms)/3600000.0  AS longest_hours
-FROM system.query.history
-WHERE statement_type = 'SELECT'
-  AND read_bytes > POW(1024,4)
-  AND start_time >= current_date() - INTERVAL 14 DAYS
-GROUP BY 1, 2
-HAVING count(*) >= 3
-ORDER BY read_tib DESC
+WITH hourly AS (
+  SELECT executed_by, date_trunc('HOUR', start_time) AS hour,
+         count(*)                          AS scans,
+         sum(read_bytes)/POW(1024,4)       AS read_tib,
+         max(total_duration_ms)/3600000.0  AS longest_hours
+  FROM system.query.history
+  WHERE statement_type = 'SELECT' AND read_bytes > 0
+    AND start_time >= current_date() - INTERVAL 35 DAYS
+  GROUP BY 1, 2
+),
+prior AS (SELECT * FROM hourly WHERE hour < current_date() - INTERVAL 7 DAYS),
+own AS (SELECT executed_by, percentile_approx(read_tib, 0.95) AS own_normal FROM prior GROUP BY 1),
+ws AS (SELECT percentile_approx(read_tib, 0.95) AS ws_normal FROM prior),
+cur AS (
+  SELECT h.*, o.own_normal, w.ws_normal,
+         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  FROM hourly h LEFT JOIN own o USING (executed_by) CROSS JOIN ws w
+  WHERE h.hour >= current_date() - INTERVAL 7 DAYS
+  QUALIFY row_number() OVER (PARTITION BY h.executed_by ORDER BY h.read_tib DESC) = 1
+)
+SELECT executed_by, hour, scans, read_tib, longest_hours,
+       round(baseline, 4)                 AS baseline,
+       round(read_tib / baseline, 2)      AS vs_normal,
+       CASE WHEN baseline IS NULL THEN 'none (new)'
+            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+FROM cur
+WHERE read_tib >= coalesce(baseline, ws_normal, 0)
+ORDER BY coalesce(read_tib / baseline, read_tib / ws_normal) DESC
+LIMIT 50
 """,
     },
 
@@ -1518,21 +1638,37 @@ ALERT_SPECS: dict[str, AlertSpec] = {
     "H0": {"kind": "threshold", "metric_col": "est_usd_rough", "metric_label": "Est. spend rate (rate-blended, 3h window)",
            "unit": "usd", "high": 100, "medium": 20, "usd_col": "est_usd_rough",
            "summary": "An AI caller is spending at an elevated rate — {metric} in the last 3 hours."},
-    "H1": {"kind": "threshold", "metric_col": "read_write_ratio", "metric_label": "Read-to-write ratio",
-           "unit": "ratio", "high": 100000, "medium": 1000, "usd_col": None,
-           "summary": "{n} MERGE statements read far more than they write (top ratio {metric})."},
-    "H2": {"kind": "threshold", "metric_col": "spill_tib", "metric_label": "Disk spill (top statement)",
-           "unit": "tib", "high": 1.0, "medium": 0.1, "usd_col": None,
-           "summary": "{n} statements spilled to disk — the worst spilled {metric}."},
+    "H1": {"kind": "anomaly", "entity_col": "merge_target", "metric_col": "read_tib",
+           "metric_label": "Heaviest MERGE run this week", "unit": "tib",
+           "baseline": "median read of the same MERGE target's runs over the prior 28 days, "
+                       "floored at the workspace's 95th-percentile MERGE",
+           "summary": "{entity}: a MERGE read {x} its usual ({metric}, normal ~{baseline} per run).",
+           "new_summary": "NEW: MERGE into {entity} first seen this window ({metric} read).",
+           "usd_col": None},
+    "H2": {"kind": "anomaly", "entity_col": "source", "metric_col": "spill_tib",
+           "metric_label": "Worst spill this week", "unit": "tib",
+           "baseline": "median spill per spilling statement from the same source over the prior "
+                       "28 days, floored at the workspace median",
+           "summary": "{entity}: a statement spilled {x} its usual ({metric}, normal ~{baseline}).",
+           "new_summary": "NEW: {entity} first seen spilling this window ({metric}).",
+           "usd_col": None},
     "H3": {"kind": "threshold", "metric_col": "stmts", "metric_label": "Chatter statements / week (top client)",
            "unit": "count", "high": 50000, "medium": 10000, "usd_col": None,
            "summary": "Chatty clients are keeping warehouses awake — top client fired {metric} tiny statements."},
-    "H5": {"kind": "threshold", "metric_col": "total_min", "metric_label": "Longest statement",
-           "unit": "minutes", "high": 480, "medium": 240, "usd_col": None,
-           "summary": "{n} statements ran over 4 hours — the longest ran {metric}."},
-    "H6": {"kind": "threshold", "metric_col": "read_tib", "metric_label": "Data re-scanned in one hour",
-           "unit": "tib", "high": 20, "medium": 3, "usd_col": None,
-           "summary": "A repeated multi-TiB investigation scan — {metric} read by one person in an hour."},
+    "H5": {"kind": "anomaly", "entity_col": "source", "metric_col": "total_min",
+           "metric_label": "Statement over 4 hours", "unit": "minutes",
+           "baseline": "median of the source's longest statement per day over the prior 28 days, "
+                       "floored at the workspace's 95th percentile",
+           "summary": "{entity}: a statement ran {x} its usual longest ({metric}, normal ~{baseline}).",
+           "new_summary": "NEW: {entity} first seen this window, with a {metric} statement.",
+           "usd_col": None},
+    "H6": {"kind": "anomaly", "entity_col": "executed_by", "metric_col": "read_tib",
+           "metric_label": "Heaviest scan hour this week", "unit": "tib",
+           "baseline": "95th percentile of the person's active hours over the prior 28 days, "
+                       "floored at the workspace's 95th-percentile person-hour",
+           "summary": "{entity}: {x} their usual busy-hour scan volume ({metric} in one hour, normal ~{baseline}).",
+           "new_summary": "NEW: {entity} first seen scanning this window ({metric} in one hour).",
+           "usd_col": None},
     "H7": {"kind": "threshold", "metric_col": "execution_hours", "metric_label": "Compute hours from polling (top principal)",
            "unit": "hours", "high": 100, "medium": 20, "usd_col": None,
            "summary": "A candidate poller ran thousands of short queries — {metric} of compute."},
