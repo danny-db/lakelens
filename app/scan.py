@@ -42,7 +42,6 @@ class Store:
         self._lock = threading.Lock()
         self.scans: dict[str, dict] = {}          # scan_id -> scan record
         self.triage: dict[str, dict] = {}         # hunt_id -> {status, note, updated_by, updated_ts}
-        self._counter = 0
 
     def new_scan_id(self) -> str:
         # Globally unique (uuid) — Databricks Apps runs MULTIPLE worker processes,
@@ -52,11 +51,6 @@ class Store:
         # Delta-backed /api/scan/latest for the completed view (cross-worker safe).
         import uuid
         return "scan-" + uuid.uuid4().hex[:12]
-
-    def _legacy_new_scan_id(self) -> str:
-        with self._lock:
-            self._counter += 1
-            return f"scan-{self._counter}"
 
     MAX_SCANS = 20
 
