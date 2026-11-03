@@ -32,7 +32,7 @@ from pydantic import BaseModel
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
-from databricks.sdk.errors import NotFound, PermissionDenied, Unauthenticated
+from databricks.sdk.errors import DatabricksError, NotFound, PermissionDenied, Unauthenticated
 from databricks.sdk.service.sql import StatementState, ExecuteStatementRequestOnWaitTimeout
 
 import hunts as catalogue
@@ -75,6 +75,9 @@ POLL_GAP_S = 3
 # CLI profile locally). Used as a fallback and to read app config.
 sp_client: Optional[WorkspaceClient] = None
 HOST = os.getenv("DATABRICKS_HOST", "")
+# The Databricks Apps runtime sets DATABRICKS_APP_NAME. There, a request without a
+# user token must not fall back to the app's own service principal.
+IN_APPS_RUNTIME = bool(os.getenv("DATABRICKS_APP_NAME"))
 
 
 def _normalize_host(h: Optional[str]) -> str:
@@ -113,13 +116,17 @@ def _client_for(request: Request) -> WorkspaceClient:
     no account-admin dependency to stand the app up.
 
     Locally (no forwarded header) we fall back to the ambient client, which
-    is the developer's CLI profile — so `uvicorn` dev runs still work.
+    is the developer's CLI profile — so `uvicorn` dev runs still work. In the
+    Apps runtime a missing token is a 401, never the service principal.
     """
     tok = request.headers.get("x-forwarded-access-token")
     if tok:
         # auth_type="pat" is REQUIRED: without it the SDK sees the ambient
         # DATABRICKS_CLIENT_ID/SECRET too and errors "more than one auth method".
         return WorkspaceClient(config=Config(host=HOST, token=tok, auth_type="pat"))
+    if IN_APPS_RUNTIME:
+        raise HTTPException(401, "No user token on this request. Open the app from its Databricks URL "
+                                 "and accept the consent screen.")
     return sp_client
 
 
@@ -145,8 +152,29 @@ def _params(items) -> Optional[list]:
     return out
 
 
+def _sdk_message(e: Exception) -> str:
+    """The SDK's own words, without the request id and Config dump it appends."""
+    return re.split(r"\s*\[ReqId|\. Config:", str(e))[0]
+
+
 def _run_sql(sql: str, client: WorkspaceClient, max_rows: Optional[int] = DEFAULT_MAX_ROWS,
              params: Optional[list] = None) -> dict[str, Any]:
+    """The SQL boundary. Every failure leaves as an HTTPException with a plain
+    message, so routes can pass it straight through."""
+    if not WAREHOUSE_ID:
+        raise HTTPException(503, "No warehouse configured. Redeploy with --var=\"warehouse_id=...\".")
+    try:
+        return _execute_sql(sql, client, max_rows, params)
+    except Unauthenticated:
+        raise HTTPException(401, "Databricks rejected your sign-in token. Reload the app to sign in again.")
+    except PermissionDenied as e:
+        raise HTTPException(403, f"Permission denied: {_sdk_message(e)}")
+    except DatabricksError as e:
+        raise HTTPException(502, f"SQL request failed: {_sdk_message(e)}")
+
+
+def _execute_sql(sql: str, client: WorkspaceClient, max_rows: Optional[int],
+                 params: Optional[list]) -> dict[str, Any]:
     """Execute SQL and return {columns, rows, total_rows, truncated, wall_ms}. Submits
     with a short wait, then polls to completion so we never hold one HTTP request past
     the app's 120s cap. Stops fetching result chunks once max_rows is reached, so
@@ -180,8 +208,12 @@ def _run_sql(sql: str, client: WorkspaceClient, max_rows: Optional[int] = DEFAUL
     if state != StatementState.SUCCEEDED:
         msg = "query did not finish in time (still running)"
         if stmt.status and stmt.status.error:
-            msg = stmt.status.error.message
-        raise HTTPException(500, f"SQL {state}: {msg}")
+            msg = stmt.status.error.message or msg
+        if msg.startswith("[AI_FUNCTION"):
+            name = re.search(r"'([^']+)' does not exist", msg)
+            raise HTTPException(502, f"AI endpoint '{name.group(1)}' is unavailable. Pick another model."
+                                if name else "The AI endpoint is unavailable. Pick another model.")
+        raise HTTPException(500, f"SQL {state.value if state else 'FAILED'}: {msg}")
 
     cols = [c.name for c in stmt.manifest.schema.columns] if stmt.manifest and stmt.manifest.schema else []
     total = stmt.manifest.total_row_count if stmt.manifest else None
@@ -563,10 +595,11 @@ def narrate_panel(board_id: str, panel_id: str, request: Request, model: Optiona
 
 def _genie(request: Request, tool: str, args: dict) -> dict:
     """Call a Genie One tool as the user, turning failures into clean JSON errors."""
+    client = _client_for(request)
     try:
         if tool == "genie_poll_response":
-            return genie_cost.poll_response(_client_for(request), **args)
-        return genie_cost.call_tool(_client_for(request), tool, args)
+            return genie_cost.poll_response(client, **args)
+        return genie_cost.call_tool(client, tool, args)
     except genie_cost.GenieError as e:
         raise HTTPException(e.status, str(e))
     except (PermissionDenied, Unauthenticated) as e:
