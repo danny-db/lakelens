@@ -38,10 +38,12 @@ resources:
       source_code_path: ./app
 
       # OBO scopes: the app runs every query AS THE LOGGED-IN USER. `sql` for the
-      # warehouse/system tables; `dashboards.genie` + `genie` for the Ask (Genie) tab.
+      # warehouse/system tables; `ai-gateway` for the Ask tab (Genie One MCP).
+      # `dashboards.genie` + `genie` stay until Genie One is proven to work without them.
       # (Requires Databricks CLI >= 0.246.0 to set these from the bundle.)
       user_api_scopes:
         - sql
+        - ai-gateway
         - dashboards.genie
         - genie
 

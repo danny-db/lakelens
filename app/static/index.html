@@ -376,9 +376,6 @@
   }
 
   /* ── Ask / Genie ── */
-  .ask-setup { text-align: center; padding: 36px 24px; }
-  .ask-setup h3 { font-size: 18px; margin-bottom: 8px; }
-  .ask-setup p { font-size: 13px; color: var(--muted); max-width: 62ch; margin: 0 auto 18px; line-height: 1.6; }
   .ask-chat { display: flex; flex-direction: column; gap: 14px; }
   .ask-samples { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
   .ask-sample { font-size: 12px; padding: 6px 12px; border-radius: 999px; cursor: pointer;
@@ -789,7 +786,7 @@
          Genie. Ask in plain English — it answers with the numbers <b>and shows the SQL it ran</b>, so
          every answer is checkable. Runs as you: it only sees tables you can already read.</p>
     </div>
-    <div id="askBody"><div class="loader"><span class="spin"></span> Checking for a cost Genie space…</div></div>
+    <div id="askBody"><div class="loader"><span class="spin"></span> Loading…</div></div>
   </section>
 
   <!-- ── TOKENOMICS ── -->
@@ -2337,7 +2334,9 @@ function escapeHtml(s){ return String(s).replace(/[&<>"]/g, m=>({'&':'&amp;','<'
 // then apply a small markdown subset. See feedback_render_markdown_in_dom memory.
 function renderMarkdown(src) {
   if (src == null) return "";
-  let s = escapeHtml(String(src));
+  // Genie One escapes some characters (\$, \~) and cites its own #snippet anchors, which
+  // mean nothing outside Genie One. Unescape those and drop the anchor-only citations.
+  let s = escapeHtml(String(src)).replace(/\\([$~!#>-])/g, "$1").replace(/\s*\[[^\]]+\]\(#[^)]*\)/g, "");
   // code spans first (protect their contents from other rules)
   s = s.replace(/`([^`]+)`/g, (_,c)=>`<code>${c}</code>`);
   // bold then italic (order matters: ** before *)
@@ -2347,14 +2346,26 @@ function renderMarkdown(src) {
   // links [text](http…)
   s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
                 '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  // bullet lists: consecutive "- " or "* " lines → <ul>
+  // bullet lists: consecutive "- " or "* " lines → <ul>; "# " headings; "| a | b |" tables
   const lines = s.split(/\n/);
-  let out = [], inList = false;
+  let out = [], inList = false, table = null;
+  const cells = ln => ln.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+  const flushTable = () => {
+    if (!table) return;
+    const [head, ...body] = table.filter(r => !r.every(c => /^:?-{3,}:?$/.test(c)));
+    out.push(`<div class="board-table-wrap"><table class="board-table"><thead><tr>${head.map(c=>`<th>${c}</th>`).join("")}</tr></thead>` +
+             `<tbody>${body.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`);
+    table = null;
+  };
   for (const ln of lines) {
+    if (/^\s*\|.*\|\s*$/.test(ln)) { (table = table || []).push(cells(ln)); continue; }
+    flushTable();
+    const h = ln.match(/^\s*#{1,6}\s+(.*)$/);
     const m = ln.match(/^\s*[-*]\s+(.*)$/);
     if (m) { if (!inList){ out.push("<ul>"); inList = true; } out.push(`<li>${m[1]}</li>`); }
-    else { if (inList){ out.push("</ul>"); inList = false; } out.push(ln); }
+    else { if (inList){ out.push("</ul>"); inList = false; } out.push(h ? `<strong>${h[1]}</strong>` : ln); }
   }
+  flushTable();
   if (inList) out.push("</ul>");
   s = out.join("\n");
   // paragraphs: blank line → break; single newline (outside lists) → <br>
@@ -2391,12 +2402,11 @@ function boardTable(cols, rows, host_el) {
   wrap.appendChild(t); host_el.appendChild(wrap);
 }
 
-// Fetch a Genie query-attachment's rows and render them natively: a chart (if the
-// shape is chartable) + the table. Returns true if it drew anything. Shared by the
-// current-turn path and the "chart my previous answer" fallback.
-async function renderGenieResult(box, conv, msg, att, cid) {
-  const qs = `conversation_id=${encodeURIComponent(conv)}&message_id=${encodeURIComponent(msg)}&attachment_id=${encodeURIComponent(att)}`;
-  const res = await (await fetch(`/api/genie/result?${qs}`)).json();
+// Fetch the rows behind one Genie query and render them natively: a chart (if the
+// shape is chartable) + the table. Returns true if it drew anything.
+async function renderGenieResult(box, conv, resp, item, cid) {
+  const qs = `conversation_id=${encodeURIComponent(conv)}&response_id=${encodeURIComponent(resp)}&item_id=${encodeURIComponent(item)}`;
+  const res = await askApi(`/api/genie/result?${qs}`);
   if (!res.rows || !res.rows.length) return false;
   const spec = inferChart(res.columns, res.rows);
   if (spec) {
@@ -2473,44 +2483,50 @@ function buildBoard(boardId) {
   board.panels.forEach(p => renderPanel(boardId, p, page));
 }
 
-// ── Ask (embedded Genie) ───────────────────────────────────────────────────
-let ASK = { built:false, conversationId:null, spaceId:null };
+// ── Ask (Genie One) ────────────────────────────────────────────────────────
+// Ask returns at once with status in_progress; we poll until Genie finishes.
+let ASK = { built:false, conversationId:null };
+const ASK_POLL_MS = 2500, ASK_MAX_MS = 180000;
+async function askApi(url, opts) {
+  const r = await (await fetch(url, opts)).json();
+  if (r.detail) throw new Error(r.detail);
+  return r;
+}
+function renderAskTurn(box, t, botId) {
+  if (t.status === "failed" || t.status === "cancelled") {
+    box.innerHTML = `<span style="color:var(--coral)">✕ ${escapeHtml(t.error || ("Genie " + t.status + "."))}</span>`;
+    return;
+  }
+  let html = t.text ? renderMarkdown(t.text) : "<i>(no text answer)</i>";
+  t.queries.forEach((q, i) => {
+    html += `<details class="ask-sql"><summary>Show the SQL Genie ran${t.queries.length>1?` (query ${i+1})`:""}</summary><pre>${escapeHtml(q.sql)}</pre></details>
+      <button class="btn ask-result-btn" data-item="${escapeHtml(q.item_id)}" style="margin-top:8px">Show result table</button>
+      <div class="ask-result"></div>`;
+  });
+  if (t.deep_link) html += `<div class="ask-disclaimer" style="margin-top:10px"><a href="${escapeHtml(t.deep_link)}" target="_blank" rel="noopener">Open in Genie One ↗</a></div>`;
+  box.innerHTML = html;
+  box.querySelectorAll(".ask-result-btn").forEach((btn, i) => btn.addEventListener("click", async () => {
+    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Loading…';
+    const slot = btn.nextElementSibling;
+    try {
+      const drew = await renderGenieResult(slot, t.conversation_id, t.response_id, btn.dataset.item, `ask-${botId}-${i}`);
+      if (!drew) slot.innerHTML = `<div class="ask-disclaimer">No rows.</div>`;
+      btn.remove();
+    } catch(e) {
+      btn.disabled = false; btn.textContent = "Show result table";
+      slot.innerHTML = `<span style="color:var(--coral)">✕ ${escapeHtml(e.message)}</span>`;
+    }
+  }));
+}
 async function buildAsk() {
   if (ASK.built) return;
   ASK.built = true;
   const host = $("#askBody");
   let status;
-  try { status = await (await fetch("/api/genie/status")).json(); }
-  catch(e) { host.innerHTML = `<div class="result-status err">✕ ${e.message}</div>`; ASK.built=false; return; }
+  try { status = await askApi("/api/genie/status"); }
+  catch(e) { host.innerHTML = `<div class="result-status err">✕ ${escapeHtml(e.message)}</div>`; ASK.built=false; return; }
 
-  if (!status.configured) {
-    // one-time setup — the "Create cost Genie space" button (creates a workspace object)
-    host.innerHTML = `
-      <div class="card ask-setup">
-        <h3>💬 Set up your cost assistant</h3>
-        <p>This creates a <b>Genie space</b> in your workspace, seeded with the cost system tables, so you
-           can ask questions in plain English. It runs as you — Genie only sees tables you can already read.
-           You only do this once.</p>
-        <button class="btn primary big" id="askCreateBtn">✨ Create cost Genie space</button>
-        <div class="ask-disclaimer">This is the one action here that creates something in your workspace. Everything else only reads.</div>
-      </div>`;
-    $("#askCreateBtn").addEventListener("click", async () => {
-      const btn = $("#askCreateBtn"); btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Creating…';
-      try {
-        const r = await (await fetch("/api/genie/create", {method:"POST"})).json();
-        if (r.detail) throw new Error(r.detail);
-        ASK.spaceId = r.space_id; ASK.built = false; buildAsk();   // re-render into chat mode
-      } catch(e) {
-        btn.disabled=false; btn.innerHTML="✨ Create cost Genie space";
-        host.insertAdjacentHTML("beforeend", `<div class="result-status err" style="margin-top:12px">✕ ${e.message}</div>`);
-      }
-    });
-    return;
-  }
-
-  // chat mode
-  ASK.spaceId = status.spaceId || status.space_id;
-  const samples = (status.sample_questions||[]).map(q=>`<button class="ask-sample">${q}</button>`).join("");
+  const samples = (status.sample_questions||[]).map(q=>`<button class="ask-sample">${escapeHtml(q)}</button>`).join("");
   host.innerHTML = `
     <div class="ask-chat">
       <div class="ask-samples">${samples}</div>
@@ -2527,38 +2543,24 @@ async function buildAsk() {
     input.value = "";
     thread.insertAdjacentHTML("beforeend", `<div class="ask-msg user">${escapeHtml(q)}</div>`);
     const botId = "bot-"+Date.now();
-    thread.insertAdjacentHTML("beforeend", `<div class="ask-msg bot" id="${botId}"><span class="spin"></span> Genie is thinking…</div>`);
+    thread.insertAdjacentHTML("beforeend", `<div class="ask-msg bot" id="${botId}"><span class="spin"></span> Genie is working…</div>`);
     thread.lastElementChild.scrollIntoView({block:"end"});
+    const box = document.getElementById(botId);
     try {
-      const r = await (await fetch("/api/genie/ask", {method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({question:q, conversation_id: ASK.conversationId})})).json();
-      if (r.detail) throw new Error(r.detail);
-      ASK.conversationId = r.conversation_id || ASK.conversationId;
-      const box = document.getElementById(botId);
-      if (r.error) { box.innerHTML = `<span style="color:var(--coral)">✕ ${escapeHtml(r.error)}</span>`; return; }
-      let html = r.text ? renderMarkdown(r.text) : "<i>(no text answer)</i>";
-      if (r.sql) {
-        html += `<details class="ask-sql"><summary>Show the SQL Genie ran${r.sql_title?` — ${escapeHtml(r.sql_title)}`:""}</summary><pre>${escapeHtml(r.sql)}</pre></details>`;
+      let t = await askApi("/api/genie/ask", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({question:q, conversation_id: ASK.conversationId})});
+      ASK.conversationId = t.conversation_id || ASK.conversationId;
+      const started = Date.now(), pollUrl = `/api/genie/poll?conversation_id=${encodeURIComponent(t.conversation_id)}&response_id=${encodeURIComponent(t.response_id)}`;
+      while (t.status === "in_progress") {
+        if (Date.now() - started > ASK_MAX_MS) throw new Error("Genie took longer than 3 minutes. Try the Genie One link or ask again.");
+        await new Promise(r => setTimeout(r, ASK_POLL_MS));
+        box.innerHTML = `<span class="spin"></span> Genie is working… ${Math.round((Date.now()-started)/1000)}s`;
+        t = await askApi(pollUrl);
       }
-      box.innerHTML = html;
-      // Render the data natively with the app's Chart.js (chart if chartable + table).
-      // Two paths:
-      //  (a) this answer carries a query attachment → chart/table it, and remember it.
-      //  (b) this answer has NO data (e.g. a "show a bar chart" follow-up, which Genie
-      //      answers as text-only) → fall back to the PREVIOUS turn's result, since the
-      //      user is asking to visualise what's already on screen.
-      try {
-        if (r.attachment_id && r.conversation_id && r.message_id) {
-          const drew = await renderGenieResult(box, r.conversation_id, r.message_id, r.attachment_id, "ask-"+botId);
-          if (drew) ASK.lastResult = { conv: r.conversation_id, msg: r.message_id, att: r.attachment_id };
-        } else if (ASK.lastResult && /\b(chart|graph|plot|bar|line|visuali[sz]e|visual)\b/i.test(q)) {
-          const drew = await renderGenieResult(box, ASK.lastResult.conv, ASK.lastResult.msg, ASK.lastResult.att, "ask-"+botId);
-          if (drew) box.insertAdjacentHTML("beforeend", `<div class="ask-disclaimer" style="margin-top:8px">Charted from your previous result. Tip: ask for the data and the chart together (e.g. “failing jobs last 30 days as a bar chart”).</div>`);
-        }
-      } catch(e) { /* result render optional */ }
+      renderAskTurn(box, t, botId);
       box.scrollIntoView({block:"end"});
     } catch(e) {
-      const box=document.getElementById(botId); if(box) box.innerHTML = `<span style="color:var(--coral)">✕ ${e.message}</span>`;
+      box.innerHTML = `<span style="color:var(--coral)">✕ ${escapeHtml(e.message)}</span>`;
     }
   };
   $("#askSend").addEventListener("click", ()=>ask(input.value));

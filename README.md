@@ -8,7 +8,7 @@ LakeLens is a Databricks App that runs a plain-English cost review of your works
 - **One-click scan** turns the results into a triaged alert queue with severity, explanation, fix and proof
 - **4 observability boards** (19 panels) flag anomalies above each chart
 - **7 measures** prove the saving before and after a fix
-- **Ask** tab: a Genie space over your cost tables that shows the SQL behind every answer
+- **Ask** tab: Genie One answers cost questions and shows the SQL behind every answer
 
 Deploys in two commands as a Databricks Asset Bundle. Nothing workspace-specific is hardcoded.
 
@@ -21,7 +21,7 @@ flowchart LR
         API --> CAT["Cost catalogue<br/>23 hunts · 7 measures · 19 panels<br/>hunts.py · boards.py · tune.py"]
         API --> SCAN["Scan engine<br/>scan.py (background thread)"]
         API --> TOOLS["Tagging · Tokenomics<br/>tagging.py · tokenomics.py"]
-        API --> ASK["Ask (Genie)<br/>genie_cost.py"]
+        API --> ASK["Ask (Genie One)<br/>genie_cost.py"]
         SCAN --> STORE["Results store<br/>store_delta.py"]
     end
 
@@ -30,7 +30,7 @@ flowchart LR
         SYS[("system.billing · compute<br/>query · lakeflow · access")]
         DELTA[("results_catalog.lakelens<br/>runs · findings · triage")]
         FM["Model serving<br/>ai_query() explainers"]
-        GENIE["Genie space"]
+        GENIE["Genie One<br/>(AI Gateway MCP)"]
     end
 
     API -->|OBO token| WH
@@ -39,7 +39,7 @@ flowchart LR
     WH --> SYS
     WH --> FM
     STORE -->|write| DELTA
-    ASK -->|Conversations API| GENIE
+    ASK -->|MCP tools/call| GENIE
     GENIE --> SYS
 ```
 
@@ -56,7 +56,7 @@ flowchart LR
 | ③ **Prove** | 7 measures that show the saving (see below). |
 | 🏷️ **Tagging** | Finds untagged warehouses, clusters and spend. You can set a tag in place (confirmed, runs as you). |
 | 💠 **Tokenomics** | Estimates AI cost before the bill: tokens → DBU → $, model comparison, live `list_prices` check, actual 30-day serving spend. |
-| 💬 **Ask** | Natural-language cost questions through Genie. A one-time button creates the space. |
+| 💬 **Ask** | Natural-language cost questions through Genie One. No setup. Each answer shows its SQL, a result table and a link to open it in Genie One. |
 
 ### The 23 hunts
 
@@ -100,17 +100,17 @@ databricks bundle run lakelens -t prod -p <profile>
 Tip: pin `host`, `warehouse_id` and `results_catalog` in the `prod` target of `databricks.yml` and skip the `--var`s.
 
 ### First run
-1. Open the app URL and **Accept** the consent screen (SQL + Genie scopes).
+1. Open the app URL and **Accept** the consent screen (SQL, AI Gateway and Genie scopes).
 2. Optional: add `/api/whoami` to the URL. You should see `"sql_ok": true` and your email.
 3. **Alerts → Run full cost scan.**
-4. **Ask → Create cost Genie space** (once).
+4. **Ask:** pick a sample question. There's nothing to create first.
 
 ### Settings
 
 | Variable | Required | Default | What it is |
 |---|---|---|---|
 | `warehouse_id` | yes | none | SQL warehouse every query runs on |
-| `results_catalog` | recommended | none | Where scans, triage and the Genie space id are saved |
+| `results_catalog` | recommended | none | Where scans and triage are saved |
 | `results_schema` | no | `lakelens` | Schema inside that catalog |
 | `ai_endpoint` | no | `databricks-gpt-5-4-mini` | Model for the plain-English explanations |
 | `ai_endpoint_dbu` | no | `7.5,30` | That model's DBU per 1M tokens (in,out), used to price the scan |
@@ -120,7 +120,9 @@ Every query runs as the signed-in user (on-behalf-of-user), so there are no serv
 - `SELECT` on `system.billing`, `system.compute`, `system.query`, `system.lakeflow`, `system.access`
 - `CAN USE` on the SQL warehouse
 - `CREATE` on `results_catalog` (for saving scans)
-- Permission to create a Genie space (for the Ask tab's first run)
+- `EXECUTE` on `system.ai.genie_one_mcp` for the Ask tab. This is usually granted to all account users.
+
+The app needs the `ai-gateway` scope (set by this bundle), and the account needs Unity AI Gateway with Genie One available.
 
 ---
 
@@ -131,7 +133,9 @@ Every query runs as the signed-in user (on-behalf-of-user), so there are no serv
 | Scans return an auth error | User lacks `SELECT` on a `system.*` schema or `CAN USE` on the warehouse. Check `/api/whoami`. |
 | "No warehouse configured" | Redeploy with `--var="warehouse_id=..."`. |
 | Scans don't save or aren't shared | `results_catalog` unset, or the user can't `CREATE` there. The app still works in memory. |
-| Ask: "token does not have required scopes: genie" | Old consent. See *Changing scopes* below. |
+| Ask: "Genie One refused this user" | Old consent without `ai-gateway`, or no `EXECUTE` on `system.ai.genie_one_mcp`. See *Changing scopes* below. |
+| Ask: "Genie One isn't available in this workspace" | The account doesn't have Unity AI Gateway or Genie One yet. Ask your account team. |
+| Ask: "Genie took longer than 3 minutes" | Busy warehouse or a broad question. Open the Genie One link, or ask a narrower question. |
 | `bundle deploy` rejects `user_api_scopes` | Upgrade the CLI to 0.246.0 or later. |
 
 <details>
@@ -144,7 +148,7 @@ CLIENT_ID=$(databricks apps get lakelens -p <profile> | jq -r .oauth2_app_client
 databricks api delete "/api/2.0/oauth-app-integrations/$CLIENT_ID/user-consent/me" -p <profile>
 ```
 
-Then reopen the app in an incognito window and accept again. This bundle sets all scopes at first deploy, so you shouldn't need this.
+Then reopen the app in an incognito window and accept again. This bundle sets all scopes at first deploy. Apps deployed before the `ai-gateway` scope was added need this reset once.
 </details>
 
 <details>
@@ -156,7 +160,7 @@ Then reopen the app in an incognito window and accept again. This bundle sets al
 - **Multi-worker safe:** scan ids are UUIDs, and polls fall back to `/api/scan/latest` if they hit a different worker.
 - **Row cap:** only the top ~200 rows go to the browser, with the true total shown.
 - **✨ Explain** uses `ai_query()`, which runs in the SQL engine with the rows inline and needs no extra scope.
-- **Ask** creates a Genie space seeded with the billing, compute, query and lakeflow system tables. It saves the space id to Delta and chats through the Conversations API as the user.
+- **Ask** calls Genie One, the Unity AI Gateway MCP service `system.ai.genie_one_mcp`, as the user. Each question gets a short preamble naming the billing, compute, query and lakeflow system tables and the list-price join, so Genie answers from them. `POST /api/genie/ask` returns at once and the browser polls `/api/genie/poll` until the answer is ready.
 - The hunt and measure SQL comes from a live-validated `weekly-cost-hunt` notebook.
 </details>
 

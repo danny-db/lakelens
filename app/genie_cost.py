@@ -1,22 +1,20 @@
 """
-genie_cost.py — the "Ask" tab: an embedded Genie space for natural-language
-cost questions.
+genie_cost.py — the "Ask" tab: natural-language cost questions through Genie One.
 
-Why a space (not "Genie One"): the Conversations API is namespaced under a
-space_id — there is NO space-less REST endpoint (Genie One is MCP-only, Beta).
-And this app runs in the CUSTOMER's workspace, so we can't hardcode a space_id.
-So: a one-time "Create cost Genie space" button provisions a space seeded with
-the cost system tables, persists the returned space_id to a small Delta config
-table, and all subsequent chat routes through the Conversations API. The
-space_id is discovered at runtime, never hardcoded — portable across workspaces.
+Genie One is the Unity AI Gateway MCP service `system.ai.genie_one_mcp`. Nothing is
+created in the customer's workspace: every question is a stateless JSON-RPC
+`tools/call` to the gateway, posted with the logged-in user's (OBO) client, so
+Genie only sees tables that user can already read.
 
-Everything runs on-behalf-of-user (OBO): the space is created and queried as the
-logged-in user, so Genie only ever sees tables that user can already read.
+Genie One searches all of the user's data, so an unprompted question can wander off
+to the wrong source. We prepend a grounding preamble built from SEED_TABLES and
+INSTRUCTIONS, and show the user only their own question.
 """
-import json
-from typing import Optional, Any, Callable
+import re
+import time
+from typing import Literal, Optional, TypedDict
 
-# The cost system tables to seed the space with, each with a short description so
+# The cost system tables Genie should answer from, each with a short description so
 # Genie knows what it is. Kept to the tables the rest of LakeLens already uses.
 SEED_TABLES = [
     ("system.billing.usage",
@@ -58,95 +56,94 @@ INSTRUCTIONS = (
 )
 
 
-def build_serialized_space() -> str:
-    """The serialized_space JSON create_space expects — seed tables + instructions + samples."""
-    return json.dumps({
-        "version": 1,
-        # ids must be 32-hex UUIDs without hyphens (API rejects 'q0'/'i1'); tables sorted by identifier.
-        "config": {"sample_questions": [{"id": _hexid(f"sample:{q}"), "question": [q]}
-                                        for q in SAMPLE_QUESTIONS]},
-        "data_sources": {"tables": [{"identifier": ident, "description": [desc]}
-                                    for ident, desc in sorted(SEED_TABLES, key=lambda t: t[0])]},
-        "instructions": {"text_instructions": [{"id": _hexid("instr:cost"), "content": [INSTRUCTIONS]}]},
-    })
+MCP_PATH = "/ai-gateway/mcp-services/system.ai.genie_one_mcp"
+_HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 
 
-def _hexid(seed: str) -> str:
-    """Stable lowercase 32-hex id (no hyphens) — required by the Genie export proto."""
-    import hashlib
-    return hashlib.md5(seed.encode()).hexdigest()
+def grounded_question(question: str) -> str:
+    """The question Genie One actually receives: a preamble naming the cost tables
+    and the list-price rule, then the user's own words."""
+    tables = "\n".join(f"- {ident}: {desc}" for ident, desc in SEED_TABLES)
+    return (f"{INSTRUCTIONS}\nAnswer only from these Databricks system tables:\n{tables}\n\n"
+            f"Question: {question}")
 
 
-# ── space-id persistence (tiny Delta config table, reuse the app's sql adapters) ──
+class GenieError(Exception):
+    """A Genie One failure with the HTTP status the API route should return."""
 
-class GenieConfig:
-    """Persists the created space_id so the button is one-time (per workspace).
-    Uses the same catalog.schema as scan results; a 1-col config table keyed by name."""
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
 
-    def __init__(self, catalog: str, schema: str, run_sql: Callable, run_write: Callable, logger):
-        self.fq = f"{catalog}.{schema}"
-        self.tbl = f"{self.fq}.app_config"
-        self._run_sql = run_sql
-        self._run_write = run_write
-        self.log = logger
 
-    def _ensure(self, client) -> bool:
-        if not self.fq.split(".")[0]:   # no RESULTS_CATALOG → can't persist the space id
-            return False
+def call_tool(client, name: str, args: dict) -> dict:
+    """Call one Genie One MCP tool as the client's user. Returns the tool's
+    structured result, or raises GenieError for protocol and tool errors."""
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": args}}
+    out = client.api_client.do("POST", MCP_PATH, body=body, headers=_HEADERS)
+    if out.get("error"):
+        raise GenieError(502, f"Genie One rejected the call: {out['error'].get('message')}")
+    res = out.get("result") or {}
+    if res.get("isError"):
+        text = " ".join(c.get("text", "") for c in res.get("content") or []).strip()
+        m = re.search(r"HTTP (\d{3})", text)
+        raise GenieError(int(m.group(1)) if m else 502, text or "Genie One returned an error.")
+    sc = res.get("structuredContent")
+    return sc if sc is not None else res
+
+
+def poll_response(client, conversation_id: str, response_id: str) -> dict:
+    """genie_poll_response, riding out the few seconds after a follow-up is sent
+    when Genie One 404s the response_id it just issued."""
+    args = {"conversation_id": conversation_id, "response_id": response_id}
+    for wait in (1.5, 1.5, 1.5):
         try:
-            self._run_write(f"CREATE SCHEMA IF NOT EXISTS {self.fq}", client)
-            self._run_write(f"CREATE TABLE IF NOT EXISTS {self.tbl} "
-                            f"(key STRING, value STRING, updated_by STRING, updated_at TIMESTAMP)", client)
-            return True
-        except Exception as e:  # noqa: BLE001
-            self.log.warning(f"GenieConfig.ensure failed: {e}")
-            return False
-
-    def get_space_id(self, client) -> Optional[str]:
-        if not self._ensure(client):
-            return None
-        try:
-            out = self._run_sql(
-                f"SELECT value FROM {self.tbl} WHERE key='genie_space_id' "
-                f"ORDER BY updated_at DESC LIMIT 1", client)
-            rows = out.get("rows") or []
-            return rows[0][0] if rows and rows[0] and rows[0][0] else None
-        except Exception as e:  # noqa: BLE001
-            self.log.warning(f"GenieConfig.get failed: {e}")
-            return None
-
-    def set_space_id(self, client, space_id: str, who: str) -> None:
-        if not self._ensure(client):
-            return
-        from databricks.sdk.service.sql import StatementParameterListItem  # noqa
-        # parameterised insert (space_id/who are safe values, but keep the pattern consistent)
-        self._run_write(
-            f"INSERT INTO {self.tbl} VALUES (:k, :v, :w, current_timestamp())", client,
-            params=[{"name": "k", "value": "genie_space_id"},
-                    {"name": "v", "value": space_id},
-                    {"name": "w", "value": who or "unknown"}])
+            return call_tool(client, "genie_poll_response", args)
+        except GenieError as e:
+            if e.status != 404:
+                raise
+            time.sleep(wait)
+    return call_tool(client, "genie_poll_response", args)
 
 
-def message_to_view(msg) -> dict:
-    """Flatten a GenieMessage into a frontend-friendly view: the text answer, the SQL
-    Genie ran (explainability!), any suggested follow-ups, and ids to fetch the result."""
-    view: dict[str, Any] = {"status": str(getattr(msg, "status", "") or ""),
-                            "text": None, "sql": None, "sql_title": None,
-                            "attachment_id": None, "conversation_id": getattr(msg, "conversation_id", None),
-                            "message_id": getattr(msg, "message_id", None),
-                            "error": None, "suggestions": []}
-    err = getattr(msg, "error", None)
-    if err:
-        view["error"] = getattr(err, "error", None) or str(err)
-    for att in (getattr(msg, "attachments", None) or []):
-        if getattr(att, "text", None) and getattr(att.text, "content", None):
-            view["text"] = att.text.content
-        if getattr(att, "suggested_questions", None):
-            sq = att.suggested_questions
-            view["suggestions"] = getattr(sq, "suggested_questions", None) or []
-        q = getattr(att, "query", None)
-        if q is not None:
-            view["sql"] = getattr(q, "query", None)
-            view["sql_title"] = getattr(q, "description", None) or getattr(q, "title", None)
-            view["attachment_id"] = getattr(att, "attachment_id", None)
-    return view
+Status = Literal["in_progress", "completed", "failed", "cancelled"]
+
+
+class GenieQuery(TypedDict):
+    item_id: str
+    sql: str
+
+
+class GenieTurn(TypedDict):
+    """One Genie One answer as the UI sees it. The UI branches on `status` only."""
+    status: Status
+    conversation_id: Optional[str]
+    response_id: Optional[str]
+    text: Optional[str]
+    queries: list[GenieQuery]
+    deep_link: Optional[str]
+    error: Optional[str]
+
+
+_STATUSES = {"in_progress", "completed", "failed", "cancelled"}
+
+
+def to_turn(payload: dict) -> GenieTurn:
+    """Map a genie_ask / genie_poll_response payload to a GenieTurn. Unknown
+    upstream statuses become "failed" with the raw status in `error`."""
+    raw = str(payload.get("status") or "")
+    status = raw if raw in _STATUSES else "failed"
+    error = payload.get("error")
+    if status != raw:
+        error = f"Genie One returned an unexpected status: {raw or 'none'}"
+    return GenieTurn(
+        status=status,
+        conversation_id=payload.get("conversation_id"),
+        response_id=payload.get("response_id"),
+        text=payload.get("final_answer"),
+        queries=[GenieQuery(item_id=q["item_id"], sql=q.get("sql") or "")
+                 for q in payload.get("query_items") or [] if q.get("item_id")],
+        deep_link=payload.get("deep_link"),
+        error=str(error) if error else None,
+    )

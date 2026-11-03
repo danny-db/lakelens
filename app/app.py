@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
+from databricks.sdk.errors import NotFound, PermissionDenied, Unauthenticated
 from databricks.sdk.service.sql import StatementState, ExecuteStatementRequestOnWaitTimeout
 
 import hunts as catalogue
@@ -56,7 +57,7 @@ AI_ENDPOINT = os.getenv("AI_ENDPOINT", "databricks-gpt-5-4-mini")
 # this shared workspace's noisy billing. Default = a conservative small-model
 # ("mini") rate; override via env if you point AI_ENDPOINT at a pricier model.
 AI_ENDPOINT_DBU = tuple(float(x) for x in os.getenv("AI_ENDPOINT_DBU", "7.5,30").split(","))
-# Where scan results + the Genie space-id are persisted (shared, durable). The app
+# Where scan results are persisted (shared, durable). The app
 # writes here AS THE LOGGED-IN USER, so they need CREATE on this catalog/schema.
 # REQUIRED: set RESULTS_CATALOG to a catalog the app's users can write to (e.g. a
 # dedicated `lakelens` catalog, or `main`). No default — must be set per workspace so
@@ -235,7 +236,6 @@ def _write_for_store(sql: str, client, params=None) -> None:
 # Delta-backed shared store (created per-request with the OBO client). One instance
 # is cheap; it holds no state itself — the OBO client is passed into each call.
 DELTA = store_delta.DeltaStore(RESULTS_CATALOG, RESULTS_SCHEMA, _sql_for_store, _write_for_store)
-GENIE_CFG = genie_cost.GenieConfig(RESULTS_CATALOG, RESULTS_SCHEMA, _sql_for_store, _write_for_store, logger)
 
 
 def _bounded(sql: str, n: int = 10) -> str:
@@ -555,61 +555,37 @@ def narrate_panel(board_id: str, panel_id: str, request: Request, model: Optiona
         raise HTTPException(500, f"narrate failed: {e}")
 
 
-# ── API: embedded Genie ("Ask") — natural-language cost Q&A ──────────────────
+# ── API: Ask (Genie One) — natural-language cost Q&A ─────────────────────────
 #
-# A space_id is mandatory (no space-less Genie REST). The app runs in the
-# customer's workspace, so we can't hardcode one: a one-time button creates a
-# space seeded with the cost system tables, we persist its id, and all chat runs
-# through the Conversations API — everything on-behalf-of-user.
+# Genie One is a Unity AI Gateway MCP service, so there is no space to create.
+# Every call runs on-behalf-of-user. Ask returns at once with status in_progress
+# and the UI polls; no route ever blocks on Genie.
+
+def _genie(request: Request, tool: str, args: dict) -> dict:
+    """Call a Genie One tool as the user, turning failures into clean JSON errors."""
+    try:
+        if tool == "genie_poll_response":
+            return genie_cost.poll_response(_client_for(request), **args)
+        return genie_cost.call_tool(_client_for(request), tool, args)
+    except genie_cost.GenieError as e:
+        raise HTTPException(e.status, str(e))
+    except (PermissionDenied, Unauthenticated) as e:
+        logger.warning(f"genie {tool} denied: {e}")
+        raise HTTPException(403, "Genie One refused this user. The app needs the ai-gateway "
+                                 "scope (re-consent after a redeploy) and the user needs EXECUTE on "
+                                 "system.ai.genie_one_mcp.")
+    except NotFound as e:
+        logger.warning(f"genie {tool} not found: {e}")
+        raise HTTPException(404, "Genie One isn't available in this workspace. It needs Unity AI Gateway.")
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"genie {tool} failed: {e}")
+        raise HTTPException(502, f"Genie One call failed: {str(e).split(' [ReqId')[0][:300]}")
+
 
 @app.get("/api/genie/status")
-def genie_status(request: Request):
-    """Is a cost Genie space configured yet? (drives button-vs-chat in the UI)."""
-    try:
-        client = _client_for(request)
-        space_id = GENIE_CFG.get_space_id(client)
-        return {"configured": bool(space_id), "space_id": space_id,
-                "sample_questions": genie_cost.SAMPLE_QUESTIONS}
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"genie status failed: {e}")
-        return {"configured": False, "space_id": None,
-                "sample_questions": genie_cost.SAMPLE_QUESTIONS, "error": str(e)[:200]}
-
-
-class GenieCreateBody(BaseModel):
-    pass
-
-
-@app.post("/api/genie/create")
-def genie_create(request: Request):
-    """Provision the cost Genie space (the one-time button). Creates it as the
-    logged-in user, seeded with the cost system tables, and persists the space_id.
-    Idempotent: if one already exists, returns it rather than making a second."""
-    client = _client_for(request)
-    try:
-        existing = GENIE_CFG.get_space_id(client)
-        if existing:
-            return {"created": False, "space_id": existing, "message": "A cost Genie space already exists."}
-        if not WAREHOUSE_ID:
-            raise HTTPException(400, "No warehouse configured — set DATABRICKS_WAREHOUSE_ID.")
-        space = client.genie.create_space(
-            warehouse_id=WAREHOUSE_ID,
-            serialized_space=genie_cost.build_serialized_space(),
-            title="LakeLens — Cost Assistant",
-            description="Natural-language questions over the cost system tables (created by LakeLens).",
-        )
-        space_id = getattr(space, "space_id", None)
-        if not space_id:
-            raise HTTPException(500, "Genie space created but no space_id returned.")
-        who = request.headers.get("x-forwarded-email") or ""
-        GENIE_CFG.set_space_id(client, space_id, who)
-        return {"created": True, "space_id": space_id}
-    except HTTPException:
-        raise
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"genie create failed: {e}")
-        # Common cause: the `genie` OBO scope isn't enabled, or no create permission.
-        raise HTTPException(500, f"Couldn't create the Genie space: {e}")
+def genie_status():
+    """Genie One needs no setup, so the Ask tab is always ready."""
+    return {"status": "ready", "sample_questions": genie_cost.SAMPLE_QUESTIONS}
 
 
 class GenieAskBody(BaseModel):
@@ -618,80 +594,33 @@ class GenieAskBody(BaseModel):
 
 
 @app.post("/api/genie/ask")
-def genie_ask(body: GenieAskBody, request: Request):
-    """Ask the cost Genie a question. Starts a new conversation, or continues one
-    if conversation_id is given. Returns the answer text, the SQL Genie ran
-    (explainability), and ids to fetch the result rows."""
-    client = _client_for(request)
-    space_id = GENIE_CFG.get_space_id(client)
-    if not space_id:
-        raise HTTPException(400, "No cost Genie space yet — create one first.")
+def genie_ask(body: GenieAskBody, request: Request) -> genie_cost.GenieTurn:
+    """Send a question (grounded on the cost tables) and return the in-progress
+    turn at once. Pass conversation_id to ask a follow-up."""
     q = (body.question or "").strip()
     if not q:
         raise HTTPException(400, "Empty question.")
-    try:
-        if body.conversation_id:
-            msg = client.genie.create_message_and_wait(space_id, body.conversation_id, q)
-        else:
-            msg = client.genie.start_conversation_and_wait(space_id, q)
-        return genie_cost.message_to_view(msg)
-    except HTTPException:
-        raise
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"genie ask failed: {e}")
-        raise HTTPException(500, f"Genie query failed: {e}")
+    args = {"question": genie_cost.grounded_question(q)}
+    if body.conversation_id:
+        args["conversation_id"] = body.conversation_id
+    return genie_cost.to_turn(_genie(request, "genie_ask", args))
 
 
-@app.get("/api/genie/viz")
-def genie_viz(request: Request, conversation_id: str, message_id: str, attachment_id: str):
-    """Fetch Genie's own rendered chart for an answer's attachment (if it produced one).
-    The download-visualization endpoint returns raw PNG bytes; we base64 it into a data
-    URI for an <img>. Returns {available:false} when there's no visualization (common —
-    not every answer has a chart), so the frontend just falls back to the table."""
-    client = _client_for(request)
-    space_id = GENIE_CFG.get_space_id(client)
-    if not space_id:
-        raise HTTPException(400, "No cost Genie space configured.")
-    path = (f"/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}"
-            f"/messages/{message_id}/attachments/{attachment_id}/download-visualization")
-    try:
-        # raw=True → BinaryIO of the PNG (this endpoint isn't in the SDK yet, call it directly)
-        resp = client.api_client.do("GET", path, raw=True)
-        raw = resp.read() if hasattr(resp, "read") else bytes(resp)
-        if not raw:
-            return {"available": False}
-        import base64
-        b64 = base64.b64encode(raw).decode("ascii")
-        return {"available": True, "image": f"data:image/png;base64,{b64}"}
-    except Exception as e:  # noqa: BLE001
-        # No viz for this attachment / not supported here → not an error, just fall back.
-        logger.info(f"genie viz unavailable ({attachment_id}): {e}")
-        return {"available": False}
+@app.get("/api/genie/poll")
+def genie_poll(request: Request, conversation_id: str, response_id: str) -> genie_cost.GenieTurn:
+    """Current state of one answer. The UI calls this until status != in_progress."""
+    return genie_cost.to_turn(_genie(request, "genie_poll_response",
+                                     {"conversation_id": conversation_id, "response_id": response_id}))
 
 
 @app.get("/api/genie/result")
-def genie_result(request: Request, conversation_id: str, message_id: str, attachment_id: str):
-    """Fetch the result rows for a Genie answer's query attachment (the table
-    behind the SQL Genie ran)."""
-    client = _client_for(request)
-    space_id = GENIE_CFG.get_space_id(client)
-    if not space_id:
-        raise HTTPException(400, "No cost Genie space configured.")
-    try:
-        res = client.genie.get_message_attachment_query_result(
-            space_id, conversation_id, message_id, attachment_id)
-        sr = getattr(res, "statement_response", None)
-        cols, rows = [], []
-        if sr and getattr(sr, "manifest", None) and sr.manifest.schema:
-            cols = [c.name for c in sr.manifest.schema.columns]
-        if sr and getattr(sr, "result", None) and sr.result.data_array:
-            rows = sr.result.data_array[:200]
-        return {"columns": cols, "rows": rows, "total_rows": len(rows)}
-    except HTTPException:
-        raise
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"genie result failed: {e}")
-        raise HTTPException(500, f"Couldn't fetch Genie result: {e}")
+def genie_result(request: Request, conversation_id: str, response_id: str, item_id: str):
+    """The result rows behind one of the SQL queries Genie ran."""
+    res = _genie(request, "genie_get_query_result", {"conversation_id": conversation_id,
+                                                     "response_id": response_id, "item_id": item_id})
+    cols = [c.get("name") if isinstance(c, dict) else c for c in res.get("columns") or []]
+    rows = (res.get("rows") or [])[:200]
+    return {"columns": cols, "rows": rows, "total_rows": res.get("total_row_count", len(rows))}
 
 
 # ── API: AI explainer for a hunt ─────────────────────────────────────────────
