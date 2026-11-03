@@ -917,6 +917,9 @@ def _compute_scan_cost(view: dict, client: WorkspaceClient) -> dict[str, Any]:
     return out
 
 
+TRIAGE_NOTE_MAX = 2000
+
+
 class TriageUpdate(BaseModel):
     status: str
     note: str = ""
@@ -926,12 +929,18 @@ class TriageUpdate(BaseModel):
 def finding_triage(hunt_id: str, body: TriageUpdate, request: Request):
     """Move a finding through the workflow: new → acknowledged → in_progress →
     resolved / dismissed. Keyed by hunt id so the decision survives a re-scan."""
+    if not any(h["id"] == hunt_id for h in catalogue.HUNTS):
+        raise HTTPException(404, f"unknown hunt {hunt_id}")
     if body.status not in scan_engine.TRIAGE_STATES:
         raise HTTPException(400, f"status must be one of {scan_engine.TRIAGE_STATES}")
+    if len(body.note) > TRIAGE_NOTE_MAX:
+        raise HTTPException(400, f"note is longer than {TRIAGE_NOTE_MAX} characters")
     who = request.headers.get("x-forwarded-email") or request.headers.get("x-forwarded-user") or ""
+    client = _client_for(request)
     rec = scan_engine.STORE.set_triage(hunt_id, body.status, body.note, who)  # in-memory (fast path)
-    DELTA.set_triage(_client_for(request), hunt_id, body.status, body.note, who)  # shared/durable
-    return {"hunt_id": hunt_id, **rec}
+    persisted = DELTA.set_triage(client, hunt_id, body.status, body.note, who)  # shared/durable
+    return {"hunt_id": hunt_id, **rec, "persisted": persisted,
+            "store_error": None if persisted else DELTA.last_error}
 
 
 # ── API: Tokenomics live SQL (verify rates + tie to actual spend) ────────────

@@ -18,6 +18,8 @@ in-memory Store and the app still works — just not shared/durable.
 """
 import json
 import logging
+import random
+import time
 from typing import Optional, Callable
 
 logger = logging.getLogger("uvicorn.error")
@@ -193,20 +195,34 @@ class DeltaStore:
 
     # ── shared triage ──────────────────────────────────────────────────────────
     def set_triage(self, client, hunt_id: str, status: str, note: str, who: str) -> bool:
+        """Upsert this hunt's triage in one atomic MERGE, so a failed write leaves the
+        prior state and a repeat converges to the same single row."""
         if not self.ensure_tables(client):
             return False
-        try:
-            # keep it simple + shared: delete prior row for this hunt, insert the new state
-            self._run_write(f"DELETE FROM {self.fq}.finding_triage WHERE hunt_id=:h", client,
-                            [{"name": "h", "value": hunt_id}])
-            self._run_write(
-                f"INSERT INTO {self.fq}.finding_triage VALUES (:h,:s,:n,:w, current_timestamp())", client,
-                [{"name": "h", "value": hunt_id}, {"name": "s", "value": status},
-                 {"name": "n", "value": note or ""}, {"name": "w", "value": who or ""}])
-            return True
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"DeltaStore.set_triage failed: {e}")
-            return False
+        for attempt in range(6):
+            try:
+                return self._merge_triage(client, hunt_id, status, note, who)
+            except Exception as e:  # noqa: BLE001
+                # Two users triaging at once conflict in Delta; the MERGE is safe to repeat.
+                if "DELTA_CONCURRENT" in str(e) and attempt < 5:
+                    time.sleep(random.uniform(0.2, 1.0))
+                    continue
+                self.last_error = str(e)[:300]
+                logger.warning(f"DeltaStore.set_triage failed: {e}")
+                return False
+        return False
+
+    def _merge_triage(self, client, hunt_id: str, status: str, note: str, who: str) -> bool:
+        self._run_write(f"""
+                MERGE INTO {self.fq}.finding_triage t
+                USING (SELECT :h AS hunt_id, :s AS status, :n AS note, :w AS updated_by,
+                              current_timestamp() AS updated_at) s
+                ON t.hunt_id = s.hunt_id
+                WHEN MATCHED THEN UPDATE SET *
+                WHEN NOT MATCHED THEN INSERT *""", client,
+            [{"name": "h", "value": hunt_id}, {"name": "s", "value": status},
+             {"name": "n", "value": note or ""}, {"name": "w", "value": who or ""}])
+        return True
 
     def all_triage(self, client) -> dict[str, dict]:
         if not self.ensure_tables(client):
