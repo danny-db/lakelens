@@ -1027,6 +1027,13 @@ def tagging_find(what: str, request: Request):
         raise HTTPException(500, f"tagging {what} failed: {e}")
 
 
+# Ids are interpolated into SDK URL paths, so each must match its type's real format.
+TAG_ID_FORMAT = {
+    "warehouse": re.compile(r"[0-9a-f]{16}"),
+    "cluster": re.compile(r"[0-9]{4}-[0-9]{6}-[a-z0-9]{5,12}"),
+}
+
+
 class TagSet(BaseModel):
     resource_type: str   # 'warehouse' | 'cluster'
     resource_id: str
@@ -1049,6 +1056,11 @@ def tagging_set(body: TagSet, request: Request):
     # basic hygiene on the tag key/value
     if not re.fullmatch(r"[A-Za-z0-9_\-. ]{1,64}", key) or len(val) > 256:
         raise HTTPException(400, "invalid tag key or value")
+    id_format = TAG_ID_FORMAT.get(body.resource_type)
+    if not id_format:
+        raise HTTPException(400, "resource_type must be 'warehouse' or 'cluster'")
+    if not id_format.fullmatch(body.resource_id):
+        raise HTTPException(400, f"'{body.resource_id[:40]}' is not a valid {body.resource_type} id")
     try:
         if body.resource_type == "warehouse":
             from databricks.sdk.service.sql import EndpointTags, EndpointTagPair
@@ -1059,7 +1071,7 @@ def tagging_set(body: TagSet, request: Request):
             client.warehouses.edit(id=body.resource_id, tags=EndpointTags(custom_tags=pairs))
             return {"ok": True, "resource_type": "warehouse", "resource_id": body.resource_id,
                     "set": {key: val}, "note": "Tag set. It appears in system tables on the next sync."}
-        elif body.resource_type == "cluster":
+        else:
             cur = client.clusters.get(body.resource_id)
             tags = dict(cur.custom_tags or {})
             tags[key] = val
@@ -1078,12 +1090,10 @@ def tagging_set(body: TagSet, request: Request):
             client.clusters.edit(**kwargs)
             return {"ok": True, "resource_type": "cluster", "resource_id": body.resource_id,
                     "set": {key: val}, "note": "Tag set (takes effect on the cluster's next start)."}
-        else:
-            raise HTTPException(400, "resource_type must be 'warehouse' or 'cluster'")
-    except HTTPException:
-        raise
+    except NotFound:
+        raise HTTPException(404, f"{body.resource_type} {body.resource_id} does not exist")
     except Exception as e:
-        msg = str(e)
+        msg = _sdk_message(e)
         logger.error(f"tagging set failed ({body.resource_type} {body.resource_id}): {msg}")
         # translate the common failures into a plain-English reason for the UI
         low = msg.lower()
