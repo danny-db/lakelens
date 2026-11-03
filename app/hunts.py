@@ -90,8 +90,10 @@ HUNTS = [
         "eli5": "Finds AI model calls that are spending fast right now — within the "
                 "hour, before the daily bill even updates.",
         "what": "Each row is one hour of AI usage for a model endpoint and the identity "
-                "that called it. If a single (endpoint, caller) pair suddenly spends "
-                "10× more than its neighbours, that is your runaway. "
+                "that called it, set against that same (endpoint, caller) pair's own busy hour: "
+                "the 95th percentile of its active hours over the prior 28 days. vs_normal is how "
+                "many times that normal this hour's tokens are, and that sets the alert. A pair "
+                "running several times its own busy hour is your runaway. "
                 "“est_usd_rough” is an estimate built from your own recent bill "
                 "— read it as a relative signal (“who spiked”), not an exact invoice.",
         "action": "Layer three controls: (1) a SQL alert on the hourly rate so a spike is "
@@ -104,8 +106,11 @@ HUNTS = [
         "explain_hunt_desc": "hourly token-rate leaders for FMAPI / ai_query() calls "
                              "(runaway-spend early warning)",
         "explain_rubric": (
-            "a single (endpoint, requester) pair whose input_tokens or est_usd_rough "
-            "jumps an order of magnitude above its neighbours is the runaway. "
+            "each row is one hour for an (endpoint, requester) pair. vs_normal = tokens / baseline, "
+            "where baseline is that pair's 95th-percentile active hour over the prior 28 days "
+            "(floored at the workspace's 95th-percentile pair-hour; baseline_from says which). A pair "
+            "several times its own busy hour is the runaway; NULL vs_normal = a pair first seen in "
+            "this window. "
             "requester_type = service principal means an automated pipeline. "
             "est_usd_rough is a rate-blended estimate (this window's tokens x the "
             "account's own 7-day effective $/1M-token rate), read it relative, not as "
@@ -134,18 +139,44 @@ rate AS (
   SELECT b.model, b.usd / (g.tok / 1e6) AS usd_1m
   FROM billing_dollars b JOIN gateway_tokens g USING (model)
   WHERE g.tok > 50e6
+),
+prior AS (
+  SELECT endpoint_name, requester, date_trunc('hour', event_time) AS hr,
+         sum(input_tokens + output_tokens) AS tok
+  FROM system.ai_gateway.usage
+  WHERE event_time >= now() - INTERVAL 28 DAYS - INTERVAL 3 HOURS
+    AND event_time <  now() - INTERVAL 3 HOURS
+  GROUP BY 1, 2, 3
+),
+own AS (SELECT endpoint_name, requester, percentile_approx(tok, 0.95) AS own_normal FROM prior GROUP BY 1, 2),
+ws AS (SELECT percentile_approx(tok, 0.95) AS ws_normal FROM prior),
+cur AS (
+  SELECT date_trunc('hour', u.event_time)        AS hr,
+         u.invocation_metadata.source            AS source,
+         u.endpoint_name, u.requester, u.requester_type,
+         sum(u.input_tokens)                      AS in_tok,
+         sum(u.output_tokens)                     AS out_tok,
+         round(sum(u.input_tokens + u.output_tokens) / 1e6 * max(r.usd_1m), 2) AS est_usd_rough
+  FROM system.ai_gateway.usage u
+  LEFT JOIN rate r ON u.endpoint_name = r.model
+  WHERE u.event_time >= now() - INTERVAL 3 HOURS
+  GROUP BY 1,2,3,4,5
+),
+graded AS (
+  SELECT c.*, c.in_tok + c.out_tok AS tokens, o.own_normal, w.ws_normal,
+         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  FROM cur c LEFT JOIN own o ON c.endpoint_name <=> o.endpoint_name AND c.requester <=> o.requester
+  CROSS JOIN ws w
 )
-SELECT date_trunc('hour', u.event_time)        AS hr,
-       u.invocation_metadata.source            AS source,
-       u.endpoint_name, u.requester, u.requester_type,
-       sum(u.input_tokens)                      AS in_tok,
-       sum(u.output_tokens)                     AS out_tok,
-       round(sum(u.input_tokens + u.output_tokens) / 1e6 * max(r.usd_1m), 2) AS est_usd_rough
-FROM system.ai_gateway.usage u
-LEFT JOIN rate r ON u.endpoint_name = r.model
-WHERE u.event_time >= now() - INTERVAL 3 HOURS
-GROUP BY 1,2,3,4,5
-ORDER BY est_usd_rough DESC NULLS LAST
+SELECT hr, source, endpoint_name, requester, requester_type, in_tok, out_tok, est_usd_rough,
+       endpoint_name || ' / ' || requester    AS caller,
+       tokens, baseline,
+       round(tokens / baseline, 2)            AS vs_normal,
+       CASE WHEN baseline IS NULL THEN 'none (new)'
+            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+FROM graded
+WHERE tokens > 0 AND tokens >= coalesce(baseline, ws_normal, 0)
+ORDER BY coalesce(tokens / baseline, tokens / ws_normal) DESC
 LIMIT 20
 """,
     },
@@ -294,8 +325,11 @@ LIMIT 20
                 "each one resets the auto-stop timer so the warehouse never sleeps.",
         "what": "“client_application” and “executed_by” name the tool exactly "
                 "— this is configuration, not guesswork. “stmts_per_session near 1” "
-                "means the tool opens a fresh connection for every statement. Tens of thousands "
-                "of these a week from one client is the pattern that keeps a warehouse billing 24/7.",
+                "means the tool opens a fresh connection for every statement. Each row is one "
+                "client this week, set against its own usual week (the median of its prior four "
+                "weeks); vs_normal is how many times that usual it fired, and that sets the alert. "
+                "A client that suddenly fires several times its normal chatter is the new cause of "
+                "a warehouse that won't sleep.",
         "action": "Fix the tool first — e.g. a BI tool's refresh schedule left at its "
                   "aggressive default, or a monitoring tool that should have its own small "
                   "warehouse. Then move always-on tools onto a small serverless warehouse where "
@@ -305,22 +339,44 @@ LIMIT 20
         "explain_rubric": (
             "client_application and executed_by name the tool - it's configuration, not "
             "guesswork. stmts_per_session near 1 means the client opens a fresh connection per "
-            "statement (pool churn). Tens of thousands of rows per week from one client is the pattern."
+            "statement (pool churn). vs_normal = stmts / baseline, where baseline is the client's "
+            "median week over the prior four weeks (floored at the workspace's 95th-percentile client-week; "
+            "baseline_from says which). A client several times its own normal is the pattern; NULL "
+            "vs_normal = a client first seen this week."
         ),
         "sql": """
-WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL)
-SELECT coalesce(wh.warehouse_name, q.warehouse_id) AS warehouse, q.statement_type, q.executed_by,
-       q.client_application, q.client_driver, q.stmts, q.sessions, q.stmts_per_session
-FROM (
+WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL),
+weekly AS (
   SELECT compute.warehouse_id, statement_type, executed_by, client_application, client_driver,
+         concat_ws('|', compute.warehouse_id, statement_type, executed_by,
+                   coalesce(client_application, ''), coalesce(client_driver, '')) AS k,
+         floor((unix_timestamp(current_timestamp()) - unix_timestamp(start_time)) / 604800) AS wk,
          count(*) AS stmts, count(DISTINCT session_id) AS sessions,
          round(count(*)/count(DISTINCT session_id),1) AS stmts_per_session
   FROM system.query.history
   WHERE read_bytes = 0 AND total_duration_ms < 30000
-    AND start_time >= current_timestamp() - INTERVAL 7 DAYS
-  GROUP BY 1,2,3,4,5
-) q LEFT JOIN wh ON q.warehouse_id = wh.warehouse_id
-ORDER BY q.stmts DESC
+    AND start_time >= current_timestamp() - INTERVAL 35 DAYS
+  GROUP BY 1,2,3,4,5,6,7
+),
+own AS (SELECT k, percentile_approx(stmts, 0.5) AS own_normal FROM weekly WHERE wk BETWEEN 1 AND 4 GROUP BY 1),
+ws AS (SELECT percentile_approx(stmts, 0.95) AS ws_normal FROM weekly WHERE wk BETWEEN 1 AND 4),
+q AS (
+  SELECT c.*, o.own_normal, w.ws_normal,
+         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  FROM weekly c LEFT JOIN own o USING (k) CROSS JOIN ws w
+  WHERE c.wk = 0
+)
+SELECT coalesce(wh.warehouse_name, q.warehouse_id) AS warehouse, q.statement_type, q.executed_by,
+       q.client_application, q.client_driver, q.stmts, q.sessions, q.stmts_per_session,
+       coalesce(q.client_application, q.client_driver, 'unknown client') || ' (' || q.executed_by
+         || ') on ' || coalesce(wh.warehouse_name, q.warehouse_id, 'a cluster') AS client,
+       q.baseline,
+       round(q.stmts / q.baseline, 2) AS vs_normal,
+       CASE WHEN q.baseline IS NULL THEN 'none (new)'
+            WHEN q.own_normal >= q.ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+FROM q LEFT JOIN wh ON q.warehouse_id = wh.warehouse_id
+WHERE q.stmts >= coalesce(q.baseline, q.ws_normal, 0)
+ORDER BY coalesce(q.stmts / q.baseline, q.stmts / q.ws_normal) DESC
 LIMIT 50
 """,
     },
@@ -499,10 +555,12 @@ LIMIT 50
         "id": "H7",
         "category": "longrun",
         "title": "Polling every 20 seconds",
-        "eli5": "Finds one identity running the same short query thousands of times — "
-                "usually an orchestrator checking metadata far more often than needed.",
-        "what": "More than ~10,000 runs a week from one identity is a CANDIDATE poller, not a "
-                "verdict — confirm before acting. ‘execution_hours’ is the total "
+        "eli5": "Finds one identity running the same short query far more often than it usually "
+                "does, typically an orchestrator checking metadata more often than needed.",
+        "what": "Each row is one identity and query source this week, set against its own usual "
+                "week (the median of its prior four weeks). vs_normal is how many times that usual "
+                "it ran, and that sets the alert. A group running several times its normal is a "
+                "CANDIDATE poller, not a verdict — confirm before acting. ‘execution_hours’ is the total "
                 "compute weight. The result names the culprit (a saved query, dashboard, or job) "
                 "even when the SQL text is hidden. When all three are blank the row is labelled "
                 "‘unattributed — confirm before acting’ because unrelated short "
@@ -515,34 +573,68 @@ LIMIT 50
         "explain_hunt_desc": ("one principal running thousands of short SELECTs (candidate polling - "
                               "unattributed groups need confirmation, do not assert waste)"),
         "explain_rubric": (
-            "more than ~10K executions a week from one principal is a candidate poller, not a "
-            "verdict - confirm before acting. p50_exec_ms shows how expensive each poll is; "
+            "vs_normal = execs / baseline, where baseline is the group's median week over the prior "
+            "four weeks (floored at the workspace's 95th-percentile group-week; baseline_from says "
+            "which). A group several times its own normal is a candidate poller, not a verdict - "
+            "confirm before acting; NULL vs_normal = a group first seen this week. p50_exec_ms shows how expensive each poll is; "
             "execution_hours is the aggregate execution weight (execution only, excluding "
             "queue/provisioning). When all query_source IDs are NULL the group is unattributed - "
             "unrelated short SELECTs can collapse into one row, so do not assert it is a poller."
         ),
         "sql": """
-SELECT executed_by,
-       CASE WHEN executed_by LIKE '%@%' THEN 'human' ELSE 'service_principal' END AS owner_type,
-       client_application,
-       query_source.sql_query_id            AS sql_query_id,
-       query_source.dashboard_id            AS dashboard_id,
-       query_source.job_info.job_id         AS job_id,
-       count(*)                                       AS execs,
-       approx_percentile(execution_duration_ms, 0.5)  AS p50_exec_ms,
-       sum(execution_duration_ms)/3600000.0           AS execution_hours,
-       any_value(statement_id)                        AS example_statement_id,
-       slice(array_agg(statement_id), 1, 3)           AS more_example_ids,
-       CASE WHEN coalesce(query_source.sql_query_id, query_source.dashboard_id,
-                          query_source.job_info.job_id) IS NULL
-            THEN 'unattributed — confirm before acting'
-            ELSE 'candidate — confirm in Query History' END    AS status
-FROM system.query.history
-WHERE statement_type = 'SELECT' AND total_duration_ms < 60000
-  AND start_time >= current_date() - INTERVAL 7 DAYS
-GROUP BY 1, 2, 3, 4, 5, 6
-HAVING count(*) > 10000
-ORDER BY execs DESC
+WITH polls AS (
+  SELECT executed_by, client_application,
+         query_source.sql_query_id            AS sql_query_id,
+         query_source.dashboard_id            AS dashboard_id,
+         query_source.job_info.job_id         AS job_id,
+         concat_ws('|', executed_by, coalesce(client_application, ''), coalesce(query_source.sql_query_id, ''),
+                   coalesce(query_source.dashboard_id, ''), coalesce(query_source.job_info.job_id, '')) AS k,
+         statement_id, execution_duration_ms, start_time
+  FROM system.query.history
+  WHERE statement_type = 'SELECT' AND total_duration_ms < 60000
+    AND start_time >= current_timestamp() - INTERVAL 35 DAYS
+),
+prior AS (
+  SELECT k, floor((unix_timestamp(current_timestamp()) - unix_timestamp(start_time)) / 604800) AS wk,
+         count(*) AS execs
+  FROM polls WHERE start_time < current_timestamp() - INTERVAL 7 DAYS
+  GROUP BY 1, 2
+),
+own AS (SELECT k, percentile_approx(execs, 0.5) AS own_normal FROM prior GROUP BY 1),
+ws AS (SELECT percentile_approx(execs, 0.95) AS ws_normal FROM prior),
+cur AS (
+  SELECT executed_by,
+         CASE WHEN executed_by LIKE '%@%' THEN 'human' ELSE 'service_principal' END AS owner_type,
+         client_application, sql_query_id, dashboard_id, job_id, k,
+         count(*)                                       AS execs,
+         approx_percentile(execution_duration_ms, 0.5)  AS p50_exec_ms,
+         sum(execution_duration_ms)/3600000.0           AS execution_hours,
+         any_value(statement_id)                        AS example_statement_id,
+         slice(array_agg(statement_id), 1, 3)           AS more_example_ids,
+         CASE WHEN coalesce(sql_query_id, dashboard_id, job_id) IS NULL
+              THEN 'unattributed — confirm before acting'
+              ELSE 'candidate — confirm in Query History' END    AS status
+  FROM polls
+  WHERE start_time >= current_timestamp() - INTERVAL 7 DAYS
+  GROUP BY 1, 2, 3, 4, 5, 6, 7
+),
+graded AS (
+  SELECT c.*, o.own_normal, w.ws_normal,
+         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  FROM cur c LEFT JOIN own o USING (k) CROSS JOIN ws w
+)
+SELECT executed_by, owner_type, client_application, sql_query_id, dashboard_id, job_id,
+       execs, p50_exec_ms, execution_hours, example_statement_id, more_example_ids, status,
+       coalesce('query ' || sql_query_id, 'dashboard ' || dashboard_id, 'job ' || job_id,
+                client_application, 'unattributed') || ' (' || executed_by || ')' AS poller,
+       baseline,
+       round(execs / baseline, 2) AS vs_normal,
+       CASE WHEN baseline IS NULL THEN 'none (new)'
+            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+FROM graded
+WHERE execs >= coalesce(baseline, ws_normal, 0)
+ORDER BY coalesce(execs / baseline, execs / ws_normal) DESC
+LIMIT 50
 """,
     },
 
@@ -553,7 +645,10 @@ ORDER BY execs DESC
         "title": "Queue pressure vs capacity",
         "eli5": "Shows, per warehouse, how long queries waited for capacity next to how long "
                 "they actually ran — the objective signal for right-sizing.",
-        "what": "High queued time relative to execution time means the warehouse is undersized "
+        "what": "Each row is one warehouse this week with its queue wait set against its own "
+                "usual week (the median of its prior four weeks that had any queueing). vs_normal "
+                "is how many times that usual it waited, and that sets the alert. "
+                "High queued time relative to execution time means the warehouse is undersized "
                 "or its maximum cluster count is too low for peaks. Near-zero queueing with low "
                 "utilisation means there is room to size DOWN. This is real demand, not perceived "
                 "slowness.",
@@ -566,24 +661,47 @@ ORDER BY execs DESC
         "explain_hunt_desc": "warehouses ranked by queue pressure vs execution time",
         "inventory": True,  # ranks every warehouse — a reference view, not a waste list
         "explain_rubric": (
+            "vs_normal = queued_hours / baseline, where baseline is the warehouse's median queueing "
+            "week over the prior four (floored at the workspace's 95th-percentile queueing warehouse-week; "
+            "baseline_from says which). A warehouse several times its own normal queue has outgrown "
+            "its size; NULL vs_normal = first time it has queued. "
             "high queued_hours relative to exec_hours means the warehouse is undersized or its "
             "max cluster count is too low for peaks. Zero queueing with low utilisation (H14 for "
             "clusters, warehouse monitoring for DBSQL) means there is room to downsize."
         ),
         "sql": """
-WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL)
-SELECT coalesce(wh.warehouse_name, q.warehouse_id) AS warehouse,
-       q.stmts_queued_over_1m, q.queued_hours, q.exec_hours
-FROM (
+WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL),
+weekly AS (
   SELECT compute.warehouse_id,
+         floor((unix_timestamp(current_timestamp()) - unix_timestamp(start_time)) / 604800) AS wk,
          count_if(waiting_at_capacity_duration_ms > 60000) AS stmts_queued_over_1m,
          sum(waiting_at_capacity_duration_ms)/3600000.0    AS queued_hours,
          sum(execution_duration_ms)/3600000.0              AS exec_hours
   FROM system.query.history
-  WHERE start_time >= current_date() - INTERVAL 7 DAYS
-  GROUP BY 1
-) q LEFT JOIN wh ON q.warehouse_id = wh.warehouse_id
-ORDER BY q.queued_hours DESC
+  WHERE start_time >= current_timestamp() - INTERVAL 35 DAYS
+  GROUP BY 1, 2
+),
+prior AS (SELECT * FROM weekly WHERE wk BETWEEN 1 AND 4 AND queued_hours > 0),
+own AS (SELECT warehouse_id, percentile_approx(queued_hours, 0.5) AS own_normal FROM prior GROUP BY 1),
+ws AS (SELECT percentile_approx(queued_hours, 0.95) AS ws_normal FROM prior),
+q AS (
+  SELECT c.*, o.own_normal, w.ws_normal,
+         CASE WHEN o.own_normal IS NOT NULL THEN greatest(o.own_normal, w.ws_normal) END AS baseline
+  FROM weekly c LEFT JOIN own o ON c.warehouse_id <=> o.warehouse_id CROSS JOIN ws w
+  WHERE c.wk = 0
+)
+SELECT coalesce(wh.warehouse_name, q.warehouse_id) AS warehouse,
+       q.stmts_queued_over_1m, q.queued_hours, q.exec_hours,
+       q.baseline,
+       -- every warehouse stays listed; one with no queueing history is NEW only when it now
+       -- queues at least the workspace normal, otherwise it is scored against that normal
+       CASE WHEN q.baseline IS NOT NULL THEN round(q.queued_hours / q.baseline, 2)
+            WHEN q.queued_hours > 0 AND q.queued_hours >= coalesce(q.ws_normal, 0) THEN NULL
+            ELSE coalesce(round(q.queued_hours / q.ws_normal, 2), 0) END AS vs_normal,
+       CASE WHEN q.baseline IS NULL THEN 'none (new)'
+            WHEN q.own_normal >= q.ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from
+FROM q LEFT JOIN wh ON q.warehouse_id = wh.warehouse_id
+ORDER BY coalesce(q.queued_hours / q.baseline, q.queued_hours / q.ws_normal) DESC NULLS LAST, q.queued_hours DESC
 """,
     },
 
@@ -1635,9 +1753,13 @@ class ThresholdSpec(TypedDict):
 AlertSpec = Union[AnomalySpec, PresenceSpec, ThresholdSpec]
 
 ALERT_SPECS: dict[str, AlertSpec] = {
-    "H0": {"kind": "threshold", "metric_col": "est_usd_rough", "metric_label": "Est. spend rate (rate-blended, 3h window)",
-           "unit": "usd", "high": 100, "medium": 20, "usd_col": "est_usd_rough",
-           "summary": "An AI caller is spending at an elevated rate — {metric} in the last 3 hours."},
+    "H0": {"kind": "anomaly", "entity_col": "caller", "metric_col": "tokens",
+           "metric_label": "Tokens in one hour", "unit": "count",
+           "baseline": "95th percentile of the (endpoint, caller) pair's active hours over the "
+                       "prior 28 days, floored at the workspace's 95th-percentile pair-hour",
+           "summary": "{entity}: {x} its usual busy-hour AI token rate ({metric} tokens in an hour, normal ~{baseline}).",
+           "new_summary": "NEW: {entity} first seen calling AI in this window ({metric} tokens in an hour).",
+           "usd_col": "est_usd_rough"},
     "H1": {"kind": "anomaly", "entity_col": "merge_target", "metric_col": "read_tib",
            "metric_label": "Heaviest MERGE run this week", "unit": "tib",
            "baseline": "median read of the same MERGE target's runs over the prior 28 days, "
@@ -1652,9 +1774,13 @@ ALERT_SPECS: dict[str, AlertSpec] = {
            "summary": "{entity}: a statement spilled {x} its usual ({metric}, normal ~{baseline}).",
            "new_summary": "NEW: {entity} first seen spilling this window ({metric}).",
            "usd_col": None},
-    "H3": {"kind": "threshold", "metric_col": "stmts", "metric_label": "Chatter statements / week (top client)",
-           "unit": "count", "high": 50000, "medium": 10000, "usd_col": None,
-           "summary": "Chatty clients are keeping warehouses awake — top client fired {metric} tiny statements."},
+    "H3": {"kind": "anomaly", "entity_col": "client", "metric_col": "stmts",
+           "metric_label": "Tiny statements this week", "unit": "count",
+           "baseline": "median of the client's prior four weeks, floored at the workspace's "
+                       "95th-percentile client-week",
+           "summary": "{entity}: {x} its usual tiny statements ({metric} this week, normal ~{baseline}/week).",
+           "new_summary": "NEW: {entity} first seen this window ({metric} tiny statements this week).",
+           "usd_col": None},
     "H5": {"kind": "anomaly", "entity_col": "source", "metric_col": "total_min",
            "metric_label": "Statement over 4 hours", "unit": "minutes",
            "baseline": "median of the source's longest statement per day over the prior 28 days, "
@@ -1669,12 +1795,20 @@ ALERT_SPECS: dict[str, AlertSpec] = {
            "summary": "{entity}: {x} their usual busy-hour scan volume ({metric} in one hour, normal ~{baseline}).",
            "new_summary": "NEW: {entity} first seen scanning this window ({metric} in one hour).",
            "usd_col": None},
-    "H7": {"kind": "threshold", "metric_col": "execution_hours", "metric_label": "Compute hours from polling (top principal)",
-           "unit": "hours", "high": 100, "medium": 20, "usd_col": None,
-           "summary": "A candidate poller ran thousands of short queries — {metric} of compute."},
-    "H8": {"kind": "threshold", "metric_col": "queued_hours", "metric_label": "Queue wait (top warehouse)",
-           "unit": "hours", "high": 10, "medium": 2, "usd_col": None,
-           "summary": "A warehouse is queue-pressured — {metric} spent waiting for capacity."},
+    "H7": {"kind": "anomaly", "entity_col": "poller", "metric_col": "execs",
+           "metric_label": "Short SELECTs this week", "unit": "count",
+           "baseline": "median of the group's prior four weeks, floored at the workspace's "
+                       "95th-percentile group-week",
+           "summary": "{entity}: {x} its usual short queries ({metric} this week, normal ~{baseline}/week).",
+           "new_summary": "NEW: {entity} first seen polling this window ({metric} short queries this week).",
+           "usd_col": None},
+    "H8": {"kind": "anomaly", "entity_col": "warehouse", "metric_col": "queued_hours",
+           "metric_label": "Queue wait this week", "unit": "hours",
+           "baseline": "median of the warehouse's prior four weeks that had any queueing, floored "
+                       "at the workspace's 95th-percentile queueing warehouse-week",
+           "summary": "{entity}: queued {x} its usual ({metric} waiting this week, normal ~{baseline}/week).",
+           "new_summary": "NEW: {entity} started queueing this window ({metric} waiting this week).",
+           "usd_col": None},
     # ── H16–H20 (Aug 2026 thread additions) ──
     "H16": {"kind": "threshold", "metric_col": "run_count", "metric_label": "Runs on All-Purpose (top job)",
             "unit": "count", "high": 100, "medium": 20, "usd_col": None,
