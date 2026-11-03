@@ -47,7 +47,7 @@ flowchart LR
 
 ## What's inside
 
-📖 **[Full catalogue](docs/CATALOGUE.md)**: every hunt, Tune practice and measure, with what it finds, how to read it, what to do, its alert thresholds and the system tables it reads.
+📖 **[Full catalogue](docs/CATALOGUE.md)**: every hunt, Tune practice and measure, with what it finds, how to read it, what to do, how it is graded and the system tables it reads.
 
 | Tab | What it does |
 |---|---|
@@ -66,7 +66,7 @@ flowchart LR
 |---|---|
 | 🤖 AI & Model Serving | H0 Runaway AI spend |
 | 💤 Idle Compute | H3 Chatter keeps warehouses awake · H4 Warehouses that never sleep · H14 Idle cores · H16 Jobs on all-purpose compute · H18 Idle interactive clusters · H19 Always-on Databricks Apps |
-| 📖 Heavy Reads & Spill | H1 Read amplification · H2 Disk spill · H6 The scan paid five times · H21 Tables still on snappy (not zstd) |
+| 📖 Heavy Reads & Spill | H1 Read amplification · H2 Disk spill · H6 Unusually heavy scan hours by one person · H21 Tables still on snappy (not zstd) |
 | ⏱️ Long-Running & Repetitive | H5 Runaway statements (over 4 hours) · H7 Polling every 20 seconds |
 | ⚙️ Right-Sizing & Config | H8 Queue pressure vs capacity · H9 Warehouse config audit · H17 Auto-stop disabled · H22 Serverless jobs in performance-optimised mode |
 | 📈 Spend Trends & Attribution | H10 Spend by product (SKU) · H11 Jobs: weekly movers · H12 Jobs: who got slower? · H13 Cost per pipeline · H20 Frequently failing jobs · H23 Predictive Optimisation cost drivers |
@@ -121,6 +121,16 @@ Tip: pin `host`, `warehouse_id` and `results_catalog` in the `prod` target of `d
 | `anomaly_high_x` | no | `3` | An alert is high when it is at least this many times its own usual |
 | `anomaly_medium_x` | no | `2` | An alert is medium when it is at least this many times its own usual |
 
+### How alerts are graded
+Each alert compares what an entity (a job, warehouse, person, client, table) did in this window with **its own normal**: the same metric for the same entity over the 28 days before the window, at the same period length. `vs_normal` is that multiple.
+
+- **High** at `anomaly_high_x` times its normal (default 3), **medium** at `anomaly_medium_x` (default 2). Anything less raises no alert.
+- **NEW**: an entity with no history in those 28 days is medium, as long as it is at least the workspace's normal size.
+- **Floor**: an entity's normal never counts as smaller than the workspace's own typical value for that metric, so a near-zero normal can't turn noise into a huge multiple. The evidence table's `baseline_from` says which one applied.
+- **Configuration hunts** (H17 auto-stop disabled, H21 likely-snappy tables) have no time series. Any row is medium.
+
+Because the rule is relative, it works the same in a small workspace and a large one. It catches change, not steady waste: a job that has run on All-Purpose compute every week for months reads about 1x its normal and raises no alert, though it still shows on the Spot tab. Each hunt's baseline is listed in the [catalogue](docs/CATALOGUE.md).
+
 ### What users need
 Every query runs as the signed-in user (on-behalf-of-user), so there are no service-principal grants. Each user needs:
 - `SELECT` on `system.billing`, `system.compute`, `system.query`, `system.lakeflow`, `system.access`
@@ -164,7 +174,7 @@ Then reopen the app in an incognito window and accept again. This bundle sets al
 <summary><b>How it works (architecture)</b></summary>
 
 - **FastAPI** backend (`app/app.py`) and a single `static/index.html` with vendored Chart.js. No build step.
-- **Scans run in the background** (`app/scan.py`). `POST /api/scan/start` returns a scan id at once. The browser polls and streams findings in, so no request comes near the ~120s app limit. Severity is rule-based (`hunts.ALERT_SPECS`); the AI only writes the explanation.
+- **Scans run in the background** (`app/scan.py`). `POST /api/scan/start` returns a scan id at once. The browser polls and streams findings in, so no request comes near the ~120s app limit. Severity is rule-based (`hunts.ALERT_SPECS`); the AI only writes the explanation. See *How alerts are graded*.
 - **Saved to Delta** (`app/store_delta.py`): runs, findings and triage are saved in `results_catalog.results_schema`. The run row is written last, so readers never see a half-written run. If the schema isn't writable, the app falls back to memory.
 - **One process:** the app runs as a single uvicorn process, so scans and triage share one in-memory store. One scan runs at a time. Pressing **Run full cost scan** during a scan joins it. If a poll finds an unknown scan id, for example after a restart, it falls back to `/api/scan/latest`.
 - **Triage** is one `MERGE` per hunt, so two people triaging at once leave one row. The response's `persisted` field says whether Delta saved it.
