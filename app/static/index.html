@@ -135,6 +135,8 @@
     .app { grid-template-columns: 1fr; }
     aside.sidebar { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }
     nav { flex-direction: row; flex-wrap: wrap; }
+    nav button { width: auto; }
+    .nav-label { display: none; }
     .sidebar-foot { margin: 0 0 0 auto; flex-direction: row; border: none; }
     main { padding: 24px 20px 70px; }
   }
@@ -560,7 +562,6 @@
   @media (max-width: 860px) {
     .kpi-row, .maturity { grid-template-columns: repeat(2, 1fr); }
     .loop, .practice-grid { grid-template-columns: 1fr; }
-    nav { display: none; }
   }
 </style>
 </head>
