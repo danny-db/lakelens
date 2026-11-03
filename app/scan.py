@@ -58,9 +58,21 @@ class Store:
             self._counter += 1
             return f"scan-{self._counter}"
 
-    def put_scan(self, scan_id: str, record: dict):
+    MAX_SCANS = 20
+
+    def start_scan(self, record: dict) -> tuple[str, bool]:
+        """Register a new scan and return (scan_id, True). If one is already
+        starting or running, return (its id, False) instead: overlapping scans
+        inflate each other's self-cost windows. Keeps the newest MAX_SCANS."""
         with self._lock:
-            self.scans[scan_id] = record
+            for sid, rec in self.scans.items():
+                if rec["status"] in ("starting", "running"):
+                    return sid, False
+            sid = self.new_scan_id()
+            self.scans[sid] = record
+            while len(self.scans) > self.MAX_SCANS:
+                del self.scans[next(iter(self.scans))]
+            return sid, True
 
     def get_scan(self, scan_id: str) -> Optional[dict]:
         with self._lock:

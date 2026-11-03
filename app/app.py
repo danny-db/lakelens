@@ -722,11 +722,12 @@ def scan_start(request: Request, model: Optional[str] = None):
     # explainer bound to the chosen model (falls back to default inside _ai_explain)
     def _explain_bound(rubric, desc, rows_sql, cli):
         return _ai_explain(rubric, desc, rows_sql, cli, model)
-    scan_id = scan_engine.STORE.new_scan_id()
-    scan_engine.STORE.put_scan(scan_id, {
+    scan_id, created = scan_engine.STORE.start_scan({
         "status": "starting", "total": 0, "done": 0, "clean": 0,
         "findings": [], "started_by": who,
     })
+    if not created:
+        return {"scan_id": scan_id, "status": "running"}
 
     def _persist(sid: str, cli: WorkspaceClient):
         """Called on the scan thread when it finishes: compute self-cost, then
