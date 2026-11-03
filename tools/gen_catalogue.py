@@ -31,9 +31,15 @@ def tables(sql: str) -> str:
 def threshold(spec: dict) -> str:
     if not spec:
         return "Informational (no alert)"
+    label = clean(spec["metric_label"])
+    if spec["kind"] == "presence":
+        return f"{label}: medium whenever a row exists (a configuration state, no magnitude)"
+    if spec["kind"] == "anomaly":
+        return (f"{label} versus its own normal ({clean(spec['baseline'])}): high at "
+                f"{scan.ANOMALY_HIGH_X:g}x, medium at {scan.ANOMALY_MEDIUM_X:g}x; "
+                "an entity with no history is medium")
     def fmt(v):
         return clean(scan._fmt_metric(v, spec.get("unit", "")))
-    label = clean(spec.get("metric_label", spec.get("metric_col", "metric")))
     return f"{label}: high at {fmt(spec['high'])}, medium at {fmt(spec['medium'])}"
 
 

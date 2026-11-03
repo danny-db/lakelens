@@ -8,9 +8,10 @@ fix, and which measure proves the before/after — dropped into a queue a
 FinOps admin works (acknowledge → in progress → resolved / dismissed).
 
 Design notes:
-- **Severity is deterministic** (rule-based, from each hunt's own magnitude
-  metric vs the thresholds in hunts.ALERT_SPECS). The AI only narrates; it
-  never sets severity. We never invent a dollar figure a query didn't produce.
+- **Severity is deterministic**: each row is graded by the rule for its spec's
+  `kind` (see GRADERS and hunts.ALERT_SPECS), mostly "how many times this
+  entity's own normal". The AI only narrates; it never sets severity. We never
+  invent a dollar figure a query didn't produce.
 - **Async**: a scan runs on a background thread so no single HTTP request is
   held past the Databricks Apps ~120s cap. The frontend polls and streams
   findings in as each hunt completes.
@@ -18,10 +19,11 @@ Design notes:
   hunt id so an admin's decisions survive a re-scan. The STORE object is the
   only stateful thing — swap it for a Delta/Lakebase table to persist.
 """
+import os
 import threading
 import traceback
 from datetime import datetime, timezone
-from typing import Optional, Callable
+from typing import NamedTuple, Optional, Callable
 
 import hunts as catalogue
 
@@ -114,14 +116,50 @@ def _add_wall(scan_id: str, ms: float):
 
 # ── severity + formatting ─────────────────────────────────────────────────────
 
-def _severity(value: float, spec: dict) -> str:
-    if value is None:
-        return "info"
-    if value >= spec["high"]:
-        return "high"
-    if value >= spec["medium"]:
-        return "medium"
-    return "low"
+# An anomaly row is high at ANOMALY_HIGH_X times its entity's normal and medium at
+# ANOMALY_MEDIUM_X. Read once at import; set them as bundle variables.
+ANOMALY_HIGH_X = float(os.getenv("ANOMALY_HIGH_X", "3"))
+ANOMALY_MEDIUM_X = float(os.getenv("ANOMALY_MEDIUM_X", "2"))
+
+
+class Grade(NamedTuple):
+    severity: str           # high | medium | low
+    reading: str            # anomaly | new | presence | threshold
+    x: Optional[float]      # vs_normal, for anomaly rows
+
+
+def _grade_anomaly(spec: dict, row: list, ci: dict) -> Grade:
+    x = _num(row[ci["vs_normal"]])
+    if x is None:
+        return Grade("medium", "new", None)
+    if x >= ANOMALY_HIGH_X:
+        return Grade("high", "anomaly", x)
+    if x >= ANOMALY_MEDIUM_X:
+        return Grade("medium", "anomaly", x)
+    return Grade("low", "anomaly", x)
+
+
+def _grade_presence(spec: dict, row: list, ci: dict) -> Grade:
+    return Grade("medium", "presence", None)
+
+
+def _grade_threshold(spec: dict, row: list, ci: dict) -> Grade:
+    v = _num(row[ci[spec["metric_col"]]])
+    if v is not None and v >= spec["high"]:
+        return Grade("high", "threshold", None)
+    if v is not None and v >= spec["medium"]:
+        return Grade("medium", "threshold", None)
+    return Grade("low", "threshold", None)
+
+
+GRADERS: dict[str, Callable[[dict, list, dict], Grade]] = {
+    "anomaly": _grade_anomaly,
+    "presence": _grade_presence,
+    "threshold": _grade_threshold,
+}
+
+# Columns each kind needs in the hunt result, beyond the spec's own column names.
+REQUIRED_COLS = {"anomaly": ("vs_normal", "baseline"), "presence": (), "threshold": ()}
 
 
 def _fmt_metric(value: float, unit: str) -> str:
@@ -155,12 +193,22 @@ def _num(x) -> Optional[float]:
         return None
 
 
-def build_finding(hunt: dict, result: dict) -> Optional[dict]:
-    """Turn one hunt's query result into an alert finding, or None if nothing
-    crossed the medium threshold (a clean hunt raises no alert).
+def _headline(spec: dict, g: Grade, row: list, ci: dict, total: int, metric_str: str,
+              baseline_str: Optional[str]) -> str:
+    entity = str(row[ci[spec["entity_col"]]]) if spec.get("entity_col") in ci else ""
+    if g.reading == "new":
+        return spec["new_summary"].format(entity=entity, metric=metric_str, n=total)
+    x = f"{g.x:,.1f}x" if g.x is not None else ""
+    return spec["summary"].format(entity=entity, x=x, baseline=baseline_str, metric=metric_str, n=total)
 
-    `result` = {columns, rows, total_rows} from _run_sql (top rows already
-    sorted worst-first by the hunt's own ORDER BY)."""
+
+def build_finding(hunt: dict, result: dict) -> Optional[dict]:
+    """Turn one hunt's query result into an alert finding, or None if no row
+    grades medium or worse (a clean hunt raises no alert).
+
+    `result` = {columns, rows, total_rows} from _run_sql. Every row is graded;
+    the headline row is the first row with the worst severity, so the hunt's
+    ORDER BY breaks ties."""
     spec = catalogue.ALERT_SPECS.get(hunt["id"])
     if not spec:
         return None
@@ -169,25 +217,30 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
         return None
 
     ci = {c: i for i, c in enumerate(cols)}
-    mcol = spec["metric_col"]
-    if mcol not in ci:
+    needed = [spec.get("metric_col"), spec.get("entity_col"), *REQUIRED_COLS[spec["kind"]]]
+    if any(c and c not in ci for c in needed):
         return None
 
-    top_val = _num(rows[0][ci[mcol]])
-    sev = _severity(top_val, spec)
-    if sev in ("low", "info"):
-        # Below the medium bar → not worth an admin's queue. Clean-ish.
+    grader = GRADERS[spec["kind"]]
+    graded = [grader(spec, r, ci) for r in rows]
+    top_i = min(range(len(rows)), key=lambda i: SEV_RANK[graded[i].severity])
+    top, g = rows[top_i], graded[top_i]
+    if g.severity == "low":
         return None
 
     total = result.get("total_rows", len(rows))
-    metric_str = _fmt_metric(top_val, spec["unit"])
-    summary = spec["summary"].format(n=total, metric=metric_str)
+    mcol = spec.get("metric_col")
+    top_val = _num(top[ci[mcol]]) if mcol else None
+    metric_str = _fmt_metric(top_val, spec["unit"]) if mcol else ""
+    baseline_str = (_fmt_metric(_num(top[ci["baseline"]]), spec["unit"])
+                    if g.reading == "anomaly" else None)
+    summary = _headline(spec, g, top, ci, total, metric_str, baseline_str)
 
     # Real dollars only if the hunt genuinely has a $ column (else None — we show
     # the magnitude metric instead, never a fabricated cost).
     impact_usd = None
     if spec.get("usd_col") and spec["usd_col"] in ci:
-        impact_usd = _num(rows[0][ci[spec["usd_col"]]])
+        impact_usd = _num(top[ci[spec["usd_col"]]])
 
     # Keep the top-5 rows as evidence (the queue card shows these; the full
     # result stays available on the Spot tab).
@@ -197,11 +250,13 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
         "hunt_id": hunt["id"],
         "title": hunt["title"],
         "category": hunt["category"],
-        "severity": sev,
+        "severity": g.severity,
         "summary": summary,
         "metric_label": spec["metric_label"],
         "metric_value": metric_str,
         "metric_num": top_val,          # raw numeric — for reliable run-over-run comparison
+        # How the headline row compares with its own normal (the card's badge).
+        "vs": {"reading": g.reading, "x": g.x, "baseline": baseline_str},
         "impact_usd": impact_usd,
         "total_rows": total,
         "action": hunt["action"],          # the recommended fix (static, from the notebook)

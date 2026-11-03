@@ -118,6 +118,8 @@ Tip: pin `host`, `warehouse_id` and `results_catalog` in the `prod` target of `d
 | `results_schema` | no | `lakelens` | Schema inside that catalog |
 | `ai_endpoint` | no | `databricks-gpt-5-4-mini` | Model for the plain-English explanations |
 | `ai_endpoint_dbu` | no | `7.5,30` | That model's DBU per 1M tokens (in,out), used to price the scan |
+| `anomaly_high_x` | no | `3` | An alert is high when it is at least this many times its own usual |
+| `anomaly_medium_x` | no | `2` | An alert is medium when it is at least this many times its own usual |
 
 ### What users need
 Every query runs as the signed-in user (on-behalf-of-user), so there are no service-principal grants. Each user needs:

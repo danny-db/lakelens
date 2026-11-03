@@ -14,6 +14,10 @@ system table — no jargon, no analogies, just what it means.
 
 `AI_ENDPOINT` is substituted into the explainer prompt at request time.
 """
+from typing import Literal, Optional, Union
+
+from typing_extensions import TypedDict
+
 
 # The six plain-English categories the hunts are grouped into on the Spot page.
 # label = what the customer sees; blurb = one ELI5 line under the category header.
@@ -1459,68 +1463,105 @@ ORDER BY 1, 2
 #
 # Only the WASTE-SIGNAL hunts raise alerts. The inventory/reference hunts
 # (H4/H9/H12/H14) are excluded — they list every warehouse/job by design, so a
-# row is not a finding. The full-scan engine runs each hunt below, and if the
-# result's top row crosses `medium`, it raises ONE alert for that hunt with a
-# deterministic severity (rule-based, from the hunt's own magnitude metric — we
-# never invent a dollar figure the query didn't produce).
+# row is not a finding. The full-scan engine runs each hunt below and grades it
+# with the rule for its `kind` (scan.GRADERS). We never invent a dollar figure
+# the query didn't produce.
 #
-# Fields per hunt id:
-#   metric_col   — the column whose top-row value sets severity (already the sort key)
-#   metric_label — human name for that metric
-#   unit         — how to render it: "usd" | "ratio" | "count" | "tib" | "hours" | "minutes"
-#   high, medium — thresholds on metric_col's top-row value (>= high → high severity, etc.)
-#   summary      — one-line finding headline (may reference {n} rows and {metric})
-#   usd_col      — column holding a real list-price $ for this finding (None if the hunt
-#                  has no honest $ — then the alert shows the metric, not a fabricated cost)
-#   rank_by      — how to describe the ranking ("worst first" etc.), for the evidence table
-ALERT_SPECS = {
-    "H0": {"metric_col": "est_usd_rough", "metric_label": "Est. spend rate (rate-blended, 3h window)",
+# kind "anomaly": grade each row by how unusual it is versus that entity's OWN
+#   normal. The hunt SQL must return, per row:
+#     <metric_col>  this window's value
+#     baseline      the same metric for the same entity over the trailing 28 days
+#                   before this window, at the same period length, floored at the
+#                   workspace's own typical value (see each spec's `baseline` text)
+#     vs_normal     metric / baseline; NULL when the entity has no history (NEW)
+#   vs_normal >= ANOMALY_HIGH_X is high, >= ANOMALY_MEDIUM_X is medium, NEW is
+#   medium, anything else is low (no alert).
+# kind "presence": a config state with no time series. Any row is a medium alert.
+# kind "threshold": the old fixed-magnitude rule, kept only until every hunt is
+#   converted (removed in the same change series).
+
+
+class AnomalySpec(TypedDict):
+    kind: Literal["anomaly"]
+    entity_col: str        # column that names the entity in the headline
+    metric_col: str        # this window's value of the metric
+    metric_label: str
+    unit: str              # "usd" | "ratio" | "count" | "tib" | "hours" | "minutes"
+    baseline: str          # plain-English definition of the entity's normal
+    summary: str           # headline; may use {entity} {x} {baseline} {metric} {n}
+    new_summary: str       # headline for an entity with no history; {entity} {metric} {n}
+    usd_col: Optional[str]  # a real list-price $ column, or None
+
+
+class PresenceSpec(TypedDict):
+    kind: Literal["presence"]
+    entity_col: str
+    metric_label: str
+    summary: str           # headline; may use {entity} {n}
+    usd_col: Optional[str]
+
+
+class ThresholdSpec(TypedDict):
+    kind: Literal["threshold"]
+    metric_col: str
+    metric_label: str
+    unit: str
+    high: float
+    medium: float
+    summary: str
+    usd_col: Optional[str]
+
+
+AlertSpec = Union[AnomalySpec, PresenceSpec, ThresholdSpec]
+
+ALERT_SPECS: dict[str, AlertSpec] = {
+    "H0": {"kind": "threshold", "metric_col": "est_usd_rough", "metric_label": "Est. spend rate (rate-blended, 3h window)",
            "unit": "usd", "high": 100, "medium": 20, "usd_col": "est_usd_rough",
            "summary": "An AI caller is spending at an elevated rate — {metric} in the last 3 hours."},
-    "H1": {"metric_col": "read_write_ratio", "metric_label": "Read-to-write ratio",
+    "H1": {"kind": "threshold", "metric_col": "read_write_ratio", "metric_label": "Read-to-write ratio",
            "unit": "ratio", "high": 100000, "medium": 1000, "usd_col": None,
            "summary": "{n} MERGE statements read far more than they write (top ratio {metric})."},
-    "H2": {"metric_col": "spill_tib", "metric_label": "Disk spill (top statement)",
+    "H2": {"kind": "threshold", "metric_col": "spill_tib", "metric_label": "Disk spill (top statement)",
            "unit": "tib", "high": 1.0, "medium": 0.1, "usd_col": None,
            "summary": "{n} statements spilled to disk — the worst spilled {metric}."},
-    "H3": {"metric_col": "stmts", "metric_label": "Chatter statements / week (top client)",
+    "H3": {"kind": "threshold", "metric_col": "stmts", "metric_label": "Chatter statements / week (top client)",
            "unit": "count", "high": 50000, "medium": 10000, "usd_col": None,
            "summary": "Chatty clients are keeping warehouses awake — top client fired {metric} tiny statements."},
-    "H5": {"metric_col": "total_min", "metric_label": "Longest statement",
+    "H5": {"kind": "threshold", "metric_col": "total_min", "metric_label": "Longest statement",
            "unit": "minutes", "high": 480, "medium": 240, "usd_col": None,
            "summary": "{n} statements ran over 4 hours — the longest ran {metric}."},
-    "H6": {"metric_col": "read_tib", "metric_label": "Data re-scanned in one hour",
+    "H6": {"kind": "threshold", "metric_col": "read_tib", "metric_label": "Data re-scanned in one hour",
            "unit": "tib", "high": 20, "medium": 3, "usd_col": None,
            "summary": "A repeated multi-TiB investigation scan — {metric} read by one person in an hour."},
-    "H7": {"metric_col": "execution_hours", "metric_label": "Compute hours from polling (top principal)",
+    "H7": {"kind": "threshold", "metric_col": "execution_hours", "metric_label": "Compute hours from polling (top principal)",
            "unit": "hours", "high": 100, "medium": 20, "usd_col": None,
            "summary": "A candidate poller ran thousands of short queries — {metric} of compute."},
-    "H8": {"metric_col": "queued_hours", "metric_label": "Queue wait (top warehouse)",
+    "H8": {"kind": "threshold", "metric_col": "queued_hours", "metric_label": "Queue wait (top warehouse)",
            "unit": "hours", "high": 10, "medium": 2, "usd_col": None,
            "summary": "A warehouse is queue-pressured — {metric} spent waiting for capacity."},
     # ── H16–H20 (Aug 2026 thread additions) ──
-    "H16": {"metric_col": "run_count", "metric_label": "Runs on All-Purpose (top job)",
+    "H16": {"kind": "threshold", "metric_col": "run_count", "metric_label": "Runs on All-Purpose (top job)",
             "unit": "count", "high": 100, "medium": 20, "usd_col": None,
             "summary": "{n} jobs ran on All-Purpose compute ($0.55/DBU vs $0.15 on Jobs) — top job {metric} runs."},
-    "H17": {"metric_col": "min_clusters", "metric_label": "Min clusters held 24/7 (top warehouse)",
-            "unit": "count", "high": 2, "medium": 1, "usd_col": None,
-            "summary": "{n} classic warehouses never auto-stop — top holds {metric} cluster(s) warm 24/7."},
-    "H18": {"metric_col": "node_minutes", "metric_label": "Idle-cluster runtime (top)",
+    "H17": {"kind": "presence", "entity_col": "warehouse_name",
+            "metric_label": "Classic warehouses with auto-stop off", "usd_col": None,
+            "summary": "{n} classic warehouse(s) never auto-stop, including {entity}."},
+    "H18": {"kind": "threshold", "metric_col": "node_minutes", "metric_label": "Idle-cluster runtime (top)",
             "unit": "count", "high": 5000, "medium": 1000, "usd_col": None,
             "summary": "{n} interactive clusters sit at low CPU — the busiest idled for {metric} node-minutes."},
-    "H19": {"metric_col": "total_dbus_30d", "metric_label": "Always-on App DBUs (30d, top)",
+    "H19": {"kind": "threshold", "metric_col": "total_dbus_30d", "metric_label": "Always-on App DBUs (30d, top)",
             "unit": "count", "high": 500, "medium": 100, "usd_col": None,
             "summary": "{n} Databricks Apps run always-on — the top burned {metric} DBUs over 30 days."},
-    "H20": {"metric_col": "wasted_hours", "metric_label": "Compute on failed runs (top job)",
+    "H20": {"kind": "threshold", "metric_col": "wasted_hours", "metric_label": "Compute on failed runs (top job)",
             "unit": "hours", "high": 20, "medium": 5, "usd_col": None,
             "summary": "{n} jobs fail repeatedly — the worst wasted {metric} of compute on failed runs."},
-    "H21": {"metric_col": "candidate_delta_tables", "metric_label": "Likely-snappy tables (top schema)",
-            "unit": "count", "high": 50, "medium": 10, "usd_col": None,
-            "summary": "{n} schemas hold Delta tables predating the zstd default — top schema has {metric} candidates to recompress."},
-    "H22": {"metric_col": "perf_optimized_usd", "metric_label": "Performance-optimized spend (top job, 30d)",
+    "H21": {"kind": "presence", "entity_col": "schema_name",
+            "metric_label": "Schemas with likely-snappy Delta tables", "usd_col": None,
+            "summary": "{n} schema(s) hold Delta tables that predate the zstd default, including {entity}."},
+    "H22": {"kind": "threshold", "metric_col": "perf_optimized_usd", "metric_label": "Performance-optimized spend (top job, 30d)",
             "unit": "usd", "high": 5000, "medium": 1000, "usd_col": "perf_optimized_usd",
             "summary": "{n} serverless jobs run in Performance-optimized mode — top job {metric} over 30d that non-urgent runs could move to Standard."},
-    "H23": {"metric_col": "dbu_increase", "metric_label": "PO DBU increase, top table (7d vs prior 7d)",
+    "H23": {"kind": "threshold", "metric_col": "dbu_increase", "metric_label": "PO DBU increase, top table (7d vs prior 7d)",
             "unit": "count", "high": 2000, "medium": 500, "usd_col": None,
             "summary": "Predictive Optimization work is climbing — the table with the biggest rise added {metric} DBUs in the last 7 days vs the prior 7."},
 }

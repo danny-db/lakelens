@@ -465,6 +465,10 @@
   .trend-worse  { color: var(--coral); background: rgba(255,107,74,.14); }
   .trend-better { color: var(--teal);  background: var(--teal-dim); }
   .trend-flat   { color: var(--muted-2); background: var(--panel-2); }
+  .vs-normal { font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 5px; color: var(--amber); background: rgba(255,192,67,.12); }
+  .vs-normal.high { color: var(--coral); background: rgba(255,107,74,.14); }
+  .vs-normal.new { color: var(--blue); background: rgba(74,168,255,.14); }
+  .vs-normal.presence { color: var(--muted); background: var(--panel-2); }
   .vs-prev { color: var(--muted-2); font-size: 12px; }
   .vs-prev b { color: var(--muted); font-family: ui-monospace, monospace; font-weight: 600; }
   .cost-strip { display: flex; align-items: center; gap: 10px; padding: 10px 16px; margin-bottom: 16px; background: rgba(0,212,184,.05); border: 1px solid rgba(0,212,184,.16); border-radius: 10px; font-size: 13.5px; color: var(--muted); }
@@ -1656,6 +1660,14 @@ function alertCard(f) {
   };
   const tr = f.trend ? trendMap[f.trend] : null;
   const trendBadge = tr ? `<span class="trend-badge ${tr.c}">${tr.t}</span>` : "";
+  // How the headline row compares with its own normal. Older saved scans have no `vs`.
+  const vs = f.vs || {};
+  const vsBadge = vs.reading === "anomaly" && vs.x != null
+      ? `<span class="vs-normal ${f.severity==='high'?'high':''}" title="this window versus the entity's own usual">${vs.x.toFixed(1)}x normal</span>`
+    : vs.reading === "new" ? `<span class="vs-normal new" title="no history for this entity in the prior 28 days">NEW, first seen</span>`
+    : vs.reading === "presence" ? `<span class="vs-normal presence" title="a configuration state, graded by presence">config present</span>` : "";
+  const metricLine = vs.reading === "presence" ? ""
+    : `<span>${f.metric_label}: <b>${f.metric_value}</b>${vs.baseline ? ` (normal ~${vs.baseline})` : ""}</span>`;
   const vsPrev = (f.prev_metric_value && f.trend && f.trend!=="new")
     ? `<span class="vs-prev">was <b>${f.prev_metric_value}</b> last scan</span>` : "";
   card.innerHTML = `
@@ -1672,7 +1684,8 @@ function alertCard(f) {
         </div>
         <div class="alert-summary">${f.summary}</div>
         <div class="alert-metrics">
-          <span>${f.metric_label}: <b>${f.metric_value}</b></span>
+          ${vsBadge}
+          ${metricLine}
           ${vsPrev}
           ${impact}
           <span>${f.total_rows.toLocaleString()} row${f.total_rows!==1?'s':''} found</span>

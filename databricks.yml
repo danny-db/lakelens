@@ -29,6 +29,12 @@ variables:
   ai_endpoint_dbu:
     description: "Published DBU/1M-token rate (input,output) for ai_endpoint — used to price the scan's own AI cost."
     default: "7.5,30"
+  anomaly_high_x:
+    description: "An alert is high when a row is at least this many times its own usual (trailing 28 days)."
+    default: "3"
+  anomaly_medium_x:
+    description: "An alert is medium when a row is at least this many times its own usual."
+    default: "2"
 
 resources:
   apps:
@@ -67,6 +73,10 @@ resources:
             value: ${var.ai_endpoint}
           - name: AI_ENDPOINT_DBU
             value: ${var.ai_endpoint_dbu}
+          - name: ANOMALY_HIGH_X
+            value: ${var.anomaly_high_x}
+          - name: ANOMALY_MEDIUM_X
+            value: ${var.anomaly_medium_x}
 
       # Bind the warehouse to the app (grants the app's service principal CAN_USE so
       # the app can reach it; queries still run as the user via OBO).
