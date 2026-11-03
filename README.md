@@ -131,7 +131,10 @@ The app needs the `ai-gateway` scope (set by this bundle), and the account needs
 | Symptom | Fix |
 |---|---|
 | Scans return an auth error | User lacks `SELECT` on a `system.*` schema or `CAN USE` on the warehouse. Check `/api/whoami`. |
-| "No warehouse configured" | Redeploy with `--var="warehouse_id=..."`. |
+| 503 "No warehouse configured" | Redeploy with `--var="warehouse_id=..."`. |
+| 401 "No user token on this request" | The request didn't come through the app's Databricks URL, or consent wasn't accepted. Open the app from its URL. Deployed, the app never falls back to its own service principal. |
+| 401 "Databricks rejected your sign-in token" | The session expired. Reload the app. |
+| 502 "AI endpoint '...' is unavailable" | That model doesn't exist here or you can't query it. Pick another under **AI model**, or redeploy with `--var="ai_endpoint=..."`. |
 | Scans don't save or aren't shared | `results_catalog` unset, or the user can't `CREATE` there. The app still works in memory. |
 | Ask: "Genie One refused this user" | Old consent without `ai-gateway`, or no `EXECUTE` on `system.ai.genie_one_mcp`. See *Changing scopes* below. |
 | Ask: "Genie One isn't available in this workspace" | The account doesn't have Unity AI Gateway or Genie One yet. Ask your account team. |
@@ -157,7 +160,8 @@ Then reopen the app in an incognito window and accept again. This bundle sets al
 - **FastAPI** backend (`app/app.py`) and a single `static/index.html` with vendored Chart.js. No build step.
 - **Scans run in the background** (`app/scan.py`). `POST /api/scan/start` returns a scan id at once. The browser polls and streams findings in, so no request comes near the ~120s app limit. Severity is rule-based (`hunts.ALERT_SPECS`); the AI only writes the explanation.
 - **Saved to Delta** (`app/store_delta.py`): runs, findings and triage are saved in `results_catalog.results_schema`. The run row is written last, so readers never see a half-written run. If the schema isn't writable, the app falls back to memory.
-- **Multi-worker safe:** scan ids are UUIDs, and polls fall back to `/api/scan/latest` if they hit a different worker.
+- **One process:** the app runs as a single uvicorn process, so scans and triage share one in-memory store. One scan runs at a time. Pressing **Run full cost scan** during a scan joins it. If a poll finds an unknown scan id, for example after a restart, it falls back to `/api/scan/latest`.
+- **Triage** is one `MERGE` per hunt, so two people triaging at once leave one row. The response's `persisted` field says whether Delta saved it.
 - **Row cap:** only the top ~200 rows go to the browser, with the true total shown.
 - **✨ Explain** uses `ai_query()`, which runs in the SQL engine with the rows inline and needs no extra scope.
 - **Ask** calls Genie One, the Unity AI Gateway MCP service `system.ai.genie_one_mcp`, as the user. Each question gets a short preamble naming the billing, compute, query and lakeflow system tables and the list-price join, so Genie answers from them. `POST /api/genie/ask` returns at once and the browser polls `/api/genie/poll` until the answer is ready.

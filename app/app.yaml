@@ -17,8 +17,8 @@ env:
   #   databricks warehouses list
   - name: DATABRICKS_WAREHOUSE_ID
     value: ""            # set by the bundle; or fill in for a non-bundle deploy
-  # REQUIRED — a catalog the app's users can CREATE in (persists scans + the Genie
-  # space id). e.g. a dedicated `lakelens` catalog, or `main`. If empty, the app still
+  # REQUIRED — a catalog the app's users can CREATE in (persists scans and triage).
+  # e.g. a dedicated `lakelens` catalog, or `main`. If empty, the app still
   # runs but scan results aren't shared/persisted.
   - name: RESULTS_CATALOG
     value: ""
