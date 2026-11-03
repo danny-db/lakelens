@@ -12,7 +12,9 @@ INSTRUCTIONS, and show the user only their own question.
 """
 import re
 import time
-from typing import Literal, Optional, TypedDict
+from typing import Literal, Optional
+
+from typing_extensions import TypedDict
 
 # The cost system tables Genie should answer from, each with a short description so
 # Genie knows what it is. Kept to the tables the rest of LakeLens already uses.
