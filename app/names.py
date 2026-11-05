@@ -8,9 +8,10 @@ two of them it adds the id too, so a label never stands for two entities. An ent
 no system table names is labelled by its kind and id, and a warehouse by a short id
 and its workspace. Results keep the raw id in a column of its own for lookups.
 
-A query opens its WITH clause with ctes(...) and joins one label per id after it has
-aggregated. In the usual shape a last CTE aliased c carries <kind>_id and workspace_id,
-and WORKSPACE, WAREHOUSE, JOB, PIPELINE and CLUSTER label it (ref() builds others):
+A query opens its WITH clause with ctes(...) and joins one label per id, after it
+aggregates where it can. In the usual shape a last CTE aliased c carries <kind>_id
+and workspace_id, and WORKSPACE, WAREHOUSE, JOB, PIPELINE and CLUSTER label it
+(ref() builds others):
 
     f"WITH {ctes('job')}, ... SELECT {JOB.label} AS job_name, c.job_id FROM contrib c {JOB.join}"
 

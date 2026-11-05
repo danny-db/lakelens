@@ -1769,7 +1769,7 @@ weekly AS (
   GROUP BY 1, 2, 3, 4
 )
 SELECT c.product, {WORKSPACE.label} AS workspace,
-       coalesce({JOB.label}, {PIPELINE.label}, c.entity_id) AS entity_name,
+       coalesce({JOB.tagged}, {PIPELINE.tagged}, c.entity_id) AS entity_name,
        c.week, c.dbus, c.list_usd, c.workspace_id, c.entity_id
 FROM weekly c {WORKSPACE.join} {JOB.join} {PIPELINE.join}
 ORDER BY c.list_usd DESC
@@ -1825,7 +1825,7 @@ weekly AS (
   FROM sj JOIN top_jobs USING (job_id)
   GROUP BY 1, 2, 3
 )
-SELECT {JOB.label} AS job_name, c.week, c.perf_optimized_usd, c.standard_usd, c.dbus, c.job_id
+SELECT {JOB.label} AS job_name, c.week, c.perf_optimized_usd, c.standard_usd, c.dbus, c.job_id, c.workspace_id
 FROM weekly c {JOB.join}
 ORDER BY job_name, c.week
 """,
