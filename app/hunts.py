@@ -980,75 +980,90 @@ LIMIT 10
         "id": "H16",
         "category": "idle",
         "title": "Jobs running on All-Purpose compute",
-        "eli5": "Finds automated jobs running on All-Purpose (interactive) clusters, which cost "
-                "$0.55/DBU — versus $0.15/DBU on Jobs compute for the same work.",
-        "what": "All-Purpose compute is for interactive notebook work and bills ~3.7× more than Jobs "
-                "compute ($0.55 vs $0.15 per DBU). A job pinned to an always-on All-Purpose cluster "
-                "pays that premium AND the idle time between runs. Each row is a job + the All-Purpose "
-                "cluster it ran on (cluster_source UI/API = interactive; JOB = proper jobs compute), with "
-                "its runs this week set against its usual week (the median of its prior four). vs_normal "
-                "is how many times that usual it ran, and that sets the alert, so a job newly moved onto "
-                "an All-Purpose cluster or suddenly running there far more often stands out. "
-                "The pct_saving column is the rate saving from moving it.",
+        "eli5": "Checks how many automated job runs the account put on All-Purpose (interactive) "
+                "clusters this week against its usual week. All-Purpose bills a higher rate per DBU "
+                "than Jobs compute for the same work, so these runs pay a premium.",
+        "what": "All-Purpose compute is for interactive notebook work and bills a higher list rate "
+                "than Jobs compute. A job pinned to an always-on All-Purpose cluster pays that premium "
+                "AND the idle time between runs. The account's job runs on All-Purpose clusters "
+                "(cluster_source UI/API) this week are set against its usual week (the median of the "
+                "prior four weeks). vs_normal is how many times that normal this week is, and that "
+                "sets the alert. Each row is one job with its share of those runs and the clusters it "
+                "used. all_purpose_usd_dbu and jobs_usd_dbu are your own account's average list $/DBU "
+                "for classic All-Purpose and Jobs compute over the last 30 days, and pct_saving is the "
+                "rate saving those two imply.",
         "action": "Move the job to Jobs Compute (an ephemeral cluster that spins up per run and "
-                  "terminates after) or Serverless Jobs. That drops the rate to $0.15/DBU and removes "
-                  "idle-between-runs billing. Interim: cut the cluster's auto-termination to 20–30 min.",
+                  "terminates after) or Serverless Jobs. That drops it to the Jobs rate and removes "
+                  "idle-between-runs billing. Interim: shorten the cluster's auto-termination so it "
+                  "stops soon after the last run.",
         "measure": "M2",
-        "explain_hunt_desc": "automated jobs running on All-Purpose clusters instead of cheaper Jobs compute",
+        "explain_hunt_desc": "the account's job runs on All-Purpose clusters this week versus its usual "
+                             "week, and the jobs behind them (they belong on cheaper Jobs compute)",
         "explain_rubric": (
-            "each row is a job that ran on an ALL-PURPOSE cluster (cluster_source UI or API), which "
-            "bills $0.55/DBU vs $0.15/DBU on Jobs compute — a 3.7x markup. run_count is how many times "
-            "it ran that way this week; vs_normal = run_count / baseline, where baseline is the median of "
-            "its prior four weeks on that cluster (floored at the workspace's median job-week on all-purpose; "
-            "baseline_from says which), and NULL vs_normal = a job first seen on all-purpose this week. Name "
-            "the jobs furthest above their own normal, then the most runs, as the migration targets; "
-            "the fix is Jobs Compute / Serverless Jobs. Do not overstate — the saving is the rate delta "
-            "on that job's DBUs, not the whole cluster."
+            "account_value is the number of job runs across the account that used an ALL-PURPOSE "
+            "cluster (cluster_source UI or API) this week; baseline is the median of the prior four "
+            "weekly totals; vs_normal = account_value / baseline (NULL = no prior history). Say first "
+            "whether the account is above its normal. Each row is one job; share_pct is its share of "
+            "those runs. all_purpose_usd_dbu and jobs_usd_dbu are the account's own average list "
+            "$/DBU for classic All-Purpose and Jobs compute over 30 days, and pct_saving is the rate "
+            "saving they imply; quote those, never a fixed price. Name the jobs with the largest share "
+            "as the migration targets; the fix is Jobs Compute / Serverless Jobs. Do not overstate - "
+            "the saving is the rate difference on that job's DBUs, not the whole cluster."
         ),
         "sql": f"""
 WITH latest_clusters AS (
-  SELECT workspace_id, cluster_id, cluster_name, cluster_source, owned_by
+  SELECT workspace_id, cluster_id, cluster_name, cluster_source
   FROM system.compute.clusters
   QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC)=1
 ),
 job_names AS (
   SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2
 ),
-runs_on_cluster AS (
-  SELECT t.workspace_id, t.job_id, exploded.cluster_id,
-         floor((unix_timestamp(current_timestamp()) - unix_timestamp(t.period_start_time)) / 604800) AS wk,
-         count(DISTINCT t.run_id) AS run_count
+rates AS (
+  SELECT try_divide(sum(CASE WHEN u.billing_origin_product = 'ALL_PURPOSE' THEN u.usage_quantity * p.pricing.effective_list.default END),
+                    sum(CASE WHEN u.billing_origin_product = 'ALL_PURPOSE' THEN u.usage_quantity END)) AS all_purpose_usd_dbu,
+         try_divide(sum(CASE WHEN u.billing_origin_product = 'JOBS' THEN u.usage_quantity * p.pricing.effective_list.default END),
+                    sum(CASE WHEN u.billing_origin_product = 'JOBS' THEN u.usage_quantity END))        AS jobs_usd_dbu
+  FROM system.billing.usage u
+  JOIN system.billing.list_prices p ON u.sku_name = p.sku_name AND u.cloud = p.cloud
+   AND u.usage_start_time >= p.price_start_time
+   AND (p.price_end_time IS NULL OR u.usage_start_time < p.price_end_time)
+  WHERE u.billing_origin_product IN ('ALL_PURPOSE', 'JOBS')
+    AND NOT coalesce(u.product_features.is_serverless, false)
+    AND u.usage_date >= current_date() - INTERVAL 30 DAYS
+),
+task_clusters AS (
+  SELECT t.workspace_id, t.job_id, t.run_id, t.period_start_time, exploded.cluster_id
   FROM system.lakeflow.job_task_run_timeline t
   LATERAL VIEW explode(t.compute_ids) exploded AS cluster_id
   WHERE t.period_start_time >= current_timestamp() - INTERVAL 35 DAYS
-    AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
-  GROUP BY 1,2,3,4
 ),
-all_purpose AS (
-  SELECT r.*, c.cluster_name, c.cluster_source
-  FROM runs_on_cluster r
-  JOIN latest_clusters c ON r.workspace_id=c.workspace_id AND r.cluster_id=c.cluster_id
+runs AS (
+  SELECT t.workspace_id, t.job_id, t.run_id, {_wk("min(t.period_start_time)")} AS wk,
+         collect_set(coalesce(c.cluster_name, c.cluster_id)) AS clusters
+  FROM task_clusters t
+  JOIN latest_clusters c ON t.workspace_id = c.workspace_id AND t.cluster_id = c.cluster_id
   WHERE c.cluster_source IN ('UI','API')                     -- all-purpose only
+  GROUP BY 1, 2, 3
 ),
-own AS (SELECT workspace_id, job_id, cluster_id, percentile_approx(run_count, 0.5) AS own_normal
-        FROM all_purpose WHERE wk BETWEEN 1 AND 4 GROUP BY 1,2,3),
-ws AS (SELECT percentile_approx(run_count, 0.5) AS ws_normal FROM all_purpose WHERE wk BETWEEN 1 AND 4),
-cur AS (
-  SELECT a.*, o.own_normal, w.ws_normal
-  FROM all_purpose a LEFT JOIN own o USING (workspace_id, job_id, cluster_id) CROSS JOIN ws w
-  WHERE a.wk = 0
+weekly AS (SELECT wk, count(*) AS v FROM runs WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
+  SELECT workspace_id, job_id, count(*) AS run_count,
+         concat_ws(', ', array_distinct(flatten(collect_list(clusters)))) AS clusters
+  FROM runs WHERE wk = 0
+  GROUP BY 1, 2
 )
-SELECT r.workspace_id,
-       coalesce(jn.job_name, CAST(r.job_id AS STRING)) AS job_name,
-       r.cluster_name,
-       r.cluster_source,                                   -- UI / API = all-purpose
-       r.run_count,
-       0.55 AS all_purpose_usd_dbu, 0.15 AS jobs_usd_dbu,
-       '73% cheaper on Jobs' AS pct_saving,
-       {_vs_normal("run_count")}
-FROM cur r
-LEFT JOIN job_names jn ON r.workspace_id=jn.workspace_id AND r.job_id=jn.job_id
-ORDER BY {_most_unusual("run_count")}, run_count DESC
+SELECT c.workspace_id,
+       coalesce(jn.job_name, CAST(c.job_id AS STRING)) AS job_name,
+       c.clusters, c.run_count,
+       round(r.all_purpose_usd_dbu, 3) AS all_purpose_usd_dbu, round(r.jobs_usd_dbu, 3) AS jobs_usd_dbu,
+       round(100 * (1 - try_divide(r.jobs_usd_dbu, r.all_purpose_usd_dbu))) AS pct_saving,
+       {_vs_account("c.run_count")}
+FROM contrib c
+LEFT JOIN job_names jn ON c.workspace_id=jn.workspace_id AND c.job_id=jn.job_id
+CROSS JOIN rates r CROSS JOIN acct
+ORDER BY c.run_count DESC
 LIMIT 50
 """,
     },
@@ -1091,70 +1106,66 @@ ORDER BY min_clusters DESC, warehouse_size DESC
     {
         "id": "H18",
         "category": "idle",
-        "title": "Idle interactive clusters (low CPU)",
-        "eli5": "Finds persistent All-Purpose clusters sitting at low CPU most of the time — "
-                "you're paying for big machines that mostly idle (the ds_highmem pattern).",
-        "what": "Each row is an interactive cluster that averaged under 20% CPU this week, with its "
-                "node-minutes set against its usual week (the median of its prior four). vs_normal is how "
-                "many times that usual it ran, and that sets the alert: a cluster left running idle far "
-                "longer than it normally runs is the one to catch. "
-                "Over the last 7 days this measures each interactive cluster's average CPU and how much "
-                "of the time it sat under 10% (effectively idle). A cluster running for days at sub-20% "
-                "average CPU — especially a high-memory one — is paying for cores that do nothing. "
-                "avg_cpu_pct and pct_time_idle are the read; verdict flags the worst.",
+        "title": "Idle cores on interactive clusters",
+        "eli5": "Checks how much of the account's interactive (All-Purpose) cluster capacity sat idle "
+                "this week against its usual week, then names the clusters that idled most: big "
+                "machines you pay for that mostly do nothing (the ds_highmem pattern).",
+        "what": "Idle capacity is node-minutes weighted by how much of the CPU went unused: a node at "
+                "a quarter of its CPU for an hour counts as three quarters of an hour idle. The "
+                "account's idle node-minutes on interactive clusters this week are set against its "
+                "usual week (the median of the prior four weeks). vs_normal is how many times that "
+                "normal this week is, and that sets the alert: idle capacity growing far beyond the "
+                "account's usual is the thing to catch. Each row is one interactive cluster with its "
+                "idle node-minutes, its share of the account's, and its average and peak CPU. A "
+                "cluster with a large share and a low average, especially a high-memory one, is "
+                "paying for cores that do nothing.",
         "action": "Right-size on this evidence: fewer / smaller nodes, or move the scheduled work to "
-                  "Jobs compute (which terminates per run). Cut auto-termination to 20–30 min so it "
-                  "can't sit idle for hours. For notebook work, serverless notebooks scale to zero.",
+                  "Jobs compute (which terminates per run). Shorten auto-termination so it can't sit "
+                  "idle for hours. For notebook work, serverless notebooks scale to zero.",
         "measure": "M2",
-        "explain_hunt_desc": "persistent interactive clusters sitting at low CPU (idle cores billed)",
+        "explain_hunt_desc": "the account's idle interactive-cluster capacity this week versus its usual "
+                             "week, and the clusters that idled most (idle cores billed)",
         "explain_rubric": (
-            "each row is an interactive (all-purpose) cluster with its 7-day avg CPU and the % of time "
-            "it was effectively idle (<10% CPU). Sustained low avg_cpu_pct with high total runtime = "
-            "idle cores you are paying for; a high-mem node makes it worse. verdict flags "
-            "severely-underutilised / underutilised. vs_normal = node_minutes / baseline, where baseline is "
-            "the cluster's median week over the prior four (floored at the workspace's median "
-            "interactive cluster-week; baseline_from says which); NULL vs_normal = a cluster first seen "
-            "this week. Name the worst and recommend right-sizing or "
-            "moving to Jobs compute. Confirm the cluster isn't a deliberately-warm interactive one before acting."
+            "account_value is the account's idle node-minutes on interactive (all-purpose) clusters "
+            "this week: node-minutes weighted by the unused share of CPU. baseline is the median of "
+            "the prior four weekly totals; vs_normal = account_value / baseline (NULL = no prior "
+            "history). Say first whether the account is idling more than its normal. Each row is one "
+            "cluster; share_pct is its share of the idle node-minutes, and avg_cpu_pct / peak_cpu_pct "
+            "show how busy it was. A large share with a low average CPU = idle cores you are paying "
+            "for; a high-mem node makes it worse. Name the worst and recommend right-sizing or moving "
+            "to Jobs compute. Confirm the cluster isn't a deliberately-warm interactive one before acting."
         ),
         "sql": f"""
 WITH latest_clusters AS (
-  SELECT workspace_id, cluster_id, cluster_name, cluster_source, owned_by, auto_termination_minutes, delete_time
+  SELECT workspace_id, cluster_id, cluster_name, cluster_source, auto_termination_minutes
   FROM system.compute.clusters
   QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC)=1
 ),
-cpu AS (
-  SELECT workspace_id, cluster_id,
-         floor((unix_timestamp(current_timestamp()) - unix_timestamp(start_time)) / 604800) AS wk,
-         count(*) AS samples,
-         round(avg(cpu_user_percent + cpu_system_percent), 1) AS avg_cpu_pct,
-         round(max(cpu_user_percent + cpu_system_percent), 1) AS peak_cpu_pct,
-         round(sum(CASE WHEN (cpu_user_percent + cpu_system_percent) < 10 THEN 1 ELSE 0 END)*100.0/count(*), 1) AS pct_time_idle
-  FROM system.compute.node_timeline
-  WHERE start_time >= current_timestamp() - INTERVAL 35 DAYS
-  GROUP BY 1,2,3
+samples AS (
+  SELECT n.workspace_id, n.cluster_id, c.cluster_name, c.cluster_source, c.auto_termination_minutes,
+         {_wk("n.start_time")} AS wk,
+         n.cpu_user_percent + n.cpu_system_percent AS cpu
+  FROM system.compute.node_timeline n
+  JOIN latest_clusters c USING (workspace_id, cluster_id)
+  WHERE n.start_time >= current_timestamp() - INTERVAL 35 DAYS
+    AND c.cluster_source IN ('UI','API')
 ),
-interactive AS (
-  SELECT cpu.*, c.cluster_name, c.cluster_source, c.auto_termination_minutes
-  FROM cpu JOIN latest_clusters c USING (workspace_id, cluster_id)
-  WHERE c.cluster_source IN ('UI','API') AND c.delete_time IS NULL
-),
-own AS (SELECT workspace_id, cluster_id, percentile_approx(samples, 0.5) AS own_normal
-        FROM interactive WHERE wk BETWEEN 1 AND 4 GROUP BY 1,2),
-ws AS (SELECT percentile_approx(samples, 0.5) AS ws_normal FROM interactive WHERE wk BETWEEN 1 AND 4),
-cur AS (
-  SELECT i.*, i.samples AS node_minutes, o.own_normal, w.ws_normal
-  FROM interactive i LEFT JOIN own o USING (workspace_id, cluster_id) CROSS JOIN ws w
-  WHERE i.wk = 0 AND i.avg_cpu_pct < 20
+weekly AS (SELECT wk, sum(greatest(100 - cpu, 0)) / 100 AS v FROM samples WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
+  SELECT workspace_id, cluster_id, cluster_name, cluster_source, auto_termination_minutes,
+         sum(greatest(100 - cpu, 0)) / 100 AS idle_node_minutes,
+         count(*)                          AS node_minutes,
+         round(avg(cpu), 1)                AS avg_cpu_pct,
+         round(max(cpu), 1)                AS peak_cpu_pct
+  FROM samples WHERE wk = 0
+  GROUP BY 1, 2, 3, 4, 5
 )
-SELECT coalesce(cluster_name, cluster_id) AS cluster,
-       cluster_source, auto_termination_minutes,
-       avg_cpu_pct, peak_cpu_pct, pct_time_idle, node_minutes,
-       CASE WHEN avg_cpu_pct < 10 AND peak_cpu_pct < 30 THEN 'severely-underutilised'
-            WHEN avg_cpu_pct < 20 THEN 'underutilised' ELSE 'ok' END AS verdict,
-       {_vs_normal("node_minutes")}
-FROM cur
-ORDER BY {_most_unusual("node_minutes")}, node_minutes DESC
+SELECT coalesce(cluster_name, cluster_id) AS cluster, cluster_source, auto_termination_minutes,
+       round(idle_node_minutes, 1) AS idle_node_minutes, node_minutes, avg_cpu_pct, peak_cpu_pct,
+       {_vs_account("idle_node_minutes")}
+FROM contrib CROSS JOIN acct
+ORDER BY idle_node_minutes DESC
 LIMIT 50
 """,
     },
@@ -1163,66 +1174,57 @@ LIMIT 50
     {
         "id": "H19",
         "category": "idle",
-        "title": "Always-on Databricks Apps",
-        "eli5": "Finds Databricks Apps that bill compute nearly every day — running continuously "
-                "whether or not anyone is using them.",
-        "what": "A Databricks App bills DBUs while deployed and running, regardless of traffic. An app "
-                "that shows usage on 25+ of the last 30 days is effectively always-on. Each row is an "
-                "app with its days billed and total/average daily DBUs, plus its DBUs this week set "
-                "against its usual week (the median of its prior four). vs_normal is how many times that "
-                "usual it burned, and that sets the alert, so an app that scaled up or started burning "
-                "more stands out. High DBU + always-on + little real traffic = a stop-or-consolidate candidate.",
+        "title": "Databricks Apps compute",
+        "eli5": "Checks how much compute the account's Databricks Apps billed this week against its "
+                "usual week. An app bills while it runs, whether or not anyone is using it.",
+        "what": "A Databricks App bills DBUs while deployed and running, regardless of traffic. The "
+                "DBUs every app in the account billed this week (complete days) are set against its "
+                "usual week (the median of the prior four weeks). vs_normal is how many times that "
+                "normal this week is, and that sets the alert, so apps that scaled up or started "
+                "burning more stand out. Each row is one app with its DBUs, its share of the account's "
+                "app DBUs and how many days of the week it billed; an app billed every day is "
+                "effectively always-on. High DBU + always-on + little real traffic = a "
+                "stop-or-consolidate candidate.",
         "action": "Audit per-app traffic (Apps UI Insights, or OAuth-consent as a breadth signal); stop "
                   "or undeploy apps no one uses, and consolidate per-workspace/per-env duplicates. Apps "
                   "that only need business-hours availability don't need to run overnight.",
         "measure": "M2",
-        "explain_hunt_desc": "Databricks Apps billing nearly every day (always-on regardless of traffic)",
+        "explain_hunt_desc": "the account's Databricks Apps DBUs this week versus its usual week, and "
+                             "the apps behind them (apps bill while running, regardless of traffic)",
         "explain_rubric": (
-            "each row is a Databricks App with days_billed (of last 30) and its DBUs. days_billed >= 25 "
-            "means it's effectively always-on; high total_dbus makes it costly. vs_normal = dbus_7d / "
-            "baseline, where baseline is the app's median week over the prior four (floored at the "
-            "workspace's median app-week; baseline_from says which). Name the apps furthest above their "
-            "own normal first, then the biggest "
-            "always-on apps as stop/consolidate candidates — but note billing shows it's RUNNING, not "
-            "whether it's USED, so recommend confirming traffic (Apps Insights) before stopping."
+            "account_value is the DBUs every Databricks App in the account billed this week (complete "
+            "days); baseline is the median of the prior four weekly totals; vs_normal = account_value / "
+            "baseline (NULL = no prior history). Say first whether the account is above its normal. "
+            "Each row is one app; share_pct is its share, and days_billed_7d shows how many days of the "
+            "week it billed (every day = effectively always-on). Name the apps with the largest share "
+            "as stop/consolidate candidates - but note billing shows it's RUNNING, not whether it's "
+            "USED, so recommend confirming traffic (Apps Insights) before stopping."
         ),
         "sql": f"""
 WITH daily AS (
-  SELECT usage_metadata.app_name AS app_name, workspace_id, usage_date,
-         sum(usage_quantity) AS dbus
+  SELECT coalesce(usage_metadata.app_name, 'unnamed app') AS app_name, workspace_id, usage_date,
+         {_wk_day("usage_date")} AS wk, sum(usage_quantity) AS dbus
   FROM system.billing.usage
   WHERE billing_origin_product = 'APPS'
-    AND usage_date >= current_date() - INTERVAL 34 DAYS
-    AND usage_metadata.app_name IS NOT NULL
+    AND usage_date >= current_date() - INTERVAL 35 DAYS
+    AND usage_date < current_date()
   GROUP BY 1, 2, 3
 ),
-weekly AS (
-  SELECT app_name, workspace_id, floor(datediff(current_date(), usage_date) / 7) AS wk, sum(dbus) AS dbus
-  FROM daily GROUP BY 1, 2, 3
-),
-own AS (SELECT app_name, workspace_id, percentile_approx(dbus, 0.5) AS own_normal
-        FROM weekly WHERE wk BETWEEN 1 AND 4 GROUP BY 1, 2),
-ws AS (SELECT percentile_approx(dbus, 0.5) AS ws_normal FROM weekly WHERE wk BETWEEN 1 AND 4),
-apps AS (
+weekly AS (SELECT wk, sum(dbus) AS v FROM daily WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
   SELECT app_name, workspace_id,
-         count(*)                                       AS days_billed_30d,
-         round(sum(dbus), 1)                            AS total_dbus_30d,
-         round(sum(dbus)/count(*), 2)                   AS avg_daily_dbus,
-         max(usage_date)                                AS last_billed,
-         round(sum(CASE WHEN usage_date > current_date() - INTERVAL 7 DAYS THEN dbus ELSE 0 END), 1) AS dbus_7d
-  FROM daily
-  WHERE usage_date >= current_date() - INTERVAL 30 DAYS
+         sum(dbus)              AS dbus_7d,
+         count(*)               AS days_billed_7d,
+         round(avg(dbus), 2)    AS avg_daily_dbus,
+         max(usage_date)        AS last_billed
+  FROM daily WHERE wk = 0
   GROUP BY 1, 2
-  HAVING count(*) >= 25
-),
-graded AS (
-  SELECT a.*, o.own_normal, w.ws_normal
-  FROM apps a LEFT JOIN own o USING (app_name, workspace_id) CROSS JOIN ws w
 )
-SELECT app_name, workspace_id, days_billed_30d, total_dbus_30d, avg_daily_dbus, last_billed, dbus_7d,
-       {_vs_normal("dbus_7d")}
-FROM graded
-ORDER BY {_most_unusual("dbus_7d")}, total_dbus_30d DESC
+SELECT app_name, workspace_id, round(dbus_7d, 1) AS dbus_7d, days_billed_7d, avg_daily_dbus, last_billed,
+       {_vs_account("dbus_7d")}
+FROM contrib CROSS JOIN acct
+ORDER BY dbus_7d DESC
 LIMIT 50
 """,
     },
@@ -1232,59 +1234,60 @@ LIMIT 50
         "id": "H20",
         "category": "spend",
         "title": "Frequently-failing jobs",
-        "eli5": "Finds jobs that fail repeatedly — every failed run still burns compute on "
-                "setup and partial execution before it dies.",
-        "what": "A job that fails often wastes the DBUs of every failed attempt (startup + however far "
-                "it got). Each row is a job that failed this week with its run count, failed-run count, "
-                "failure rate, and the hours of compute spent on runs that failed, set against its usual "
-                "failing week (the median of its prior four weeks that had failures). vs_normal is how many "
-                "times that usual it wasted, and that sets the alert; a job with no failures in the prior "
-                "four weeks shows as NEW. A high failure rate on a frequent job is both a reliability "
-                "problem and a steady cost leak.",
+        "eli5": "Checks how much compute the account burned on job runs that failed this week against "
+                "its usual week; every failed run still pays for setup and partial execution before it "
+                "dies. Then names the jobs behind it.",
+        "what": "A job that fails wastes the DBUs of every failed attempt (startup + however far it "
+                "got). The hours the account spent on runs that ended in failure this week are set "
+                "against its usual week (the median of the prior four weeks). vs_normal is how many "
+                "times that normal this week is, and that sets the alert. Each row is one job that "
+                "failed this week with its run count, failed-run count, failure rate, wasted hours and "
+                "share of the account's wasted hours. A high failure rate on a frequent job is both a "
+                "reliability problem and a steady cost leak.",
         "action": "Root-cause the recurring failures (read the termination reason and the run logs); "
                   "add an early-abort timeout so a doomed run dies fast instead of burning a full "
                   "window; and pause or fix broken schedules that never succeed.",
         "measure": "M2",
-        "explain_hunt_desc": "jobs failing frequently (compute wasted on failed runs)",
+        "explain_hunt_desc": "the account's compute wasted on failed job runs this week versus its usual "
+                             "week, and the jobs behind it",
         "explain_rubric": (
-            "each row is a job with total_runs, failed_runs, failure_rate_pct and wasted_hours (compute "
-            "spent on runs that ended in ERROR/FAILED/TIMED_OUT/CANCELLED this week). vs_normal = "
-            "wasted_hours / baseline, where baseline is the job's median failing week over the prior four "
-            "(floored at the workspace's 95th-percentile failing job-week; baseline_from says which); NULL "
-            "vs_normal = a job that started failing this week. High "
-            "failure_rate_pct with meaningful wasted_hours = a reliability-and-cost problem. Name the "
-            "worst offenders; the fix is root-causing the failures and adding early-abort timeouts. A "
-            "few cancellations are normal — focus on the chronic high-rate ones."
+            "account_value is the hours of compute the account spent on runs that ended in "
+            "ERROR/FAILED/TIMED_OUT/CANCELLED this week; baseline is the median of the prior four "
+            "weekly totals; vs_normal = account_value / baseline (NULL = no prior failures). Say first "
+            "whether the account is wasting more than its normal. Each row is one job; share_pct is "
+            "its share of the wasted hours, with total_runs, failed_runs and failure_rate_pct. A high "
+            "failure_rate_pct with a large share = a reliability-and-cost problem. Name the worst "
+            "offenders; the fix is root-causing the failures and adding early-abort timeouts. A few "
+            "cancellations are normal - focus on the chronic high-rate ones."
         ),
         "sql": f"""
 WITH job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
-weekly AS (
-  SELECT workspace_id, job_id,
-         floor((unix_timestamp(current_timestamp()) - unix_timestamp(period_start_time)) / 604800) AS wk,
-         count(*) AS total_runs,
-         count_if(result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED')) AS failed_runs,
-         round(count_if(result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED'))*100.0/count(*), 1) AS failure_rate_pct,
-         sum(CASE WHEN result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED')
-                  THEN timestampdiff(SECOND, period_start_time, period_end_time) ELSE 0 END)/3600.0 AS wasted_hours
+runs AS (
+  SELECT workspace_id, job_id, {_wk("period_start_time")} AS wk,
+         result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED') AS failed,
+         timestampdiff(SECOND, period_start_time, period_end_time) / 3600.0 AS hours
   FROM system.lakeflow.job_run_timeline
   WHERE period_start_time >= current_timestamp() - INTERVAL 35 DAYS
-  GROUP BY 1, 2, 3
 ),
-own AS (SELECT workspace_id, job_id, percentile_approx(wasted_hours, 0.5) AS own_normal
-        FROM weekly WHERE wk BETWEEN 1 AND 4 AND wasted_hours > 0 GROUP BY 1, 2),
-ws AS (SELECT percentile_approx(wasted_hours, 0.95) AS ws_normal
-       FROM weekly WHERE wk BETWEEN 1 AND 4 AND wasted_hours > 0),
-cur AS (
-  SELECT s.*, o.own_normal, w.ws_normal
-  FROM weekly s LEFT JOIN own o USING (workspace_id, job_id) CROSS JOIN ws w
-  WHERE s.wk = 0 AND s.failed_runs > 0
+weekly AS (SELECT wk, sum(CASE WHEN failed THEN hours END) AS v FROM runs WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
+  SELECT workspace_id, job_id,
+         count(*)                                       AS total_runs,
+         count_if(failed)                               AS failed_runs,
+         round(count_if(failed) * 100.0 / count(*), 1)  AS failure_rate_pct,
+         sum(CASE WHEN failed THEN hours END)           AS wasted_hours
+  FROM runs WHERE wk = 0
+  GROUP BY 1, 2
+  HAVING count_if(failed) > 0
 )
-SELECT s.workspace_id,
-       coalesce(jn.job_name, CAST(s.job_id AS STRING)) AS job_name,
-       s.total_runs, s.failed_runs, s.failure_rate_pct, round(s.wasted_hours, 1) AS wasted_hours,
-       {_vs_normal("s.wasted_hours")}
-FROM cur s LEFT JOIN job_names jn ON s.workspace_id=jn.workspace_id AND s.job_id=jn.job_id
-ORDER BY {_most_unusual("s.wasted_hours")}, s.failure_rate_pct DESC
+SELECT c.workspace_id,
+       coalesce(jn.job_name, CAST(c.job_id AS STRING)) AS job_name,
+       c.total_runs, c.failed_runs, c.failure_rate_pct, round(c.wasted_hours, 1) AS wasted_hours,
+       {_vs_account("c.wasted_hours")}
+FROM contrib c LEFT JOIN job_names jn ON c.workspace_id=jn.workspace_id AND c.job_id=jn.job_id
+CROSS JOIN acct
+ORDER BY c.wasted_hours DESC
 LIMIT 50
 """,
     },
@@ -1938,35 +1941,32 @@ ALERT_SPECS: dict[str, AlertSpec] = {
            "new_summary": "Account has no prior history of queueing yet ({account} waiting this week).",
            "usd_col": None},
     # ── H16–H20 (Aug 2026 thread additions) ──
-    "H16": {"kind": "anomaly", "entity_col": "job_name", "metric_col": "run_count",
-            "metric_label": "All-Purpose runs this week", "unit": "count",
-            "baseline": "median of the job's prior four weeks on that cluster, floored at the "
-                        "workspace's median job-week on All-Purpose",
-            "summary": "{entity}: {x} its usual All-Purpose runs (normal ~{baseline}/week).",
-            "new_summary": "NEW: {entity} first seen on All-Purpose compute this window ({metric} runs this week).",
+    "H16": {"kind": "anomaly", "aggregate": "additive", "entity_col": "job_name", "metric_col": "run_count",
+            "metric_label": "Account job runs on All-Purpose compute this week", "unit": "count",
+            "baseline": "median of the account's prior four weekly totals",
+            "summary": "Account ran {account} jobs on All-Purpose compute this week, {x} its usual (normal ~{baseline}).",
+            "new_summary": "Account has no prior history of jobs on All-Purpose compute yet ({account} runs this week).",
             "usd_col": None},
     "H17": {"kind": "presence", "entity_col": "warehouse_name",
             "metric_label": "Classic warehouses with auto-stop off", "usd_col": None,
             "summary": "{n} classic warehouse(s) never auto-stop, including {entity}."},
-    "H18": {"kind": "anomaly", "entity_col": "cluster", "metric_col": "node_minutes",
-            "metric_label": "Low-CPU node-minutes this week", "unit": "count",
-            "baseline": "median of the cluster's prior four weeks, floored at the workspace's median "
-                        "interactive cluster-week",
-            "summary": "{entity}: idled {x} its usual runtime ({metric} node-minutes this week, normal ~{baseline}/week).",
-            "new_summary": "NEW: {entity} first seen this window, idling for {metric} node-minutes.",
+    "H18": {"kind": "anomaly", "aggregate": "additive", "entity_col": "cluster", "metric_col": "idle_node_minutes",
+            "metric_label": "Account idle node-minutes on interactive clusters this week", "unit": "count",
+            "baseline": "median of the account's prior four weekly totals",
+            "summary": "Account's interactive clusters idled {account} node-minutes this week, {x} its usual (normal ~{baseline}).",
+            "new_summary": "Account has no prior history of interactive clusters yet ({account} idle node-minutes this week).",
             "usd_col": None},
-    "H19": {"kind": "anomaly", "entity_col": "app_name", "metric_col": "dbus_7d",
-            "metric_label": "Always-on App DBUs this week", "unit": "count",
-            "baseline": "median of the app's prior four weeks, floored at the workspace's median app-week",
-            "summary": "{entity}: {x} its usual DBUs ({metric} this week, normal ~{baseline}/week).",
-            "new_summary": "NEW: {entity} first seen billing this window ({metric} DBUs this week).",
+    "H19": {"kind": "anomaly", "aggregate": "additive", "entity_col": "app_name", "metric_col": "dbus_7d",
+            "metric_label": "Account Databricks Apps DBUs this week", "unit": "count",
+            "baseline": "median of the account's prior four weekly totals (complete days)",
+            "summary": "Account's Databricks Apps billed {account} DBUs this week, {x} its usual (normal ~{baseline}).",
+            "new_summary": "Account has no prior history of Databricks Apps billing yet ({account} DBUs this week).",
             "usd_col": None},
-    "H20": {"kind": "anomaly", "entity_col": "job_name", "metric_col": "wasted_hours",
-            "metric_label": "Compute on failed runs this week", "unit": "hours",
-            "baseline": "median of the job's prior four weeks that had failures, floored at the "
-                        "workspace's 95th-percentile failing job-week",
-            "summary": "{entity}: wasted {x} its usual on failed runs ({metric} this week, normal ~{baseline}/week).",
-            "new_summary": "NEW: {entity} started failing this window ({metric} of compute on failed runs).",
+    "H20": {"kind": "anomaly", "aggregate": "additive", "entity_col": "job_name", "metric_col": "wasted_hours",
+            "metric_label": "Account compute on failed job runs this week", "unit": "hours",
+            "baseline": "median of the account's prior four weekly totals",
+            "summary": "Account spent {account} on failed job runs this week, {x} its usual (normal ~{baseline}).",
+            "new_summary": "Account has no prior history of failed job runs yet ({account} on failed runs this week).",
             "usd_col": None},
     "H21": {"kind": "presence", "entity_col": "schema_name",
             "metric_label": "Schemas with likely-snappy Delta tables", "usd_col": None,
