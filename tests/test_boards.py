@@ -134,6 +134,12 @@ class DecompDriver(unittest.TestCase):
 
 
 class Catalogue(unittest.TestCase):
+    def test_generated_skill_matches_the_board_sql(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import gen_unit_economics_skill as gen
+        with open(gen.OUT) as f:
+            self.assertEqual(f.read(), gen.render(), "run tools/gen_unit_economics_skill.py")
+
     def test_no_detector_spec_carries_a_number(self):
         for b in boards.BOARDS:
             for p in b["panels"]:
