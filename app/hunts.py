@@ -558,76 +558,95 @@ LIMIT 50
     {
         "id": "H7",
         "category": "longrun",
-        "title": "Repeated short queries (polling)",
-        "eli5": "Checks how many short queries the account ran this week against its usual week, then "
-                "names the identities and sources behind them, typically an orchestrator checking "
-                "metadata more often than needed.",
-        "what": "“Short” means at or under the account's own typical SELECT duration (the median "
-                "over the prior four weeks), so the definition fits any account. The number of short "
-                "SELECTs across the account this week is set against its usual week (the median of the "
-                "prior four weeks). vs_normal is how many times that normal this week is, and that sets "
-                "the alert. Each row is one identity and query source with its share of those "
-                "queries. A group with a large share is a CANDIDATE poller, not a verdict; confirm "
-                "before acting. ‘execution_hours’ is the total compute weight. The result names the "
-                "culprit (a saved query, dashboard, or job) even when the SQL text is hidden. When all "
-                "three are blank the row is labelled ‘unattributed, confirm before acting’ because "
-                "unrelated short queries can pile into one row.",
-        "action": "Go event-driven — use a table-update trigger to run work only when the "
-                  "source changes, instead of polling. Or write the freshness marker to a tiny "
-                  "one-row table (a single-row read beats a metadata scan). Or simply reduce the "
-                  "frequency to what downstream actually needs (minutes, not seconds).",
+        "title": "Repeated identical queries (polling)",
+        "eli5": "Checks how often the account re-ran the exact same query this week, by the same identity "
+                "within the same hour, against its usual week, then names the identities and statements "
+                "that repeat most, typically a job, app or dashboard polling for changes.",
+        "what": "A repeat is a run of a SELECT whose exact text and parameters the same identity already ran "
+                "earlier in the same clock hour. The first run in each hour does not count, so a refresh "
+                "scheduled hourly or less often never counts, while a loop that checks every few seconds or "
+                "minutes counts every check after the first. The repeats across the account this week are "
+                "set against its usual week (the median of the prior four weeks). vs_normal is how many "
+                "times that normal this week is, and that sets the alert. Each row is one identity and "
+                "statement with its share of the account's repeats. ‘hours_repeating’ is how many hours of "
+                "the week it repeated in, ‘peak_runs_in_an_hour’ its busiest hour, and ‘from_cache_pct’ "
+                "the share of runs the result cache answered, which use little compute. Open "
+                "‘example_statement_id’ in Query History to see the statement. For notebook and job code "
+                "the recorded text can be the line of code that issued the query, so one row can cover a "
+                "loop over several tables; the example shows which.",
+        "action": "Find what re-runs the statement (open ‘example_statement_id’ in Query History) and make "
+                  "it event-driven: a table-update trigger runs work only when the source changes. If a "
+                  "dashboard or app reads the same result again and again, point it at a cached or "
+                  "materialised result instead. Otherwise lower the frequency to what downstream actually "
+                  "needs.",
         "measure": "M3",
-        "explain_hunt_desc": ("the account's short SELECTs this week versus its usual week, and the "
-                              "identities behind them (candidate polling; unattributed groups need "
-                              "confirmation, do not assert waste)"),
+        "explain_hunt_desc": ("the account's repeat runs of identical SELECTs this week versus its usual "
+                              "week, and the identities and statements that repeat most (polling)"),
         "explain_rubric": (
-            "a short SELECT is one at or under the account's median SELECT duration over the prior four "
-            "weeks. account_value is the number of short SELECTs across the account this week; "
-            "baseline is the median of the prior four weekly totals; vs_normal = account_value / "
-            "baseline (NULL = no prior history). Say first whether the account is polling more than its "
-            "normal. Each row is one group; share_pct is its share. A group with a large share is a "
-            "candidate poller, not a verdict - confirm before acting. p50_exec_ms shows how expensive "
-            "each poll is; execution_hours is the aggregate execution weight (execution only, excluding "
-            "queue/provisioning). When all query_source IDs are NULL the group is unattributed - "
-            "unrelated short SELECTs can collapse into one row, so do not assert it is a poller."
+            "a repeat is a run of a SELECT whose exact text and parameters the same identity already ran "
+            "earlier in the same clock hour; the first run in each hour is not counted. account_value is "
+            "the number of repeats across the account this week; baseline is the median of the prior four "
+            "weekly totals; vs_normal = account_value / baseline (NULL = no prior history). Say first "
+            "whether the account is polling more than its normal. Each row is one identity and statement; "
+            "share_pct is its share of the repeats. hours_repeating is how many hours of the week it "
+            "repeated in and peak_runs_in_an_hour its busiest hour, which show how steady the polling is. "
+            "from_cache_pct is the share of runs the result cache answered, which use little compute; "
+            "execution_hours is the execution time the runs used. For notebook and job code the statement "
+            "text can be the line of code that issued the query, so one row can cover a loop over several "
+            "tables; the example statement shows which."
         ),
         "sql": f"""
-WITH selects AS (
+WITH runs AS (
   SELECT executed_by, client_application,
-         query_source.sql_query_id            AS sql_query_id,
-         query_source.dashboard_id            AS dashboard_id,
-         query_source.job_info.job_id         AS job_id,
-         statement_id, execution_duration_ms, total_duration_ms, {_wk("start_time")} AS wk
+         coalesce('query ' || query_source.sql_query_id, 'dashboard ' || query_source.dashboard_id,
+                  'job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
+                  'alert ' || query_source.alert_id, 'genie space ' || query_source.genie_space_id) AS source,
+         statement_id, execution_duration_ms, from_result_cache,
+         -- identical means the same text and the same parameters, so a lookup with new values is not a repeat
+         xxhash64(statement_text, to_json(query_parameters)) AS statement_key,
+         date_trunc('HOUR', start_time) AS hour, {_wk("start_time")} AS wk
   FROM system.query.history
   WHERE statement_type = 'SELECT'
     AND start_time >= current_timestamp() - INTERVAL 35 DAYS
 ),
-typical AS (SELECT percentile_approx(total_duration_ms, 0.5) AS short_ms FROM selects WHERE wk BETWEEN 1 AND 4),
-polls AS (SELECT s.* FROM selects s CROSS JOIN typical t WHERE s.total_duration_ms <= t.short_ms),
-weekly AS (SELECT wk, count(*) AS v FROM polls WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+-- every run after the first of a statement in the same clock hour is a repeat
+hourly AS (
+  SELECT wk, executed_by, statement_key, hour,
+         count(*) - 1                AS repeats,
+         count(*)                    AS execs,
+         count_if(from_result_cache) AS cached,
+         sum(execution_duration_ms)  AS exec_ms,
+         max(source)                 AS source,
+         max(client_application)     AS client_application,
+         any_value(statement_id)     AS statement_id
+  FROM runs
+  GROUP BY wk, executed_by, statement_key, hour
+),
+weekly AS (SELECT wk, sum(repeats) AS v FROM hourly WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
 {_account_normal("weekly")},
 contrib AS (
-  SELECT executed_by,
-         CASE WHEN executed_by LIKE '%@%' THEN 'human' ELSE 'service_principal' END AS owner_type,
-         client_application, sql_query_id, dashboard_id, job_id,
-         count(*)                                       AS execs,
-         approx_percentile(execution_duration_ms, 0.5)  AS p50_exec_ms,
-         sum(execution_duration_ms)/3600000.0           AS execution_hours,
-         any_value(statement_id)                        AS example_statement_id,
-         slice(array_agg(statement_id), 1, 3)           AS more_example_ids,
-         CASE WHEN coalesce(sql_query_id, dashboard_id, job_id) IS NULL
-              THEN 'unattributed, confirm before acting'
-              ELSE 'candidate, confirm in Query History' END    AS status
-  FROM polls WHERE wk = 0
-  GROUP BY 1, 2, 3, 4, 5, 6
+  SELECT executed_by, statement_key,
+         sum(repeats)                              AS repeats,
+         sum(execs)                                AS execs,
+         count_if(repeats > 0)                     AS hours_repeating,
+         max(execs)                                AS peak_runs_in_an_hour,
+         round(100 * sum(cached) / sum(execs), 1)  AS from_cache_pct,
+         sum(exec_ms)/3600000.0                    AS execution_hours,
+         max(source)                               AS source,
+         max(client_application)                   AS client_application,
+         any_value(statement_id)                   AS example_statement_id
+  FROM hourly WHERE wk = 0
+  GROUP BY 1, 2
+  HAVING sum(repeats) > 0
 )
-SELECT executed_by, owner_type, client_application, sql_query_id, dashboard_id, job_id,
-       execs, p50_exec_ms, execution_hours, example_statement_id, more_example_ids, status,
-       coalesce('query ' || sql_query_id, 'dashboard ' || dashboard_id, 'job ' || job_id,
-                client_application, 'unattributed') || ' (' || executed_by || ')' AS poller,
-       {_vs_account("execs")}
+SELECT executed_by,
+       CASE WHEN executed_by LIKE '%@%' THEN 'human' ELSE 'service_principal' END AS owner_type,
+       source, client_application, repeats, execs, hours_repeating, peak_runs_in_an_hour,
+       from_cache_pct, execution_hours, example_statement_id,
+       coalesce(source, client_application, 'unattributed') || ' (' || executed_by || ')' AS poller,
+       {_vs_account("repeats")}
 FROM contrib CROSS JOIN acct
-ORDER BY execs DESC
+ORDER BY repeats DESC
 LIMIT 50
 """,
     },
@@ -1885,12 +1904,11 @@ ALERT_SPECS: dict[str, AlertSpec] = {
            "summary": "Account scanned {account} in its busiest hour this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of SELECT scans yet ({account} in its busiest hour this week).",
            "usd_col": None},
-    "H7": {"kind": "anomaly", "aggregate": "additive", "entity_col": "poller", "metric_col": "execs",
-           "metric_label": "Account short SELECTs this week", "unit": "count",
-           "baseline": "median of the account's prior four weekly totals of SELECTs at or under its "
-                       "median SELECT duration",
-           "summary": "Account ran {account} short queries this week, {x} its usual (normal ~{baseline}).",
-           "new_summary": "Account has no prior history of short queries yet ({account} this week).",
+    "H7": {"kind": "anomaly", "aggregate": "additive", "entity_col": "poller", "metric_col": "repeats",
+           "metric_label": "Account repeat runs of identical SELECTs this week", "unit": "count",
+           "baseline": "median of the account's prior four weekly totals of repeat runs",
+           "summary": "Account re-ran identical SELECTs {account} times this week, {x} its usual (normal ~{baseline}).",
+           "new_summary": "Account has no prior history of repeated identical SELECTs yet ({account} repeat runs this week).",
            "usd_col": None},
     "H8": {"kind": "anomaly", "aggregate": "additive", "entity_col": "warehouse", "metric_col": "queued_hours",
            "metric_label": "Account queue wait this week", "unit": "hours",

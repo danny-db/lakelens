@@ -67,7 +67,7 @@ flowchart LR
 | 🤖 AI & Model Serving | H0 Runaway AI spend |
 | 💤 Idle Compute | H3 Chatter keeps warehouses awake · H4 Warehouses that never sleep · H14 Idle cores · H16 Jobs on all-purpose compute · H18 Idle cores on interactive clusters · H19 Databricks Apps compute |
 | 📖 Heavy Reads & Spill | H1 Read amplification · H2 Disk spill · H6 Unusually heavy scan hours across the account · H21 Tables still on snappy (not zstd) |
-| ⏱️ Long-Running & Repetitive | H5 Statements far longer than the account's usual · H7 Repeated short queries (polling) |
+| ⏱️ Long-Running & Repetitive | H5 Statements far longer than the account's usual · H7 Repeated identical queries (polling) |
 | ⚙️ Right-Sizing & Config | H8 Queue pressure vs capacity · H9 Warehouse config audit · H17 Auto-stop disabled · H22 Serverless jobs in performance-optimised mode |
 | 📈 Spend Trends & Attribution | H10 Spend by product (SKU) · H11 Jobs: weekly movers · H12 Jobs: who got slower? · H13 Cost per pipeline · H20 Frequently failing jobs · H23 Predictive Optimisation cost drivers |
 
@@ -130,7 +130,7 @@ Each alert answers two questions for an admin: is the **account** behaving abnor
 - **Who caused it.** The rows are the top contributors this window, largest first, each with `share_pct` of the account value. For a total the shares add up to the account value; for the busiest hour they split that hour; for the longest statement each row is a source's longest as a % of the account's.
 - **Configuration hunts** (H17 auto-stop disabled, H21 likely-snappy tables) have no time series. Any row is medium.
 
-No hunt hard-codes a size, duration or CPU cut-off: "short" (H7) is the account's own median SELECT duration, and "idle" (H18) weights node-minutes by unused CPU. So the rule works the same in a small account and a large one. It catches change, not steady waste: an account that has run the same All-Purpose jobs every week for months reads about 1x its normal and raises no alert, though the hunt still lists them on the Spot tab. Each hunt's metric and normal are listed in the [catalogue](docs/CATALOGUE.md).
+No hunt hard-codes a size, duration or CPU cut-off: a "repeat" (H7) is any rerun of an identical SELECT by the same identity in the same clock hour, with no minimum count, and "idle" (H18) weights node-minutes by unused CPU. So the rule works the same in a small account and a large one. It catches change, not steady waste: an account that has run the same All-Purpose jobs every week for months reads about 1x its normal and raises no alert, though the hunt still lists them on the Spot tab. Each hunt's metric and normal are listed in the [catalogue](docs/CATALOGUE.md).
 
 Saved scans show each hunt under its current title and fix, so a renamed hunt never reads under its old name. The headline and metric stay as that scan measured them.
 
