@@ -121,12 +121,17 @@ def _wk_day(day: str) -> str:
 
 
 def _account_normal(weekly: str) -> str:
-    """CTE `acct` from a CTE of (wk, v), the account metric per window. A window
-    with no rows counts as 0, so a quiet week pulls the median down honestly."""
+    """CTE `acct` from a CTE of (wk, v), the account metric per window. The spine
+    is the current window plus the four 7-day windows of the prior 28 days; a
+    window with no rows counts as 0, so a quiet week pulls the median down honestly."""
     return f"""acct AS (
-  SELECT coalesce(max(CASE WHEN s.wk = 0 THEN a.v END), 0)      AS account_value,
-         percentile(CASE WHEN s.wk > 0 THEN coalesce(a.v, 0) END, 0.5) AS normal
-  FROM (SELECT explode(sequence(0, 4)) AS wk) s LEFT JOIN {weekly} a USING (wk)
+  SELECT max(CASE WHEN wk = 0 THEN v END)                AS account_value,
+         percentile(CASE WHEN wk > 0 THEN v END, 0.5)    AS normal
+  FROM (
+    SELECT s.wk, coalesce(a.v, 0) AS v
+    FROM (SELECT posexplode(sequence(current_date() - INTERVAL 28 DAYS, current_date(), INTERVAL 7 DAYS)) AS (wk, d)) s
+    LEFT JOIN {weekly} a USING (wk)
+  )
 )"""
 
 
@@ -231,61 +236,64 @@ LIMIT 20
         "id": "H1",
         "category": "reads",
         "title": "Read amplification",
-        "eli5": "Finds MERGE statements that read enormously more data than they write "
-                "— an “incremental” job quietly re-scanning everything.",
-        "what": "Each row is one MERGE target (or the job, notebook or person behind it) "
-                "with its heaviest run this week, set against the bytes a run of that same "
-                "MERGE usually reads. vs_normal is how many times its usual this run read, "
-                "and that sets the alert: an incremental MERGE that suddenly reads several "
-                "times its normal has started re-scanning. A high read-to-write ratio says "
-                "the same thing in another way. If the target table is small but the reads "
-                "are huge, the cost is upstream (the source query has no date filter). If "
-                "reads are about twice the target size, the merge is scanning the whole "
-                "target every run.",
+        "eli5": "Checks how much data the account's MERGE statements read this week against its usual "
+                "week, then names the MERGE targets behind it; an “incremental” job quietly "
+                "re-scanning everything shows up here.",
+        "what": "The TiB every MERGE in the account read this week, set against its usual week (the "
+                "median of the prior four weeks). vs_normal is how many times that normal this week "
+                "is, and that sets the alert. Each row is one MERGE target (or the job, notebook or "
+                "person behind it) with its runs, the TiB it read this week and its share of the "
+                "account's MERGE reads, so the top row is where the extra reading went. A high "
+                "read-to-write ratio says the MERGE reads far more than it changes. If the target "
+                "table is small but the reads are huge, the cost is upstream (the source query has no "
+                "date filter). If each run reads about twice the target's size, the merge is scanning "
+                "the whole target in both its match and rewrite phases.",
         "action": "Bound the source with an incremental watermark so it only reads new "
                   "rows; bound the target with incremental_predicates on a date column; "
                   "cluster the target on that same column so old data can be skipped; and "
                   "update only the rows that changed.",
         "measure": "M4",
-        "explain_hunt_desc": "MERGE statements that read far more than they write (read amplification)",
+        "explain_hunt_desc": "the account's MERGE read volume this week versus its usual week, and the "
+                             "MERGE targets that drove it (read amplification)",
         "explain_rubric": (
-            "each row is a MERGE target's heaviest run this week. vs_normal = read_tib / baseline, "
-            "where baseline is the median bytes a run of the same MERGE read over the prior 28 days "
-            "(floored at the workspace's 95th-percentile MERGE; baseline_from says which). A NULL vs_normal "
-            "means a MERGE first seen this week. A run several times its own normal has started "
-            "re-scanning; read_write_ratio corroborates it. Then compare read_tib per "
-            "run against the target's actual size (DESCRIBE DETAIL <target> -> sizeInBytes, "
-            "see H15): if the target is small but reads are huge, the cost is upstream (the "
-            "source query); if reads are approximately 2x the target size, the merge scans "
-            "the whole target in both its match and rewrite phases."
+            "account_value is the TiB all MERGE statements in the account read this week; baseline is "
+            "the median of the prior four weekly totals; vs_normal = account_value / baseline (NULL = "
+            "no prior MERGE history). Say first whether the account is reading more than its normal. "
+            "Each row is one MERGE target this week; share_pct is its share of the account's MERGE "
+            "reads, and read_write_ratio shows how much it reads per byte written. Compare read_tib "
+            "per run against the target's actual size (DESCRIBE DETAIL <target> -> sizeInBytes, see "
+            "H15): if the target is small but reads are huge, the cost is upstream (the source "
+            "query); if reads per run are about twice the target size, the merge scans the whole "
+            "target in both its match and rewrite phases."
         ),
         "sql": f"""
 WITH merges AS (
-  SELECT statement_id, executed_by, start_time, read_bytes, written_bytes, total_duration_ms,
-         read_bytes/POW(1024,4) AS read_tib,
+  SELECT statement_id, executed_by, read_bytes, written_bytes, total_duration_ms,
+         read_bytes/POW(1024,4) AS read_tib, {_wk("start_time")} AS wk,
          coalesce(nullif(regexp_extract(statement_text, '(?i)MERGE\\\\s+INTO\\\\s+([`\\\\w.]+)', 1), ''),
                   'job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
                   executed_by) AS merge_target
   FROM system.query.history
   WHERE statement_type = 'MERGE' AND read_bytes > 0
-    AND start_time >= current_date() - INTERVAL 35 DAYS
+    AND start_time >= current_timestamp() - INTERVAL 35 DAYS
 ),
-prior AS (SELECT * FROM merges WHERE start_time < current_date() - INTERVAL 7 DAYS),
-own AS (SELECT merge_target, percentile_approx(read_tib, 0.5) AS own_normal FROM prior GROUP BY 1),
-ws AS (SELECT percentile_approx(read_tib, 0.95) AS ws_normal FROM prior),
-cur AS (
-  SELECT m.*, o.own_normal, w.ws_normal
-  FROM merges m LEFT JOIN own o USING (merge_target) CROSS JOIN ws w
-  WHERE m.start_time >= current_date() - INTERVAL 7 DAYS
-  QUALIFY row_number() OVER (PARTITION BY m.merge_target ORDER BY m.read_bytes DESC) = 1
+weekly AS (SELECT wk, sum(read_tib) AS v FROM merges WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
+  SELECT merge_target, count(*) AS runs, sum(read_tib) AS read_tib,
+         sum(written_bytes)/POW(1024,3)                         AS written_gib,
+         CAST(sum(read_bytes) AS DOUBLE)/NULLIF(sum(written_bytes),0) AS read_write_ratio,
+         sum(total_duration_ms)/60000.0                         AS mins,
+         max_by(statement_id, read_bytes)                       AS heaviest_statement_id,
+         max_by(executed_by, read_bytes)                        AS executed_by
+  FROM merges WHERE wk = 0
+  GROUP BY 1
 )
-SELECT statement_id, executed_by, merge_target, read_tib,
-       written_bytes/POW(1024,3)            AS written_gib,
-       CAST(read_bytes AS DOUBLE)/NULLIF(written_bytes,0) AS read_write_ratio,
-       total_duration_ms/60000.0            AS mins,
-       {_vs_normal("read_tib")}
-FROM cur
-ORDER BY {_most_unusual("read_tib")}
+SELECT merge_target, executed_by, heaviest_statement_id, runs, read_tib, written_gib,
+       read_write_ratio, mins,
+       {_vs_account("read_tib")}
+FROM contrib CROSS JOIN acct
+ORDER BY read_tib DESC
 LIMIT 20
 """,
     },
@@ -295,58 +303,60 @@ LIMIT 20
         "id": "H2",
         "category": "reads",
         "title": "Disk spill",
-        "eli5": "Finds queries that ran out of memory and had to write working data to "
-                "disk — far slower, and you pay for the extra time.",
-        "what": "Each row is one source of spilling statements (a job, notebook, saved query, "
-                "dashboard or person) with its worst spill this week, set against how much a "
-                "spilling statement from that source usually spills. vs_normal is how many times "
-                "its usual, and that sets the alert. "
-                "Compare spill to the input size. Spill much LARGER than the input (we have "
-                "seen 46×) is a query-shape problem — a CTE recomputed many times, "
-                "de-duplication done after a join instead of before, or an unbounded lookback. "
-                "Spill roughly equal to the input is a sizing problem.",
+        "eli5": "Checks how much working data the account's queries spilled to disk this week (they "
+                "ran out of memory, which is slower and you pay for the extra time) against its usual "
+                "week, then names the sources behind it.",
+        "what": "The TiB every statement in the account spilled to disk this week, set against its "
+                "usual week (the median of the prior four weeks). vs_normal is how many times that "
+                "normal this week is, and that sets the alert. Each row is one source of spilling "
+                "statements (a job, notebook, saved query, dashboard or person) with its spill and "
+                "share of the account's spill. Compare spill to the input size. Spill much LARGER "
+                "than the input is a query-shape problem: a CTE recomputed many times, de-duplication "
+                "done after a join instead of before, or an unbounded lookback. Spill roughly equal "
+                "to the input is a sizing problem.",
         "action": "Rewrite first — shorten lookbacks, stage a re-used CTE into a temp "
                   "table, and de-duplicate the small side before joins. Only if a clean query "
                   "still spills should you increase the warehouse/cluster size. Open the worst "
                   "offender's query profile to see which step spills.",
         "measure": "M4",
-        "explain_hunt_desc": "statements spilling intermediate data to disk (memory pressure)",
+        "explain_hunt_desc": "the account's disk spill this week versus its usual week, and the sources "
+                             "that drove it (memory pressure)",
         "explain_rubric": (
-            "each row is a source's worst-spilling statement this week. vs_normal = spill_tib / "
-            "baseline, where baseline is the source's median spill per spilling statement over the "
-            "prior 28 days (floored at the workspace median; baseline_from says which). NULL "
-            "vs_normal = a source first seen spilling this week. "
-            "compare spill_tib to read_gib. Spill far larger than the input (we saw 46x) is a "
-            "query-shape problem: re-used CTEs recomputed per reference, deduplication after a "
-            "join instead of before, unbounded lookback windows. Spill roughly proportional to "
-            "input on a well-shaped query is a sizing problem."
+            "account_value is the TiB the whole account spilled to local disk this week; baseline is "
+            "the median of the prior four weekly totals; vs_normal = account_value / baseline (NULL = "
+            "no prior spill history). Say first whether the account is spilling more than its normal. "
+            "Each row is one source this week; share_pct is its share of the account's spill. Compare "
+            "spill_tib to read_gib. Spill far larger than the input is a query-shape problem: re-used "
+            "CTEs recomputed per reference, deduplication after a join instead of before, unbounded "
+            "lookback windows. Spill roughly proportional to input on a well-shaped query is a sizing "
+            "problem."
         ),
         "sql": f"""
 WITH spills AS (
-  SELECT statement_id, start_time, executed_by, read_bytes, total_duration_ms,
-         spilled_local_bytes/POW(1024,4) AS spill_tib,
+  SELECT statement_id, executed_by, read_bytes, total_duration_ms,
+         spilled_local_bytes/POW(1024,4) AS spill_tib, {_wk("start_time")} AS wk,
          coalesce('job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
                   'query ' || query_source.sql_query_id, 'dashboard ' || query_source.dashboard_id,
                   executed_by) AS source
   FROM system.query.history
   WHERE spilled_local_bytes > 0
-    AND start_time >= current_date() - INTERVAL 35 DAYS
+    AND start_time >= current_timestamp() - INTERVAL 35 DAYS
 ),
-prior AS (SELECT * FROM spills WHERE start_time < current_date() - INTERVAL 7 DAYS),
-own AS (SELECT source, percentile_approx(spill_tib, 0.5) AS own_normal FROM prior GROUP BY 1),
-ws AS (SELECT percentile_approx(spill_tib, 0.5) AS ws_normal FROM prior),
-cur AS (
-  SELECT s.*, o.own_normal, w.ws_normal
-  FROM spills s LEFT JOIN own o USING (source) CROSS JOIN ws w
-  WHERE s.start_time >= current_date() - INTERVAL 7 DAYS
-  QUALIFY row_number() OVER (PARTITION BY s.source ORDER BY s.spill_tib DESC) = 1
+weekly AS (SELECT wk, sum(spill_tib) AS v FROM spills WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
+  SELECT source, count(*) AS statements, sum(spill_tib) AS spill_tib,
+         sum(read_bytes)/POW(1024,3)          AS read_gib,
+         sum(total_duration_ms)/60000.0       AS mins,
+         max_by(statement_id, spill_tib)      AS worst_statement_id,
+         max_by(executed_by, spill_tib)       AS executed_by
+  FROM spills WHERE wk = 0
+  GROUP BY 1
 )
-SELECT statement_id, start_time, executed_by, source, spill_tib,
-       read_bytes/POW(1024,3)               AS read_gib,
-       total_duration_ms/60000.0            AS mins,
-       {_vs_normal("spill_tib")}
-FROM cur
-ORDER BY {_most_unusual("spill_tib")}
+SELECT source, executed_by, worst_statement_id, statements, spill_tib, read_gib, mins,
+       {_vs_account("spill_tib")}
+FROM contrib CROSS JOIN acct
+ORDER BY spill_tib DESC
 LIMIT 20
 """,
     },
@@ -356,57 +366,55 @@ LIMIT 20
         "id": "H3",
         "category": "idle",
         "title": "Chatter keeps warehouses awake",
-        "eli5": "Finds tools that fire tiny, do-nothing statements around the clock — "
-                "each one resets the auto-stop timer so the warehouse never sleeps.",
-        "what": "“client_application” and “executed_by” name the tool exactly "
-                "— this is configuration, not guesswork. “stmts_per_session near 1” "
-                "means the tool opens a fresh connection for every statement. Each row is one "
-                "client this week, set against its own usual week (the median of its prior four "
-                "weeks); vs_normal is how many times that usual it fired, and that sets the alert. "
-                "A client that suddenly fires several times its normal chatter is the new cause of "
-                "a warehouse that won't sleep.",
+        "eli5": "Checks how many do-nothing statements (ones that read no data) the account fired this "
+                "week against its usual week; each one resets a warehouse's auto-stop timer, so the "
+                "warehouse never sleeps. Then names the tools firing them.",
+        "what": "The number of statements across the account that read no data this week, set against "
+                "its usual week (the median of the prior four weeks). vs_normal is how many times that "
+                "normal this week is, and that sets the alert. Each row is one client with its share of "
+                "that chatter. “client_application” and “executed_by” name the tool exactly: "
+                "this is configuration, not guesswork. “stmts_per_session near 1” means the tool "
+                "opens a fresh connection for every statement.",
         "action": "Fix the tool first — e.g. a BI tool's refresh schedule left at its "
                   "aggressive default, or a monitoring tool that should have its own small "
                   "warehouse. Then move always-on tools onto a small serverless warehouse where "
                   "a short auto-stop is practical.",
         "measure": "M3",
-        "explain_hunt_desc": "chatty clients issuing tiny zero-read statements that keep warehouses awake",
+        "explain_hunt_desc": "the account's zero-read statements this week versus its usual week, and the "
+                             "chatty clients keeping warehouses awake",
         "explain_rubric": (
-            "client_application and executed_by name the tool - it's configuration, not "
-            "guesswork. stmts_per_session near 1 means the client opens a fresh connection per "
-            "statement (pool churn). vs_normal = stmts / baseline, where baseline is the client's "
-            "median week over the prior four weeks (floored at the workspace's 95th-percentile client-week; "
-            "baseline_from says which). A client several times its own normal is the pattern; NULL "
-            "vs_normal = a client first seen this week."
+            "account_value is the number of statements across the account that read no data this week; "
+            "baseline is the median of the prior four weekly totals; vs_normal = account_value / "
+            "baseline (NULL = no prior history). Say first whether the account's chatter is above its "
+            "normal. Each row is one client; share_pct is its share of the chatter. client_application "
+            "and executed_by name the tool - it's configuration, not guesswork. stmts_per_session near 1 "
+            "means the client opens a fresh connection per statement (pool churn)."
         ),
         "sql": f"""
 WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL),
-weekly AS (
-  SELECT compute.warehouse_id, statement_type, executed_by, client_application, client_driver,
-         concat_ws('|', compute.warehouse_id, statement_type, executed_by,
-                   coalesce(client_application, ''), coalesce(client_driver, '')) AS k,
-         floor((unix_timestamp(current_timestamp()) - unix_timestamp(start_time)) / 604800) AS wk,
+chatter AS (
+  SELECT compute.warehouse_id AS warehouse_id, statement_type, executed_by, client_application,
+         client_driver, session_id, {_wk("start_time")} AS wk
+  FROM system.query.history
+  WHERE read_bytes = 0
+    AND start_time >= current_timestamp() - INTERVAL 35 DAYS
+),
+weekly AS (SELECT wk, count(*) AS v FROM chatter WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
+  SELECT warehouse_id, statement_type, executed_by, client_application, client_driver,
          count(*) AS stmts, count(DISTINCT session_id) AS sessions,
          round(count(*)/count(DISTINCT session_id),1) AS stmts_per_session
-  FROM system.query.history
-  WHERE read_bytes = 0 AND total_duration_ms < 30000
-    AND start_time >= current_timestamp() - INTERVAL 35 DAYS
-  GROUP BY 1,2,3,4,5,6,7
-),
-own AS (SELECT k, percentile_approx(stmts, 0.5) AS own_normal FROM weekly WHERE wk BETWEEN 1 AND 4 GROUP BY 1),
-ws AS (SELECT percentile_approx(stmts, 0.95) AS ws_normal FROM weekly WHERE wk BETWEEN 1 AND 4),
-q AS (
-  SELECT c.*, o.own_normal, w.ws_normal
-  FROM weekly c LEFT JOIN own o USING (k) CROSS JOIN ws w
-  WHERE c.wk = 0
+  FROM chatter WHERE wk = 0
+  GROUP BY 1, 2, 3, 4, 5
 )
-SELECT coalesce(wh.warehouse_name, q.warehouse_id) AS warehouse, q.statement_type, q.executed_by,
-       q.client_application, q.client_driver, q.stmts, q.sessions, q.stmts_per_session,
-       coalesce(q.client_application, q.client_driver, 'unknown client') || ' (' || q.executed_by
-         || ') on ' || coalesce(wh.warehouse_name, q.warehouse_id, 'a cluster') AS client,
-       {_vs_normal("stmts")}
-FROM q LEFT JOIN wh ON q.warehouse_id = wh.warehouse_id
-ORDER BY {_most_unusual("stmts")}
+SELECT coalesce(wh.warehouse_name, c.warehouse_id) AS warehouse, c.statement_type, c.executed_by,
+       c.client_application, c.client_driver, c.stmts, c.sessions, c.stmts_per_session,
+       coalesce(c.client_application, c.client_driver, 'unknown client') || ' (' || c.executed_by
+         || ') on ' || coalesce(wh.warehouse_name, c.warehouse_id, 'a cluster') AS client,
+       {_vs_account("c.stmts")}
+FROM contrib c LEFT JOIN wh ON c.warehouse_id = wh.warehouse_id CROSS JOIN acct
+ORDER BY c.stmts DESC
 LIMIT 50
 """,
     },
@@ -575,81 +583,76 @@ LIMIT 50
     {
         "id": "H7",
         "category": "longrun",
-        "title": "Polling every 20 seconds",
-        "eli5": "Finds one identity running the same short query far more often than it usually "
-                "does, typically an orchestrator checking metadata more often than needed.",
-        "what": "Each row is one identity and query source this week, set against its own usual "
-                "week (the median of its prior four weeks). vs_normal is how many times that usual "
-                "it ran, and that sets the alert. A group running several times its normal is a "
-                "CANDIDATE poller, not a verdict — confirm before acting. ‘execution_hours’ is the total "
-                "compute weight. The result names the culprit (a saved query, dashboard, or job) "
-                "even when the SQL text is hidden. When all three are blank the row is labelled "
-                "‘unattributed — confirm before acting’ because unrelated short "
-                "queries can pile into one row.",
+        "title": "Repeated short queries (polling)",
+        "eli5": "Checks how many short queries the account ran this week against its usual week, then "
+                "names the identities and sources behind them, typically an orchestrator checking "
+                "metadata more often than needed.",
+        "what": "“Short” means at or under the account's own typical SELECT duration (the median "
+                "over the prior four weeks), so the definition fits any account. The number of short "
+                "SELECTs across the account this week is set against its usual week (the median of the "
+                "prior four weeks). vs_normal is how many times that normal this week is, and that sets "
+                "the alert. Each row is one identity and query source with its share of those "
+                "queries. A group with a large share is a CANDIDATE poller, not a verdict; confirm "
+                "before acting. ‘execution_hours’ is the total compute weight. The result names the "
+                "culprit (a saved query, dashboard, or job) even when the SQL text is hidden. When all "
+                "three are blank the row is labelled ‘unattributed, confirm before acting’ because "
+                "unrelated short queries can pile into one row.",
         "action": "Go event-driven — use a table-update trigger to run work only when the "
                   "source changes, instead of polling. Or write the freshness marker to a tiny "
                   "one-row table (a single-row read beats a metadata scan). Or simply reduce the "
                   "frequency to what downstream actually needs (minutes, not seconds).",
         "measure": "M3",
-        "explain_hunt_desc": ("one principal running thousands of short SELECTs (candidate polling - "
-                              "unattributed groups need confirmation, do not assert waste)"),
+        "explain_hunt_desc": ("the account's short SELECTs this week versus its usual week, and the "
+                              "identities behind them (candidate polling; unattributed groups need "
+                              "confirmation, do not assert waste)"),
         "explain_rubric": (
-            "vs_normal = execs / baseline, where baseline is the group's median week over the prior "
-            "four weeks (floored at the workspace's 95th-percentile group-week; baseline_from says "
-            "which). A group several times its own normal is a candidate poller, not a verdict - "
-            "confirm before acting; NULL vs_normal = a group first seen this week. p50_exec_ms shows how expensive each poll is; "
-            "execution_hours is the aggregate execution weight (execution only, excluding "
+            "a short SELECT is one at or under the account's median SELECT duration over the prior four "
+            "weeks. account_value is the number of short SELECTs across the account this week; "
+            "baseline is the median of the prior four weekly totals; vs_normal = account_value / "
+            "baseline (NULL = no prior history). Say first whether the account is polling more than its "
+            "normal. Each row is one group; share_pct is its share. A group with a large share is a "
+            "candidate poller, not a verdict - confirm before acting. p50_exec_ms shows how expensive "
+            "each poll is; execution_hours is the aggregate execution weight (execution only, excluding "
             "queue/provisioning). When all query_source IDs are NULL the group is unattributed - "
             "unrelated short SELECTs can collapse into one row, so do not assert it is a poller."
         ),
         "sql": f"""
-WITH polls AS (
+WITH selects AS (
   SELECT executed_by, client_application,
          query_source.sql_query_id            AS sql_query_id,
          query_source.dashboard_id            AS dashboard_id,
          query_source.job_info.job_id         AS job_id,
-         concat_ws('|', executed_by, coalesce(client_application, ''), coalesce(query_source.sql_query_id, ''),
-                   coalesce(query_source.dashboard_id, ''), coalesce(query_source.job_info.job_id, '')) AS k,
-         statement_id, execution_duration_ms, start_time
+         statement_id, execution_duration_ms, total_duration_ms, {_wk("start_time")} AS wk
   FROM system.query.history
-  WHERE statement_type = 'SELECT' AND total_duration_ms < 60000
+  WHERE statement_type = 'SELECT'
     AND start_time >= current_timestamp() - INTERVAL 35 DAYS
 ),
-prior AS (
-  SELECT k, floor((unix_timestamp(current_timestamp()) - unix_timestamp(start_time)) / 604800) AS wk,
-         count(*) AS execs
-  FROM polls WHERE start_time < current_timestamp() - INTERVAL 7 DAYS
-  GROUP BY 1, 2
-),
-own AS (SELECT k, percentile_approx(execs, 0.5) AS own_normal FROM prior GROUP BY 1),
-ws AS (SELECT percentile_approx(execs, 0.95) AS ws_normal FROM prior),
-cur AS (
+typical AS (SELECT percentile_approx(total_duration_ms, 0.5) AS short_ms FROM selects WHERE wk BETWEEN 1 AND 4),
+polls AS (SELECT s.* FROM selects s CROSS JOIN typical t WHERE s.total_duration_ms <= t.short_ms),
+weekly AS (SELECT wk, count(*) AS v FROM polls WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
   SELECT executed_by,
          CASE WHEN executed_by LIKE '%@%' THEN 'human' ELSE 'service_principal' END AS owner_type,
-         client_application, sql_query_id, dashboard_id, job_id, k,
+         client_application, sql_query_id, dashboard_id, job_id,
          count(*)                                       AS execs,
          approx_percentile(execution_duration_ms, 0.5)  AS p50_exec_ms,
          sum(execution_duration_ms)/3600000.0           AS execution_hours,
          any_value(statement_id)                        AS example_statement_id,
          slice(array_agg(statement_id), 1, 3)           AS more_example_ids,
          CASE WHEN coalesce(sql_query_id, dashboard_id, job_id) IS NULL
-              THEN 'unattributed — confirm before acting'
-              ELSE 'candidate — confirm in Query History' END    AS status
-  FROM polls
-  WHERE start_time >= current_timestamp() - INTERVAL 7 DAYS
-  GROUP BY 1, 2, 3, 4, 5, 6, 7
-),
-graded AS (
-  SELECT c.*, o.own_normal, w.ws_normal
-  FROM cur c LEFT JOIN own o USING (k) CROSS JOIN ws w
+              THEN 'unattributed, confirm before acting'
+              ELSE 'candidate, confirm in Query History' END    AS status
+  FROM polls WHERE wk = 0
+  GROUP BY 1, 2, 3, 4, 5, 6
 )
 SELECT executed_by, owner_type, client_application, sql_query_id, dashboard_id, job_id,
        execs, p50_exec_ms, execution_hours, example_statement_id, more_example_ids, status,
        coalesce('query ' || sql_query_id, 'dashboard ' || dashboard_id, 'job ' || job_id,
                 client_application, 'unattributed') || ' (' || executed_by || ')' AS poller,
-       {_vs_normal("execs")}
-FROM graded
-ORDER BY {_most_unusual("execs")}
+       {_vs_account("execs")}
+FROM contrib CROSS JOIN acct
+ORDER BY execs DESC
 LIMIT 50
 """,
     },
@@ -659,57 +662,58 @@ LIMIT 50
         "id": "H8",
         "category": "config",
         "title": "Queue pressure vs capacity",
-        "eli5": "Shows, per warehouse, how long queries waited for capacity next to how long "
-                "they actually ran — the objective signal for right-sizing.",
-        "what": "Each row is one warehouse this week with its queue wait set against its own "
-                "usual week (the median of its prior four weeks that had any queueing). vs_normal "
-                "is how many times that usual it waited, and that sets the alert. "
-                "High queued time relative to execution time means the warehouse is undersized "
-                "or its maximum cluster count is too low for peaks. Near-zero queueing with low "
-                "utilisation means there is room to size DOWN. This is real demand, not perceived "
-                "slowness.",
+        "eli5": "Checks how long the account's queries waited for capacity this week against its usual "
+                "week, then shows which warehouses the waiting happened on, next to how long they "
+                "actually ran: the objective signal for right-sizing.",
+        "what": "The hours statements across the account spent queued for capacity this week, set "
+                "against its usual week (the median of the prior four weeks). vs_normal is how many "
+                "times that normal this week is, and that sets the alert. Each row is one warehouse "
+                "that queued this week, with its share of the account's queue wait. High queued time "
+                "relative to execution time means the warehouse is undersized or its maximum cluster "
+                "count is too low for peaks. Near-zero queueing with low utilisation means there is "
+                "room to size DOWN. This is real demand, not perceived slowness.",
         "action": "Decide warehouse by warehouse, by load shape. Spiky, idle-heavy workloads "
                   "suit serverless (scales in seconds, stops in minutes). Steady, predictable "
                   "load can suit a right-sized classic warehouse with spot and committed-use "
                   "discounts. Keep different workload types on separate warehouses so one noisy "
                   "client can't queue everyone.",
         "measure": "M3",
-        "explain_hunt_desc": "warehouses ranked by queue pressure vs execution time",
+        "explain_hunt_desc": "the account's queue wait this week versus its usual week, and the "
+                             "warehouses it happened on",
         "inventory": True,  # ranks every warehouse — a reference view, not a waste list
         "explain_rubric": (
-            "vs_normal = queued_hours / baseline, where baseline is the warehouse's median queueing "
-            "week over the prior four (floored at the workspace's 95th-percentile queueing warehouse-week; "
-            "baseline_from says which). A warehouse several times its own normal queue has outgrown "
-            "its size; NULL vs_normal = first time it has queued. "
-            "high queued_hours relative to exec_hours means the warehouse is undersized or its "
-            "max cluster count is too low for peaks. Zero queueing with low utilisation (H14 for "
-            "clusters, warehouse monitoring for DBSQL) means there is room to downsize."
+            "account_value is the hours statements across the account waited for capacity this week; "
+            "baseline is the median of the prior four weekly totals; vs_normal = account_value / "
+            "baseline (NULL = no prior queueing). Say first whether the account is queueing more than "
+            "its normal. Each row is one warehouse; share_pct is its share of the queue wait. High "
+            "queued_hours relative to exec_hours means the warehouse is undersized or its max cluster "
+            "count is too low for peaks. Zero queueing with low utilisation (H14 for clusters, "
+            "warehouse monitoring for DBSQL) means there is room to downsize."
         ),
         "sql": f"""
 WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL),
-weekly AS (
-  SELECT compute.warehouse_id,
-         floor((unix_timestamp(current_timestamp()) - unix_timestamp(start_time)) / 604800) AS wk,
-         count_if(waiting_at_capacity_duration_ms > 60000) AS stmts_queued_over_1m,
-         sum(waiting_at_capacity_duration_ms)/3600000.0    AS queued_hours,
-         sum(execution_duration_ms)/3600000.0              AS exec_hours
+stmts AS (
+  SELECT compute.warehouse_id AS warehouse_id, {_wk("start_time")} AS wk,
+         waiting_at_capacity_duration_ms, execution_duration_ms
   FROM system.query.history
   WHERE start_time >= current_timestamp() - INTERVAL 35 DAYS
-  GROUP BY 1, 2
 ),
-prior AS (SELECT * FROM weekly WHERE wk BETWEEN 1 AND 4 AND queued_hours > 0),
-own AS (SELECT warehouse_id, percentile_approx(queued_hours, 0.5) AS own_normal FROM prior GROUP BY 1),
-ws AS (SELECT percentile_approx(queued_hours, 0.95) AS ws_normal FROM prior),
-q AS (
-  SELECT c.*, o.own_normal, w.ws_normal
-  FROM weekly c LEFT JOIN own o ON c.warehouse_id <=> o.warehouse_id CROSS JOIN ws w
-  WHERE c.wk = 0
+weekly AS (SELECT wk, sum(waiting_at_capacity_duration_ms)/3600000.0 AS v FROM stmts WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
+  SELECT warehouse_id,
+         count_if(waiting_at_capacity_duration_ms > 0)  AS stmts_queued,
+         sum(waiting_at_capacity_duration_ms)/3600000.0 AS queued_hours,
+         sum(execution_duration_ms)/3600000.0           AS exec_hours
+  FROM stmts WHERE wk = 0
+  GROUP BY 1
+  HAVING sum(waiting_at_capacity_duration_ms) > 0
 )
-SELECT coalesce(wh.warehouse_name, q.warehouse_id) AS warehouse,
-       q.stmts_queued_over_1m, q.queued_hours, q.exec_hours,
-       {_vs_normal("queued_hours")}
-FROM q LEFT JOIN wh ON q.warehouse_id = wh.warehouse_id
-ORDER BY {_most_unusual("queued_hours")}, queued_hours DESC
+SELECT coalesce(wh.warehouse_name, c.warehouse_id, 'no warehouse') AS warehouse,
+       c.stmts_queued, c.queued_hours, c.exec_hours,
+       {_vs_account("c.queued_hours")}
+FROM contrib c LEFT JOIN wh ON c.warehouse_id = wh.warehouse_id CROSS JOIN acct
+ORDER BY c.queued_hours DESC
 """,
     },
 
@@ -1890,26 +1894,23 @@ ALERT_SPECS: dict[str, AlertSpec] = {
            "summary": "Account used {account} AI tokens in its busiest hour this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of AI token use yet ({account} tokens in its busiest hour this week).",
            "usd_col": None},
-    "H1": {"kind": "anomaly", "entity_col": "merge_target", "metric_col": "read_tib",
-           "metric_label": "Heaviest MERGE run this week", "unit": "tib",
-           "baseline": "median read of the same MERGE target's runs over the prior 28 days, "
-                       "floored at the workspace's 95th-percentile MERGE",
-           "summary": "{entity}: a MERGE read {x} its usual ({metric}, normal ~{baseline} per run).",
-           "new_summary": "NEW: MERGE into {entity} first seen this window ({metric} read).",
+    "H1": {"kind": "anomaly", "aggregate": "additive", "entity_col": "merge_target", "metric_col": "read_tib",
+           "metric_label": "Account MERGE reads this week", "unit": "tib",
+           "baseline": "median of the account's prior four weekly MERGE read totals",
+           "summary": "Account's MERGE statements read {account} this week, {x} its usual (normal ~{baseline}).",
+           "new_summary": "Account has no prior history of MERGE reads yet ({account} this week).",
            "usd_col": None},
-    "H2": {"kind": "anomaly", "entity_col": "source", "metric_col": "spill_tib",
-           "metric_label": "Worst spill this week", "unit": "tib",
-           "baseline": "median spill per spilling statement from the same source over the prior "
-                       "28 days, floored at the workspace median",
-           "summary": "{entity}: a statement spilled {x} its usual ({metric}, normal ~{baseline}).",
-           "new_summary": "NEW: {entity} first seen spilling this window ({metric}).",
+    "H2": {"kind": "anomaly", "aggregate": "additive", "entity_col": "source", "metric_col": "spill_tib",
+           "metric_label": "Account disk spill this week", "unit": "tib",
+           "baseline": "median of the account's prior four weekly spill totals",
+           "summary": "Account spilled {account} to disk this week, {x} its usual (normal ~{baseline}).",
+           "new_summary": "Account has no prior history of disk spill yet ({account} this week).",
            "usd_col": None},
-    "H3": {"kind": "anomaly", "entity_col": "client", "metric_col": "stmts",
-           "metric_label": "Tiny statements this week", "unit": "count",
-           "baseline": "median of the client's prior four weeks, floored at the workspace's "
-                       "95th-percentile client-week",
-           "summary": "{entity}: {x} its usual tiny statements ({metric} this week, normal ~{baseline}/week).",
-           "new_summary": "NEW: {entity} first seen this window ({metric} tiny statements this week).",
+    "H3": {"kind": "anomaly", "aggregate": "additive", "entity_col": "client", "metric_col": "stmts",
+           "metric_label": "Account zero-read statements this week", "unit": "count",
+           "baseline": "median of the account's prior four weekly totals",
+           "summary": "Account fired {account} statements that read no data this week, {x} its usual (normal ~{baseline}).",
+           "new_summary": "Account has no prior history of zero-read statements yet ({account} this week).",
            "usd_col": None},
     "H5": {"kind": "anomaly", "aggregate": "peak", "entity_col": "source", "metric_col": "total_min",
            "metric_label": "Account's longest statement this week", "unit": "minutes",
@@ -1923,19 +1924,18 @@ ALERT_SPECS: dict[str, AlertSpec] = {
            "summary": "Account scanned {account} in its busiest hour this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of SELECT scans yet ({account} in its busiest hour this week).",
            "usd_col": None},
-    "H7": {"kind": "anomaly", "entity_col": "poller", "metric_col": "execs",
-           "metric_label": "Short SELECTs this week", "unit": "count",
-           "baseline": "median of the group's prior four weeks, floored at the workspace's "
-                       "95th-percentile group-week",
-           "summary": "{entity}: {x} its usual short queries ({metric} this week, normal ~{baseline}/week).",
-           "new_summary": "NEW: {entity} first seen polling this window ({metric} short queries this week).",
+    "H7": {"kind": "anomaly", "aggregate": "additive", "entity_col": "poller", "metric_col": "execs",
+           "metric_label": "Account short SELECTs this week", "unit": "count",
+           "baseline": "median of the account's prior four weekly totals of SELECTs at or under its "
+                       "median SELECT duration",
+           "summary": "Account ran {account} short queries this week, {x} its usual (normal ~{baseline}).",
+           "new_summary": "Account has no prior history of short queries yet ({account} this week).",
            "usd_col": None},
-    "H8": {"kind": "anomaly", "entity_col": "warehouse", "metric_col": "queued_hours",
-           "metric_label": "Queue wait this week", "unit": "hours",
-           "baseline": "median of the warehouse's prior four weeks that had any queueing, floored "
-                       "at the workspace's 95th-percentile queueing warehouse-week",
-           "summary": "{entity}: queued {x} its usual ({metric} waiting this week, normal ~{baseline}/week).",
-           "new_summary": "NEW: {entity} started queueing this window ({metric} waiting this week).",
+    "H8": {"kind": "anomaly", "aggregate": "additive", "entity_col": "warehouse", "metric_col": "queued_hours",
+           "metric_label": "Account queue wait this week", "unit": "hours",
+           "baseline": "median of the account's prior four weekly queue-wait totals",
+           "summary": "Account's statements waited {account} for capacity this week, {x} its usual (normal ~{baseline}).",
+           "new_summary": "Account has no prior history of queueing yet ({account} waiting this week).",
            "usd_col": None},
     # ── H16–H20 (Aug 2026 thread additions) ──
     "H16": {"kind": "anomaly", "entity_col": "job_name", "metric_col": "run_count",
