@@ -526,6 +526,8 @@
   .tok-calc-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px; }
   .tok-calc-head h3 { font-size: 18px; font-weight: 720; }
   .tok-date { font-size: 11.5px; color: var(--muted-2); }
+  .tok-priced { font-size: 12.5px; color: var(--muted); margin: -6px 0 16px; }
+  .tok-priced a, #tokRatecardSource a { color: var(--info); }
   .tok-controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px 18px; margin-bottom: 20px; }
   .tok-field { display: flex; flex-direction: column; gap: 5px; }
   .tok-field label { font-size: 12px; font-weight: 600; color: var(--muted); }
@@ -817,6 +819,7 @@
         <h3>Live calculator</h3>
         <div class="tok-date" id="tokDate"></div>
       </div>
+      <div class="tok-priced" id="tokPriced"></div>
       <div class="tok-controls" id="tokControls"></div>
       <div class="tok-result" id="tokResult"></div>
     </div>
@@ -825,9 +828,9 @@
     <div class="page-intro" style="margin-top:30px;">
       <div class="eyebrow">Model choice is the biggest lever</div>
       <h2 style="font-size:20px;">Every model, same task</h2>
-      <p>Your task size from the calculator, priced on each model. FMAPI models share the
-         tokens→DBU→$ mechanic so ranking them is fair — but read the notes: the external model bills
-         differently, and GLM is cross-geo. A lower sticker isn't always a like-for-like swap.</p>
+      <p>Your task size from the calculator, priced on each model this workspace serves, cheapest
+         first. Every one bills tokens→DBU→$, so ranking them is fair. Read the notes: a ⌖ model costs
+         10% more with data residency on, and some rates are promotions with an end date.</p>
     </div>
     <div class="card" style="padding:18px 20px;"><div id="tokCompare"></div></div>
 
@@ -840,18 +843,17 @@
     </div>
     <div class="card" style="padding:18px 20px;"><div id="tokTasks"></div></div>
 
-    <!-- Rate card + live verify -->
+    <!-- Rate card -->
     <div class="page-intro" style="margin-top:30px;">
       <div class="eyebrow">The reference data</div>
       <h2 style="font-size:20px;">Rate card</h2>
-      <p>Each model's published DBU-per-1M-token rates, shown as familiar $/1M tokens
-         (<span class="mono">$/1M = DBU/1M × $/DBU</span>). Confirm the $/DBU against this workspace's
-         live prices with the button.</p>
+      <p>Each model's published DBU-per-1M-token rate, shown as $/1M tokens at the list $/DBU of the
+         SKU it bills on this workspace (<span class="mono">$/1M = DBU/1M × $/DBU</span>).</p>
     </div>
     <div class="card" style="padding:18px 20px;">
+      <div class="rowcount" id="tokRatecardSource" style="margin:0 0 10px;"></div>
       <div id="tokRatecard"></div>
-      <button class="btn primary" id="tokVerifyBtn" style="margin-top:14px;">Verify $/DBU on this workspace</button>
-      <div id="tokVerify" style="margin-top:14px;"></div>
+      <ul class="tok-caveats" id="tokRatecardNotes"></ul>
     </div>
 
     <!-- Tie to actuals -->
@@ -889,14 +891,17 @@
     <div class="page-intro" style="margin-top:30px;">
       <div class="eyebrow">For cost attribution</div>
       <h2 style="font-size:20px;">Which bill line each model lands on</h2>
+      <p>The SKU each model family bills on this workspace and its list $/DBU, read from this
+         workspace's own billing. These are the SKUs to filter on in <span class="mono">system.billing.usage</span>.</p>
     </div>
     <div class="card" style="padding:18px 20px;"><div id="tokSkuMap"></div></div>
 
     <div class="callout" style="margin-top:24px;background:rgba(255,192,67,.06);border-color:rgba(255,192,67,.2);">
-      <b>Read every figure as list price.</b> DBU rates and $/DBU are official (GCP Enterprise); the
-      <b>tokens-per-task</b> presets are illustrative industry norms, not measured real-world usage.
-      Output tokens cost 3–6× input, so capping response length is an easy win. Confirm your contracted
-      rate with your account team — the discount control models any negotiated number.
+      <b>Read every figure as list price.</b> DBU rates come from Databricks' published pricing pages and
+      $/DBU from this workspace's list prices. The <b>tokens-per-task</b> presets are illustrative
+      industry norms, not measured real-world usage. Output tokens cost several times input, so capping
+      response length is an easy win. Confirm your contracted rate with your account team; the discount
+      control models any negotiated number.
     </div>
   </section>
 </main>
@@ -1825,26 +1830,38 @@ async function loadSelfCost() {
 }
 
 // ── Tokenomics ─────────────────────────────────────────────────────────────
-let TOK = null;                 // the tokenomics meta block
-function modelByName(n) { return TOK.models.find(m => m.name === n); }
+let TOK = null;                 // the tokenomics meta block: the rate card and the copy
+let TOK_PRICES = null;          // this workspace's $ per DBU per SKU, from /api/token/prices
+let tokPricesAsked = false;
+function rateById(id) { return TOK.card.models.find(m => m.id === id); }
 
-// Cost of ONE task — mirrors the notebook's cost_per_task() exactly.
-function tokCost(model, inTok, outTok, cacheHit, discount) {
-  const m = modelByName(model);
+// The calculator's models: those this workspace serves, at their published rate and under
+// their display name. When the model listing failed, the whole rate card.
+function tokModels() {
+  if (MODELS.error || !(MODELS.models || []).length) return TOK.card.models;
+  return MODELS.models.filter(m => rateById(m.id)).map(m => ({ ...rateById(m.id), name: m.name, group: m.group }));
+}
+function tokUnpricedServed() {
+  return MODELS.error ? [] : (MODELS.models || []).filter(m => !rateById(m.id));
+}
+// The SKU a model bills on this workspace and its list $ per DBU, or why it has none.
+function tokSku(m) {
+  if (!TOK_PRICES) return { why: "this workspace's prices haven't loaded" };
+  if (TOK_PRICES.error) return { why: TOK_PRICES.error };
+  return (TOK_PRICES.endpoints || {})[m.id] || (TOK_PRICES.families || {})[m.sku_family]
+    || { why: (TOK_PRICES.missing || {})[m.sku_family] || "no $ per DBU for its SKU" };
+}
+
+// Cost of ONE task, as the notebook's cost_per_task() computes it.
+function tokCost(m, inTok, outTok, cacheHit, discount) {
   const cachedIn = inTok * cacheHit, freshIn = inTok - cachedIn;
-  if (m.basis === "external") {
-    const cacheR = m.usd_cache_read ?? m.usd_in;
-    const ic = (freshIn/1e6)*m.usd_in + (cachedIn/1e6)*cacheR;
-    const oc = (outTok/1e6)*m.usd_out;
-    return { basis:m.basis, dbu:null, input_cost:ic, output_cost:oc, total:ic+oc };
-  }
-  const ud = TOK.usd_per_dbu[m.basis];
   const cacheRate = m.dbu_cache_read ?? m.dbu_in;
   const inDbu = (freshIn/1e6)*m.dbu_in + (cachedIn/1e6)*cacheRate;
   const outDbu = (outTok/1e6)*m.dbu_out;
-  const ic = inDbu*ud*(1-discount), oc = outDbu*ud*(1-discount);
-  return { basis:m.basis, dbu:inDbu+outDbu, input_dbu:inDbu, output_dbu:outDbu,
-           input_cost:ic, output_cost:oc, total:ic+oc, usd_per_dbu:ud };
+  const sku = tokSku(m), ud = sku.usd_per_dbu, priced = typeof ud === "number";
+  const ic = priced ? inDbu*ud*(1-discount) : null, oc = priced ? outDbu*ud*(1-discount) : null;
+  return { dbu:inDbu+outDbu, input_dbu:inDbu, output_dbu:outDbu, sku,
+           input_cost:ic, output_cost:oc, total: priced ? ic+oc : null, usd_per_dbu: priced ? ud : null };
 }
 function tokFmt(x) {
   if (x === null || x === undefined || isNaN(x)) return "—";
@@ -1852,22 +1869,35 @@ function tokFmt(x) {
   if (x >= 0.01) return "$" + x.toFixed(4);
   return "$" + x.toFixed(6);
 }
-function tokBasisNote(m) {
-  return m.note || "";
+function tokNote(m) {
+  const n = [];
+  if (m.residency_uplift) n.push("⌖ +10% with data residency");
+  if (m.page_row.includes("*")) n.push("* promotion, see the rate card notes");
+  return n.join(" · ");
+}
+function tokModelOptions(selected) {
+  const ms = tokModels();
+  const groups = MODELS.error ? { all: "Rate card" } : (MODELS.groups || {});
+  return Object.entries(groups).map(([g, label]) => {
+    const opts = ms.filter(m => MODELS.error || m.group === g).map(m =>
+      `<option value="${escapeHtml(m.id)}" ${m.id===selected?"selected":""}>${escapeHtml(m.name)}</option>`).join("");
+    return opts ? `<optgroup label="${escapeHtml(label)}">${opts}</optgroup>` : "";
+  }).join("");
 }
 
 function buildTokenomics() {
   TOK = META.tokenomics;
-  $("#tokDate").textContent = `GCP Enterprise · list price · rates as of ${TOK.pricing_date}`;
+  $("#tokDate").textContent = `Published rates retrieved ${TOK.card.retrieved} · list price`;
+  $("#tokPriced").textContent = "Open this tab to price the models for this workspace's cloud and region.";
   // takeaways
   $("#tokTakeaways").innerHTML = "<b>If you read nothing else</b><ul style='margin:8px 0 0 18px;'>" +
     TOK.takeaways.map(t=>`<li style='margin:4px 0;'>${t}</li>`).join("") + "</ul>";
 
   // controls
-  const modelOpts = TOK.models.map(m=>`<option value="${m.name}">${m.name}</option>`).join("");
+  const first = tokModels().some(m => m.id === chosenModel) ? chosenModel : (tokModels()[0] || {}).id;
   $("#tokControls").innerHTML = `
     <div class="tok-field"><label for="tkModel">Model</label>
-      <select id="tkModel">${modelOpts}</select></div>
+      <select id="tkModel">${tokModelOptions(first)}</select></div>
     <div class="tok-field"><label for="tkIn">Input tokens / task</label>
       <input id="tkIn" type="number" value="5000" min="0"></div>
     <div class="tok-field"><label for="tkOut">Output tokens / task</label>
@@ -1880,7 +1910,6 @@ function buildTokenomics() {
     <div class="tok-field"><label for="tkDisc">Discount % off list</label>
       <input id="tkDisc" type="number" value="0" min="0" max="100">
       <span class="hint">Model your contracted rate</span></div>`;
-  $("#tkModel").value = "Claude Sonnet 4.5";
   ["tkModel","tkIn","tkOut","tkTpd","tkCache","tkDisc"].forEach(id =>
     $("#"+id).addEventListener("input", tokRecalc));
 
@@ -1889,103 +1918,124 @@ function buildTokenomics() {
   buildTokCache();
   buildTokGateway();
   buildTokSkuMap();
-  // wire live-SQL buttons
-  $("#tokVerifyBtn").addEventListener("click", tokVerifyRates);
   $("#tokActualsBtn").addEventListener("click", tokActuals);
+  // This workspace's prices read billing, so they load on the first visit to the tab.
+  $('#nav button[data-page="tokenomics"]').addEventListener("click", loadTokPrices);
 
   tokRecalc();
 }
 
+async function loadTokPrices() {
+  if (tokPricesAsked) return;
+  tokPricesAsked = true;
+  $("#tokPriced").innerHTML = '<span class="spin"></span> Reading this workspace\'s billing for its cloud, region and SKU prices…';
+  try {
+    const d = await (await fetch("/api/token/prices")).json();
+    if (d.detail) throw new Error(d.detail);
+    TOK_PRICES = d;
+  } catch(e) { TOK_PRICES = { error: e.message }; }
+  renderTokPriced();
+  buildTokRatecard();
+  buildTokSkuMap();
+  tokRecalc();
+}
+
+function renderTokPriced() {
+  const p = TOK_PRICES, box = $("#tokPriced");
+  if (p.error) {
+    box.innerHTML = `<span style="color:var(--coral)">✕ Couldn't read this workspace's prices: ${escapeHtml(p.error)}</span> DBUs are shown without $.`;
+  } else if (!p.cloud) {
+    box.innerHTML = `No $ per DBU: ${escapeHtml(Object.values(p.missing || {})[0] || "no billing rows")}. DBUs are shown without $.`;
+  } else {
+    box.innerHTML = `Priced for <b>${escapeHtml(p.cloud)}</b> · region <b>${escapeHtml(p.region || "not in billing")}</b> · `
+      + `<b>${escapeHtml(p.tier)}</b> tier, read from this workspace's own billing (workspace ${escapeHtml(p.workspace_id)}). `
+      + `Each model's SKU and $/DBU are under <a href="#tokSkuMap">Which bill line each model lands on</a>.`;
+  }
+}
+
 function tokRecalc() {
-  const model = $("#tkModel").value;
+  const models = tokModels();
+  const m = models.find(x => x.id === $("#tkModel").value) || models[0];
   const inTok = +$("#tkIn").value || 0, outTok = +$("#tkOut").value || 0;
   const tpd = +$("#tkTpd").value || 0;
   const cache = Math.min(100,Math.max(0,+$("#tkCache").value||0))/100;
   const disc = Math.min(100,Math.max(0,+$("#tkDisc").value||0))/100;
-  const m = modelByName(model);
-  const c = tokCost(model, inTok, outTok, cache, disc);
-  const perDay = c.total * tpd, perMonth = perDay * 30;
-
-  // headline stats
-  let flow;
-  if (c.dbu !== null) {
-    flow = `
+  const c = tokCost(m, inTok, outTok, cache, disc);
+  const perDay = c.total === null ? null : c.total * tpd, perMonth = perDay === null ? null : perDay * 30;
+  const perDbu = c.usd_per_dbu === null
+    ? `<div class="v">not priced</div>`
+    : `<div class="v">$${c.usd_per_dbu.toFixed(3)}<small>/DBU</small></div>`;
+  const flow = `
       <div class="tok-flow">
         <div class="tok-flow-step"><div class="k">One task</div><div class="v">${(inTok).toLocaleString()} <small>in</small> + ${(outTok).toLocaleString()} <small>out</small></div><span class="arr">→</span></div>
         <div class="tok-flow-step"><div class="k">Tokens → DBUs</div><div class="v">${c.dbu.toFixed(4)} <small>DBU</small></div><span class="arr">→</span></div>
-        <div class="tok-flow-step"><div class="k">× $/DBU</div><div class="v">$${c.usd_per_dbu.toFixed(3)}<small>/DBU</small></div><span class="arr">→</span></div>
+        <div class="tok-flow-step"><div class="k">× $/DBU</div>${perDbu}<span class="arr">→</span></div>
         <div class="tok-flow-step"><div class="k">Cost / task</div><div class="v tok-hi">${tokFmt(c.total)}</div></div>
       </div>`;
-  } else {
-    flow = `<div class="tok-note">External model — the vendor bills tokens in dollars directly (no DBUs, Databricks discount doesn't apply).</div>`;
-  }
-  const noteRow = tokBasisNote(m) ? `<div class="tok-note">Note: ${tokBasisNote(m)}</div>` : "";
+  const notes = [c.sku.sku ? `Bills as <span class="mono">${escapeHtml(c.sku.sku)}</span> on this workspace.` : `Not priced: ${escapeHtml(c.sku.why)}.`,
+                 tokNote(m)].filter(Boolean).join(" ");
   $("#tokResult").innerHTML = `
     <div class="tok-headline">
       <div class="tok-stat hero"><div class="lbl">Cost / task</div><div class="val">${tokFmt(c.total)}</div>
         <div class="sub">input ${tokFmt(c.input_cost)} + output ${tokFmt(c.output_cost)}</div></div>
-      <div class="tok-stat"><div class="lbl">Cost / 1,000 tasks</div><div class="val">${tokFmt(c.total*1000)}</div></div>
+      <div class="tok-stat"><div class="lbl">Cost / 1,000 tasks</div><div class="val">${tokFmt(c.total === null ? null : c.total*1000)}</div></div>
       <div class="tok-stat"><div class="lbl">Cost / day</div><div class="val">${tokFmt(perDay)}</div><div class="sub">at ${tpd.toLocaleString()} tasks/day</div></div>
       <div class="tok-stat"><div class="lbl">Cost / month</div><div class="val">${tokFmt(perMonth)}</div><div class="sub">30 days</div></div>
     </div>
     ${flow}
-    ${noteRow}`;
+    <div class="tok-note">${notes}</div>`;
   buildTokCompare(inTok, outTok, tpd, cache, disc);
-  buildTokTasks(model, tpd, cache, disc);
+  buildTokTasks(m, tpd, cache, disc);
 }
 
 function buildTokCompare(inTok, outTok, tpd, cache, disc) {
-  const rows = TOK.models.map(m => {
-    const c = tokCost(m.name, inTok, outTok, cache, disc);
-    return { name:m.name, family:m.family, basis:m.basis, note:tokBasisNote(m),
-             task:c.total, day:c.total*tpd, month:c.total*tpd*30 };
-  });
-  const fmapi = rows.filter(r=>r.basis!=="external").sort((a,b)=>a.task-b.task);
-  const ext = rows.filter(r=>r.basis==="external");
-  const cheapest = fmapi.length ? fmapi[0].task : 0;
-  const cols = ["Model","Family","$/task","$/day","$/month","× vs cheapest","Notes"];
-  const body = fmapi.map(r=>[
-    r.name, r.family, tokFmt(r.task), tokFmt(r.day), tokFmt(r.month),
-    cheapest? (r.task/cheapest).toFixed(1)+"×" : "—", r.note||""
-  ]);
-  let html = simpleTable(cols, body, {numCols:[2,3,4,5]});
-  if (fmapi.length>1) {
-    const most = fmapi[fmapi.length-1];
-    html += `<div class="rowcount">Within FMAPI, <b>${most.name}</b> costs <b>${(most.task/cheapest).toFixed(1)}×</b> more than <b>${fmapi[0].name}</b> for the identical task.</div>`;
+  if (!TOK_PRICES) { $("#tokCompare").innerHTML = `<div class="rowcount">${escapeHtml($("#tokPriced").textContent)}</div>`; return; }
+  const rows = tokModels().map(m => ({ m, c: tokCost(m, inTok, outTok, cache, disc) }));
+  const priced = rows.filter(r => r.c.total !== null).sort((a,b) => a.c.total - b.c.total);
+  const cheapest = priced.length ? priced[0].c.total : 0;
+  const body = priced.map(({m, c}) => [escapeHtml(m.name), tokFmt(c.total), tokFmt(c.total*tpd), tokFmt(c.total*tpd*30),
+    cheapest ? (c.total/cheapest).toFixed(1)+"×" : "—", tokNote(m)]);
+  let html = simpleTable(["Model","$/task","$/day","$/month","× vs cheapest","Notes"], body, {numCols:[1,2,3,4]});
+  if (priced.length > 1) {
+    const most = priced[priced.length-1];
+    html += `<div class="rowcount"><b>${escapeHtml(most.m.name)}</b> costs <b>${(most.c.total/cheapest).toFixed(0)}×</b> more than <b>${escapeHtml(priced[0].m.name)}</b> for the identical task.</div>`;
   }
-  if (ext.length) {
-    html += `<div style="margin-top:16px;"></div>`;
-    html += simpleTable(["Model","Family","$/task","$/day","$/month","Notes"],
-      ext.map(r=>[r.name,r.family,tokFmt(r.task),tokFmt(r.day),tokFmt(r.month),r.note||""]),
-      {numCols:[2,3,4], caption:"External — shown separately (different billing basis; not a like-for-like swap)"});
-  }
+  const notPriced = rows.filter(r => r.c.total === null).map(r => r.m.name).concat(tokUnpricedServed().map(m => m.name));
+  if (notPriced.length) html += `<div class="rowcount">Not priced here: ${notPriced.map(escapeHtml).join(", ")}.</div>`;
   $("#tokCompare").innerHTML = html;
 }
 
-function buildTokTasks(model, tpd, cache, disc) {
+function buildTokTasks(m, tpd, cache, disc) {
   const rows = TOK.tasks.map(t => {
-    const c = tokCost(model, t.in, t.out, cache, disc);
+    const c = tokCost(m, t.in, t.out, cache, disc);
     const tot = t.in + t.out;
     const size = tot<1500?"XS":tot<4000?"S":tot<8000?"M":tot<30000?"L":"XL";
     return [t.name, size, `${t.in.toLocaleString()} / ${t.out.toLocaleString()}`,
-            tokFmt(c.total), tokFmt(c.total*tpd*30), t.note];
+            tokFmt(c.total), tokFmt(c.total === null ? null : c.total*tpd*30), t.note];
   });
   $("#tokTasks").innerHTML = simpleTable(
     ["Task type","Size","In / Out tokens","$/task",`$/month @ ${tpd.toLocaleString()}/day`,"What it is"],
-    rows, {numCols:[3,4], caption:`Priced on ${model} · ${tpd.toLocaleString()} tasks/day (illustrative token counts)`});
+    rows, {numCols:[3,4], caption:`Priced on ${escapeHtml(m.name)} · ${tpd.toLocaleString()} tasks/day (illustrative token counts)`});
 }
 
 function buildTokRatecard() {
-  const rows = TOK.models.map(m => {
-    if (m.basis === "external")
-      return [m.name, m.family, TOK.basis_label[m.basis], tokFmt(m.usd_in), tokFmt(m.usd_out), "—", "—"];
-    const r = TOK.usd_per_dbu[m.basis];
-    return [m.name, m.family, TOK.basis_label[m.basis], tokFmt(m.dbu_in*r), tokFmt(m.dbu_out*r),
-            m.dbu_in.toFixed(3), m.dbu_out.toFixed(3)];
-  });
+  const src = TOK.card.sources;
+  $("#tokRatecardSource").innerHTML = `Source: Databricks pricing pages for `
+    + `<a href="${src.proprietary}" target="_blank" rel="noopener">proprietary</a> and `
+    + `<a href="${src.open}" target="_blank" rel="noopener">open</a> foundation models, retrieved ${TOK.card.retrieved}. `
+    + escapeHtml(TOK.card.basis);
+  const dbu = x => x === null || x === undefined ? "—" : x.toFixed(3);
+  const rows = tokModels().map(m => {
+    const s = tokSku(m), r = s.usd_per_dbu;
+    return [escapeHtml(m.name), tokFmt(r === undefined ? null : m.dbu_in*r), tokFmt(r === undefined ? null : m.dbu_out*r),
+            dbu(m.dbu_in), dbu(m.dbu_out), dbu(m.dbu_cache_read),
+            s.sku ? `<span class="mono">${escapeHtml(s.sku)}</span>` : `not priced: ${escapeHtml(s.why)}`, tokNote(m)];
+  }).concat(tokUnpricedServed().map(m =>
+    [escapeHtml(m.name), "—", "—", "—", "—", "—", "not priced: no published pay-per-token rate", ""]));
   $("#tokRatecard").innerHTML = simpleTable(
-    ["Model","Family","Billing basis","$/1M input","$/1M output","DBU/1M in","DBU/1M out"],
-    rows, {numCols:[3,4,5,6]});
+    ["Model","$/1M input","$/1M output","DBU/1M in","DBU/1M out","DBU/1M cache read","SKU on this workspace","Notes"],
+    rows, {numCols:[1,2,3,4,5], html:[6]});
+  $("#tokRatecardNotes").innerHTML = TOK.card.notes.map(n => `<li>${escapeHtml(n)}</li>`).join("");
 }
 
 function buildTokCache() {
@@ -2001,9 +2051,17 @@ function buildTokGateway() {
 }
 
 function buildTokSkuMap() {
+  const p = TOK_PRICES || {}, models = tokModels();
+  const rows = Object.entries(TOK.family_label).map(([f, label]) => {
+    const s = (p.families || {})[f];
+    const price = s ? "$" + s.usd_per_dbu.toFixed(3)
+      : !TOK_PRICES ? "not loaded yet" : `not priced: ${escapeHtml((p.missing || {})[f] || p.error || "")}`;
+    return [escapeHtml(label), price, models.filter(m => m.sku_family === f).length,
+            s ? (s.billed ? "billed here" : "named from tier and region") : "",
+            s ? `<span class="mono">${escapeHtml(s.sku)}</span>` : "—"];
+  });
   $("#tokSkuMap").innerHTML = simpleTable(
-    ["Model family","Billing SKU (sku_name contains)","$/DBU — Singapore workspace"],
-    TOK.sku_map.map(s=>[s.family, `<span class="mono">${s.sku}</span>`, s.usd_dbu]), {html:[1]});
+    ["Model family","List $/DBU","Models here","How it was found","SKU on this workspace"], rows, {html:[1,4], numCols:[2]});
 }
 
 // small table builder for tokenomics (client-side data, no truncation needed)
@@ -2024,21 +2082,6 @@ function simpleTable(cols, rows, opts) {
     h += "</tr>";
   });
   return h + "</tbody></table></div>";
-}
-
-async function tokVerifyRates() {
-  const btn = $("#tokVerifyBtn"), box = $("#tokVerify");
-  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Reading list_prices…';
-  box.innerHTML = "";
-  try {
-    const d = await (await fetch("/api/token/verify-rates")).json();
-    if (d.detail) throw new Error(d.detail);
-    if (!d.rows || !d.rows.length) { box.innerHTML = `<div class="rowcount">No model-serving SKUs found on this workspace (likely not GCP, or not provisioned). The rate card above stays the reference.</div>`; }
-    else { box.appendChild(renderTable(d.columns, d.rows, d.total_rows));
-      const n=document.createElement("div"); n.className="rowcount";
-      n.innerHTML="Live $/DBU on this workspace — compare to the rate card (~$0.070 proprietary / ~$0.088 SG open). Any difference → the rate card needs an update."; box.appendChild(n); }
-  } catch(e){ box.innerHTML = `<div class="result-status err">✕ ${e.message}</div>`; }
-  btn.disabled = false; btn.textContent = "Verify $/DBU on this workspace";
 }
 
 async function tokActuals() {

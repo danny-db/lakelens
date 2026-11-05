@@ -44,6 +44,7 @@ import tagging as tagging_content
 import boards as boards_content
 import genie_cost
 import models as chat_catalogue
+import pricing
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -79,6 +80,8 @@ HOST = os.getenv("DATABRICKS_HOST", "")
 # The Databricks Apps runtime sets DATABRICKS_APP_NAME. There, a request without a
 # user token must not fall back to the app's own service principal.
 IN_APPS_RUNTIME = bool(os.getenv("DATABRICKS_APP_NAME"))
+# The Apps runtime sets the workspace id; locally it is read once from the ambient client.
+WORKSPACE_ID = os.getenv("DATABRICKS_WORKSPACE_ID", "")
 
 
 def _normalize_host(h: Optional[str]) -> str:
@@ -944,29 +947,27 @@ def finding_triage(hunt_id: str, body: TriageUpdate, request: Request):
             "store_error": None if persisted else DELTA.last_error}
 
 
-# ── API: Tokenomics live SQL (verify rates + tie to actual spend) ────────────
+# ── API: Tokenomics live SQL (this workspace's prices + actual spend) ────────
 
-@app.get("/api/token/verify-rates")
-def token_verify_rates(request: Request):
-    """Read the model-serving $/DBU rates actually in effect on this workspace,
-    so the rate card can be confirmed against system.billing.list_prices."""
-    sql = """
-        SELECT sku_name,
-               round(pricing.default, 4)                AS usd_per_dbu_list,
-               round(pricing.effective_list.default, 4) AS usd_per_dbu_effective
-        FROM system.billing.list_prices
-        WHERE (sku_name ILIKE '%MODEL_SERVING%' OR sku_name ILIKE '%REAL_TIME_INFERENCE%')
-          AND price_end_time IS NULL
-        ORDER BY sku_name
-    """
-    try:
-        out = _run_sql(sql, _client_for(request))
-        return {"columns": out["columns"], "rows": out["rows"], "total_rows": out["total_rows"]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"verify-rates failed: {e}")
-        raise HTTPException(500, f"verify-rates failed: {e}")
+def _workspace_prices(client: WorkspaceClient) -> pricing.Prices:
+    """What each model's SKU costs per DBU on this workspace, from its own billing."""
+    global WORKSPACE_ID
+    if not WORKSPACE_ID:
+        try:
+            WORKSPACE_ID = str(sp_client.get_workspace_id())
+        except DatabricksError as e:
+            raise HTTPException(502, f"Couldn't read this workspace's id: {_sdk_message(e)}")
+    out = _run_sql(pricing.PRICES_SQL, client, max_rows=None,
+                   params=[{"name": "workspace_id", "value": WORKSPACE_ID}])
+    return pricing.workspace_prices(out["rows"])
+
+
+@app.get("/api/token/prices")
+def token_prices(request: Request):
+    """The cloud, tier and region this workspace bills in, and the $ per DBU of each model SKU,
+    for the Tokenomics calculator and rate card."""
+    prices = _workspace_prices(_client_for(request))
+    return {"workspace_id": WORKSPACE_ID, **pricing.as_json(prices)}
 
 
 @app.get("/api/token/actuals")

@@ -1,63 +1,24 @@
 """
-tokenomics.py — the "Tokenomics" tab content: how an AI task's cost is built.
+The "Tokenomics" tab content: how an AI task's cost is built.
 
-Ported VERBATIM (rates + presets + explainers) from an internal token cost-estimator
-notebook  That notebook is the source of truth for
-the numbers; this module mirrors its §3 rate card and §8/§9 explainers so the app
-answers "what will an AI task cost, and why?" — the estimate side, complementing
-the other tabs which measure ACTUAL spend from system tables.
-
-The cost arithmetic itself runs client-side in the browser (it's simple, and an
-instant calculator is the point). This module just ships the reference data +
-plain-English copy. The backend adds two live SQL touches: verify $/DBU against
-system.billing.list_prices, and show actual 30-day model-serving spend.
-
-Numbers are GCP Enterprise, LIST price, as of the date below. Re-confirm on the
-public pricing page before quoting — they move.
+The model rates are the published rate card (pricing.py, rate_card.json), and the $ per DBU is
+this workspace's own list price for each model's SKU, read live (GET /api/token/prices). The
+cost arithmetic runs in the browser, since an instant calculator is the point. This module
+ships the rate card, the plain-English copy, the cache and gateway explainers, and the
+illustrative task sizes. The task sizes and the cache and gateway tables come from an internal
+token cost-estimator notebook.
 """
+import pricing
 
-PRICING_DATE = "2026-07-29"
-
-# ── $/DBU: converts DBUs to dollars (GCP Enterprise) ─────────────────────────
-#   proprietary (Claude/OpenAI/Gemini) = FLAT GLOBAL $0.070 (does not vary by region)
-#   open models via SRTI = REGIONALISED, follows the WORKSPACE region → SG $0.088
-USD_PER_DBU = {
-    "fmapi_proprietary": 0.070,
-    "fmapi_open_sg": 0.088,
+# What each billing SKU family is, for the "which bill line" table.
+FAMILY_LABEL = {
+    "ANTHROPIC_MODEL_SERVING": "Claude (Anthropic)",
+    "OPENAI_MODEL_SERVING": "GPT (OpenAI)",
+    "GEMINI_MODEL_SERVING": "Gemini (Google)",
+    "XAI_MODEL_SERVING": "Grok (xAI)",
+    "MOONSHOT_MODEL_SERVING": "Kimi (Moonshot AI)",
+    "SERVERLESS_REAL_TIME_INFERENCE": "Open models (Llama, GLM, DeepSeek, Qwen and others)",
 }
-
-# Human labels for each billing basis (shown in the UI).
-BASIS_LABEL = {
-    "fmapi_proprietary": "FMAPI · proprietary",
-    "fmapi_open_sg": "FMAPI · open (SRTI)",
-    "external": "External (vendor $)",
-}
-
-# ── Per-model DBU per 1M tokens (input / output / cache-read) ─────────────────
-# Verbatim from the notebook §3 rate card. "basis" drives how the calculator
-# bills it. External models carry usd_* (vendor $/1M) instead of dbu_*.
-MODELS = [
-    {"name": "Claude Haiku 4.5",  "family": "Claude", "basis": "fmapi_proprietary",
-     "dbu_in": 14.286, "dbu_out": 71.429,  "dbu_cache_read": 1.429},
-    {"name": "Claude Sonnet 4.5", "family": "Claude", "basis": "fmapi_proprietary",
-     "dbu_in": 42.857, "dbu_out": 214.286, "dbu_cache_read": 4.286},
-    {"name": "Claude Opus 4.8",   "family": "Claude", "basis": "fmapi_proprietary",
-     "dbu_in": 71.429, "dbu_out": 357.143, "dbu_cache_read": 7.143},
-    {"name": "OpenAI GPT-5.4",    "family": "OpenAI", "basis": "fmapi_proprietary",
-     "dbu_in": 35.714, "dbu_out": 214.286, "dbu_cache_read": 3.571},
-    {"name": "Gemini 3.5 Flash",  "family": "Gemini", "basis": "fmapi_proprietary",
-     "dbu_in": 26.786, "dbu_out": 160.714, "dbu_cache_read": 2.679},
-    # GLM: US-served (a Singapore call is cross-geo) but bills at the WORKSPACE
-    # region SRTI rate = SG $0.088. A data-residency consideration, not just price.
-    {"name": "GLM 5.2",           "family": "GLM",    "basis": "fmapi_open_sg",
-     "dbu_in": 20.000, "dbu_out": 62.857,  "dbu_cache_read": 3.714,
-     "note": "US-served (cross-geo) · bills at SG SRTI $0.088/DBU"},
-    # External example — billed by the vendor in $ directly (no DBU). Placeholder
-    # rates; replace with a provider's published $/1M price.
-    {"name": "External model (example)", "family": "External", "basis": "external",
-     "usd_in": 2.50, "usd_out": 10.00, "usd_cache_read": 0.25,
-     "note": "external vendor billing (not FMAPI · discounts don't apply)"},
-]
 
 # ── Example workload menu — ILLUSTRATIVE INDUSTRY NORMS, not measured real-world usage ─
 TASKS = [
@@ -76,11 +37,12 @@ TASKS = [
 # ── "If you read nothing else" — the exec takeaways (notebook top box) ────────
 TAKEAWAYS = [
     "Cost = tokens × the model's DBU rate × $/DBU. DBUs are just the meter in between.",
-    "On a Singapore workspace, Claude / OpenAI / Gemini bill at a flat $0.070/DBU (a global "
-    "rate). Open models via SRTI bill at $0.088/DBU in Singapore.",
-    "Output tokens cost ~5× input — controlling response length is an easy cost win.",
-    "Model choice is the biggest lever: ~5× between the cheapest and priciest Claude for the "
-    "identical task.",
+    "Claude, GPT, Gemini, Grok and Kimi bill one $/DBU for your cloud and pricing tier. Open "
+    "models hosted by Databricks bill your workspace region's rate. This page reads both from "
+    "your workspace's own list prices.",
+    "Output tokens cost several times more than input tokens, so capping response length is an "
+    "easy saving.",
+    "Model choice is the biggest lever. The comparison below shows the spread for your task.",
     "All figures are list price; your contracted rate may differ (use the discount control).",
 ]
 
@@ -115,27 +77,15 @@ GATEWAY_TABLE = [
     {"cap": "External-model routing", "cost": "No Databricks fee", "kind": "free"},
 ]
 
-# ── SKU map (notebook §10) — links the estimate to the ‘Spot’-tab actuals ─────
-SKU_MAP = [
-    {"family": "Claude", "sku": "ANTHROPIC_MODEL_SERVING", "usd_dbu": "$0.070 (flat global)"},
-    {"family": "OpenAI", "sku": "OPENAI_MODEL_SERVING", "usd_dbu": "$0.070 (flat global)"},
-    {"family": "Gemini", "sku": "GEMINI_MODEL_SERVING", "usd_dbu": "$0.070 (flat global)"},
-    {"family": "Open models (GLM, Kimi…)", "sku": "SERVERLESS_REAL_TIME_INFERENCE",
-     "usd_dbu": "$0.088 SG (regionalised: US $0.070 · SG/Sydney $0.088 · Tokyo $0.090)"},
-]
-
-
 def public_meta() -> dict:
-    """Everything the Tokenomics tab needs to render + calculate client-side."""
+    """Everything the Tokenomics tab needs to render and calculate in the browser, except the
+    $ per DBU, which /api/token/prices reads for this workspace."""
     return {
-        "pricing_date": PRICING_DATE,
-        "usd_per_dbu": USD_PER_DBU,
-        "basis_label": BASIS_LABEL,
-        "models": MODELS,
+        "card": pricing.card_meta(),
+        "family_label": FAMILY_LABEL,
         "tasks": TASKS,
         "takeaways": TAKEAWAYS,
         "cache_table": CACHE_TABLE,
         "cache_caveats": CACHE_CAVEATS,
         "gateway_table": GATEWAY_TABLE,
-        "sku_map": SKU_MAP,
     }
