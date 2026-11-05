@@ -144,15 +144,15 @@ HUNTS = [
         "id": "H0",
         "category": "ai",
         "title": "Runaway AI spend",
-        "eli5": "Finds AI model calls that are spending fast right now — within the "
-                "hour, before the daily bill even updates.",
-        "what": "Each row is one hour of AI usage for a model endpoint and the identity "
-                "that called it, set against that same (endpoint, caller) pair's own busy hour: "
-                "the 95th percentile of its active hours over the prior 28 days. vs_normal is how "
-                "many times that normal this hour's tokens are, and that sets the alert. A pair "
-                "running several times its own busy hour is your runaway. "
-                "“est_usd_rough” is an estimate built from your own recent bill "
-                "— read it as a relative signal (“who spiked”), not an exact invoice.",
+        "eli5": "Watches the account's AI token rate hour by hour, so a runaway shows up the same "
+                "day, before the daily bill even updates.",
+        "what": "The account's busiest AI hour this week (every endpoint and caller together), set "
+                "against its usual busiest hour: the median of its busiest hour in each of the prior "
+                "four weeks. vs_normal is how many times that normal this week's peak is, and that "
+                "sets the alert. Each row is one (endpoint, caller) pair inside that peak hour with "
+                "its share of the hour's tokens, so the top row is who drove the spike. "
+                "“est_usd_rough” is an estimate built from your own recent bill; read it as a "
+                "relative signal (“who spiked”), not an exact invoice.",
         "action": "Layer three controls: (1) a SQL alert on the hourly rate so a spike is "
                   "caught fast; (2) a daily billing-dollar alert as the reconciling truth; "
                   "(3) a monthly budget as a coarse net. Prevent repeats by not granting "
@@ -160,18 +160,18 @@ HUNTS = [
                   "default to a cheaper tier (e.g. Haiku), cap max_tokens, and only run the "
                   "model over NEW rows each refresh, never the whole table again.",
         "measure": "M2",
-        "explain_hunt_desc": "hourly token-rate leaders for FMAPI / ai_query() calls "
-                             "(runaway-spend early warning)",
+        "explain_hunt_desc": "the account's busiest AI token hour this week versus its usual busiest "
+                             "hour, and the (endpoint, caller) pairs that drove it",
         "explain_rubric": (
-            "each row is one hour for an (endpoint, requester) pair. vs_normal = tokens / baseline, "
-            "where baseline is that pair's 95th-percentile active hour over the prior 28 days "
-            "(floored at the workspace's 95th-percentile pair-hour; baseline_from says which). A pair "
-            "several times its own busy hour is the runaway; NULL vs_normal = a pair first seen in "
-            "this window. "
-            "requester_type = service principal means an automated pipeline. "
-            "est_usd_rough is a rate-blended estimate (this window's tokens x the "
-            "account's own 7-day effective $/1M-token rate), read it relative, not as "
-            "an invoice. source = AI_QUERY marks a SQL ai_query() call."
+            "account_value is the account's tokens in its busiest hour this week, across every "
+            "endpoint and caller; baseline is the median of the account's busiest hour in each of the "
+            "prior four weeks; vs_normal = account_value / baseline (NULL = no prior AI usage). Say "
+            "first whether the account is running above its normal. Each row is one (endpoint, "
+            "requester) pair inside that peak hour; share_pct is its share of the hour's tokens, so "
+            "the top rows are who drove it. requester_type = service principal means an automated "
+            "pipeline. est_usd_rough is a rate-blended estimate (the pair's tokens x the account's "
+            "own 7-day effective $/1M-token rate, NULL when there is no rate for that endpoint); read it "
+            "relative, not as an invoice. source = AI_QUERY marks a SQL ai_query() call."
         ),
         "sql": f"""
 WITH billing_dollars AS (
@@ -195,41 +195,33 @@ gateway_tokens AS (
 rate AS (
   SELECT b.model, b.usd / (g.tok / 1e6) AS usd_1m
   FROM billing_dollars b JOIN gateway_tokens g USING (model)
-  WHERE g.tok > 50e6
+  WHERE g.tok > 0
 ),
-prior AS (
-  SELECT endpoint_name, requester, date_trunc('hour', event_time) AS hr,
-         sum(input_tokens + output_tokens) AS tok
-  FROM system.ai_gateway.usage
-  WHERE event_time >= now() - INTERVAL 28 DAYS - INTERVAL 3 HOURS
-    AND event_time <  now() - INTERVAL 3 HOURS
-  GROUP BY 1, 2, 3
+hourly AS (
+  SELECT *, {_wk("hr")} AS wk, in_tok + out_tok AS tokens
+  FROM (
+    SELECT date_trunc('hour', event_time) AS hr, invocation_metadata.source AS source,
+           endpoint_name, requester, requester_type,
+           coalesce(sum(input_tokens), 0) AS in_tok, coalesce(sum(output_tokens), 0) AS out_tok
+    FROM system.ai_gateway.usage
+    WHERE event_time >= current_timestamp() - INTERVAL 35 DAYS
+    GROUP BY 1, 2, 3, 4, 5
+  )
 ),
-own AS (SELECT endpoint_name, requester, percentile_approx(tok, 0.95) AS own_normal FROM prior GROUP BY 1, 2),
-ws AS (SELECT percentile_approx(tok, 0.95) AS ws_normal FROM prior),
-cur AS (
-  SELECT date_trunc('hour', u.event_time)        AS hr,
-         u.invocation_metadata.source            AS source,
-         u.endpoint_name, u.requester, u.requester_type,
-         sum(u.input_tokens)                      AS in_tok,
-         sum(u.output_tokens)                     AS out_tok,
-         round(sum(u.input_tokens + u.output_tokens) / 1e6 * max(r.usd_1m), 2) AS est_usd_rough
-  FROM system.ai_gateway.usage u
-  LEFT JOIN rate r ON u.endpoint_name = r.model
-  WHERE u.event_time >= now() - INTERVAL 3 HOURS
-  GROUP BY 1,2,3,4,5
-),
-graded AS (
-  SELECT c.*, c.in_tok + c.out_tok AS tokens, o.own_normal, w.ws_normal
-  FROM cur c LEFT JOIN own o ON c.endpoint_name <=> o.endpoint_name AND c.requester <=> o.requester
-  CROSS JOIN ws w
+account_hours AS (SELECT wk, hr, sum(tokens) AS v FROM hourly WHERE wk BETWEEN 0 AND 4 GROUP BY 1, 2),
+weekly AS (SELECT wk, max(v) AS v FROM account_hours GROUP BY 1),
+peak AS (SELECT max_by(hr, v) AS hr FROM account_hours WHERE wk = 0),
+{_account_normal("weekly")},
+contrib AS (
+  SELECT h.*, round(h.tokens / 1e6 * r.usd_1m, 2) AS est_usd_rough
+  FROM hourly h JOIN peak p ON h.hr = p.hr LEFT JOIN rate r ON h.endpoint_name = r.model
 )
 SELECT hr, source, endpoint_name, requester, requester_type, in_tok, out_tok, est_usd_rough,
        endpoint_name || ' / ' || coalesce(requester, 'unknown caller') AS caller,
        tokens,
-       {_vs_normal("tokens")}
-FROM graded
-ORDER BY {_most_unusual("tokens")}
+       {_vs_account("tokens")}
+FROM contrib CROSS JOIN acct
+ORDER BY tokens DESC
 LIMIT 20
 """,
     },
@@ -460,65 +452,62 @@ ORDER BY 1, 2
     {
         "id": "H5",
         "category": "longrun",
-        "title": "Runaway statements (over 4 hours)",
-        "eli5": "Finds any statement that ran longer than four hours, and splits its time "
-                "into waiting-for-capacity vs starting-up vs actually-running.",
-        "what": "Each row is a statement that ran over four hours this week, set against the "
-                "longest statement its source (job, notebook, saved query, or person) usually runs "
-                "in a day. vs_normal is how many times that usual length this one ran, and that "
-                "sets the alert: a nightly six-hour job is normal for itself, while a four-hour "
-                "statement from a source that usually finishes in minutes is not. "
-                "The split tells you which of three problems you have. Long execution time "
-                "plus a huge read = a genuine heavy scan. Long execution time plus tiny reads "
-                "= a HUNG statement (we found two that ‘ran’ 21.7 hours while reading "
-                "6 MB). A large queued time = a capacity problem (see Queue Pressure).",
-        "action": "Set a workspace-wide statement timeout (say 2–4 hours) so runaways stop "
-                  "themselves — the platform default is TWO DAYS. Long ETL can raise its own "
+        "title": "Statements far longer than the account's usual",
+        "eli5": "Checks the account's longest statement this week against the longest it usually "
+                "runs in a week, and splits that time into waiting-for-capacity vs starting-up vs "
+                "actually-running.",
+        "what": "The account's longest statement this week, set against its usual longest: the "
+                "median of the longest statement in each of the prior four weeks. vs_normal is how "
+                "many times that normal this week's longest ran, and that sets the alert. Each row is "
+                "one source (job, notebook, saved query, dashboard or person) with its longest "
+                "statement this week; share_pct is that statement's length as a % of the account's "
+                "longest, so the top row is the culprit. The split tells you which of three problems "
+                "you have. Long execution time plus a huge read = a genuine heavy scan. Long execution "
+                "time plus tiny reads = a HUNG statement (check execution_status and the query "
+                "profile). A large queued time = a capacity problem (see Queue Pressure).",
+        "action": "Set a workspace-wide statement timeout so runaways stop themselves; the platform "
+                  "default is TWO DAYS. A few times the account's usual longest statement (the normal "
+                  "this check shows) is a sensible starting point, and long ETL can raise its own "
                   "limit per session. Note: changing the workspace setting restarts running "
                   "warehouses, so schedule it.",
         "measure": "M5",
-        "explain_hunt_desc": "statements running over 4 hours, split into queued vs executing",
+        "explain_hunt_desc": "the account's longest statement this week versus its usual longest, "
+                             "split into queued vs executing, and the sources behind it",
         "explain_rubric": (
-            "vs_normal = total_min / baseline, where baseline is the source's median daily longest "
-            "statement over the prior 28 days (floored at the workspace's 95th percentile; baseline_from says "
-            "which). A statement near 1x is that source's normal long run; a high multiple is a "
-            "runaway or a hang. NULL vs_normal = a source first seen this week. "
-            "long exec_min + huge read_gib = a genuine heavy scan (see H6). Long exec_min + tiny "
-            "reads = a hung statement (we found two that executed 21.7 h while reading 6 MB - "
-            "check execution_status and the query profile). Large queued_min = a capacity problem (see H8)."
+            "account_value is the account's longest statement this week in minutes; baseline is the "
+            "median of the account's longest statement in each of the prior four weeks; vs_normal = "
+            "account_value / baseline (NULL = no prior history). Say first whether the account's "
+            "longest is above its normal. Each row is one source's longest statement this week; "
+            "share_pct is its length as a % of the account's longest. Long exec_min + huge read_gib = "
+            "a genuine heavy scan (see H6). Long exec_min + tiny reads = a hung statement (check "
+            "execution_status and the query profile). Large queued_min = a capacity problem (see H8)."
         ),
         "sql": f"""
 WITH stmts AS (
-  SELECT statement_id, start_time, executed_by, total_duration_ms, waiting_at_capacity_duration_ms,
-         waiting_for_compute_duration_ms, execution_duration_ms, read_files, read_bytes,
+  SELECT statement_id, start_time, {_wk("start_time")} AS wk,
+         total_duration_ms/60000.0               AS total_min,
+         waiting_at_capacity_duration_ms/60000.0 AS queued_min,
+         waiting_for_compute_duration_ms/60000.0 AS provisioning_min,
+         execution_duration_ms/60000.0           AS exec_min,
+         read_files, read_bytes/POW(1024,3)      AS read_gib,
          coalesce('job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
                   'query ' || query_source.sql_query_id, 'dashboard ' || query_source.dashboard_id,
                   executed_by) AS source
   FROM system.query.history
-  WHERE start_time >= current_date() - INTERVAL 35 DAYS
+  WHERE start_time >= current_timestamp() - INTERVAL 35 DAYS
 ),
-daily AS (
-  SELECT source, date(start_time) AS day, max(total_duration_ms)/60000.0 AS longest_min
-  FROM stmts WHERE start_time < current_date() - INTERVAL 7 DAYS
-  GROUP BY 1, 2
-),
-own AS (SELECT source, percentile_approx(longest_min, 0.5) AS own_normal FROM daily GROUP BY 1),
-ws AS (SELECT percentile_approx(longest_min, 0.95) AS ws_normal FROM daily),
-cur AS (
-  SELECT s.*, s.total_duration_ms/60000.0 AS total_min, o.own_normal, w.ws_normal
-  FROM stmts s LEFT JOIN own o USING (source) CROSS JOIN ws w
-  WHERE s.total_duration_ms > 4*3600*1000
-    AND s.start_time >= current_date() - INTERVAL 7 DAYS
+weekly AS (SELECT wk, max(total_min) AS v FROM stmts WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
+  SELECT * FROM stmts WHERE wk = 0
+  QUALIFY row_number() OVER (PARTITION BY source ORDER BY total_min DESC) = 1
 )
-SELECT statement_id, start_time, source,
-       total_min,
-       waiting_at_capacity_duration_ms/60000.0 AS queued_min,
-       waiting_for_compute_duration_ms/60000.0 AS provisioning_min,
-       execution_duration_ms/60000.0           AS exec_min,
-       read_files, read_bytes/POW(1024,3)      AS read_gib,
-       {_vs_normal("total_min")}
-FROM cur
-ORDER BY {_most_unusual("total_min")}
+SELECT statement_id, start_time, source, total_min, queued_min, provisioning_min, exec_min,
+       read_files, read_gib,
+       {_vs_account("total_min")}
+FROM contrib CROSS JOIN acct
+ORDER BY total_min DESC
+LIMIT 20
 """,
     },
 
@@ -526,55 +515,58 @@ ORDER BY {_most_unusual("total_min")}
     {
         "id": "H6",
         "category": "reads",
-        "title": "Unusually heavy scan hours by one person",
-        "eli5": "Finds an hour in which one person scanned far more data than they usually do "
-                "in a busy hour, often an investigation re-scanning a raw table over and over.",
-        "what": "Each row is one person's heaviest scanning hour this week, set against their "
-                "own busy hour (the 95th percentile of their active hours over the prior 28 "
-                "days). vs_normal is how many times that normal this hour read, and that sets "
-                "the alert. Many scans in that hour (the scans column) is usually a single "
-                "incident hunt: someone searching a raw event table with ‘LIKE %some-id%’ "
-                "and re-paying the full scan on every refinement. Open the statements in Query "
-                "History to confirm the shape.",
+        "title": "Unusually heavy scan hours across the account",
+        "eli5": "Checks the account's heaviest scanning hour this week against its usual heaviest "
+                "hour, then names who did the scanning; often one investigation re-scanning a raw "
+                "table over and over.",
+        "what": "The account's busiest scan hour this week (bytes read by everyone's SELECTs), set "
+                "against its usual busiest hour: the median of its busiest hour in each of the prior "
+                "four weeks. vs_normal is how many times that normal this week's peak is, and that "
+                "sets the alert. Each row is one person who scanned in that hour, with their share of "
+                "its bytes. One person with a large share and many scans (the scans column) is "
+                "usually a single incident hunt: someone searching a raw event table with "
+                "‘LIKE %some-id%’ and re-paying the full scan on every refinement. Open the "
+                "statements in Query History to confirm the shape.",
         "action": "Give investigators a two-line template: first, time-bound the opening scan "
                   "on the table's date column; second, stage that first pass into a temp table "
                   "and run every refinement against the small staged copy — five scans become "
                   "one. Longer term, promote the searched fields to real clustered columns, or "
                   "evaluate a full-text search index.",
         "measure": "M1",
-        "explain_hunt_desc": "hours in which one principal scanned far more than their own normal busy hour (often a re-paid investigation scan)",
+        "explain_hunt_desc": "the account's heaviest scan hour this week versus its usual heaviest "
+                             "hour, and the people who scanned in it (often a re-paid investigation scan)",
         "explain_rubric": (
-            "each row is one principal's heaviest scanning hour this week. vs_normal = read_tib / "
-            "baseline, where baseline is that principal's 95th-percentile active hour over the prior "
-            "28 days (floored at the workspace's 95th-percentile person-hour; baseline_from says "
-            "which). NULL vs_normal = someone first seen scanning this week. A high multiple with "
-            "many scans in the hour is usually one incident hunt re-paying a full scan per "
-            "refinement. Open the statements in the Query History UI to confirm the shape."
+            "account_value is the TiB the whole account's SELECTs read in its busiest hour this week; "
+            "baseline is the median of the account's busiest hour in each of the prior four weeks; "
+            "vs_normal = account_value / baseline (NULL = no prior history). Say first whether the "
+            "account's peak is above its normal. Each row is one principal who scanned in that hour; "
+            "share_pct is their share of its bytes. A large share with many scans is usually one "
+            "incident hunt re-paying a full scan per refinement. Open the statements in the Query "
+            "History UI to confirm the shape."
         ),
         "sql": f"""
 WITH hourly AS (
-  SELECT executed_by, date_trunc('HOUR', start_time) AS hour,
-         count(*)                          AS scans,
-         sum(read_bytes)/POW(1024,4)       AS read_tib,
-         max(total_duration_ms)/3600000.0  AS longest_hours
-  FROM system.query.history
-  WHERE statement_type = 'SELECT' AND read_bytes > 0
-    AND start_time >= current_date() - INTERVAL 35 DAYS
-  GROUP BY 1, 2
+  SELECT *, {_wk("hour")} AS wk
+  FROM (
+    SELECT executed_by, date_trunc('HOUR', start_time) AS hour,
+           count(*)                          AS scans,
+           sum(read_bytes)/POW(1024,4)       AS read_tib,
+           max(total_duration_ms)/3600000.0  AS longest_hours
+    FROM system.query.history
+    WHERE statement_type = 'SELECT' AND read_bytes > 0
+      AND start_time >= current_timestamp() - INTERVAL 35 DAYS
+    GROUP BY 1, 2
+  )
 ),
-prior AS (SELECT * FROM hourly WHERE hour < current_date() - INTERVAL 7 DAYS),
-own AS (SELECT executed_by, percentile_approx(read_tib, 0.95) AS own_normal FROM prior GROUP BY 1),
-ws AS (SELECT percentile_approx(read_tib, 0.95) AS ws_normal FROM prior),
-cur AS (
-  SELECT h.*, o.own_normal, w.ws_normal
-  FROM hourly h LEFT JOIN own o USING (executed_by) CROSS JOIN ws w
-  WHERE h.hour >= current_date() - INTERVAL 7 DAYS
-  QUALIFY row_number() OVER (PARTITION BY h.executed_by ORDER BY h.read_tib DESC) = 1
-)
+account_hours AS (SELECT wk, hour, sum(read_tib) AS v FROM hourly WHERE wk BETWEEN 0 AND 4 GROUP BY 1, 2),
+weekly AS (SELECT wk, max(v) AS v FROM account_hours GROUP BY 1),
+peak AS (SELECT max_by(hour, v) AS hour FROM account_hours WHERE wk = 0),
+{_account_normal("weekly")},
+contrib AS (SELECT h.* FROM hourly h JOIN peak p ON h.hour = p.hour)
 SELECT executed_by, hour, scans, read_tib, longest_hours,
-       {_vs_normal("read_tib")}
-FROM cur
-ORDER BY {_most_unusual("read_tib")}
+       {_vs_account("read_tib")}
+FROM contrib CROSS JOIN acct
+ORDER BY read_tib DESC
 LIMIT 50
 """,
     },
@@ -1892,13 +1884,12 @@ class PresenceSpec(TypedDict):
 AlertSpec = Union[AnomalySpec, PresenceSpec]
 
 ALERT_SPECS: dict[str, AlertSpec] = {
-    "H0": {"kind": "anomaly", "entity_col": "caller", "metric_col": "tokens",
-           "metric_label": "Tokens in one hour", "unit": "count",
-           "baseline": "95th percentile of the (endpoint, caller) pair's active hours over the "
-                       "prior 28 days, floored at the workspace's 95th-percentile pair-hour",
-           "summary": "{entity}: {x} its usual busy-hour AI token rate ({metric} tokens in an hour, normal ~{baseline}).",
-           "new_summary": "NEW: {entity} first seen calling AI in this window ({metric} tokens in an hour).",
-           "usd_col": "est_usd_rough"},
+    "H0": {"kind": "anomaly", "aggregate": "peak", "entity_col": "caller", "metric_col": "tokens",
+           "metric_label": "Account tokens in its busiest hour this week", "unit": "count",
+           "baseline": "median of the account's busiest hour in each of the prior four weeks",
+           "summary": "Account used {account} AI tokens in its busiest hour this week, {x} its usual (normal ~{baseline}).",
+           "new_summary": "Account has no prior history of AI token use yet ({account} tokens in its busiest hour this week).",
+           "usd_col": None},
     "H1": {"kind": "anomaly", "entity_col": "merge_target", "metric_col": "read_tib",
            "metric_label": "Heaviest MERGE run this week", "unit": "tib",
            "baseline": "median read of the same MERGE target's runs over the prior 28 days, "
@@ -1920,19 +1911,17 @@ ALERT_SPECS: dict[str, AlertSpec] = {
            "summary": "{entity}: {x} its usual tiny statements ({metric} this week, normal ~{baseline}/week).",
            "new_summary": "NEW: {entity} first seen this window ({metric} tiny statements this week).",
            "usd_col": None},
-    "H5": {"kind": "anomaly", "entity_col": "source", "metric_col": "total_min",
-           "metric_label": "Statement over 4 hours", "unit": "minutes",
-           "baseline": "median of the source's longest statement per day over the prior 28 days, "
-                       "floored at the workspace's 95th percentile",
-           "summary": "{entity}: a statement ran {x} its usual longest ({metric}, normal ~{baseline}).",
-           "new_summary": "NEW: {entity} first seen this window, with a {metric} statement.",
+    "H5": {"kind": "anomaly", "aggregate": "peak", "entity_col": "source", "metric_col": "total_min",
+           "metric_label": "Account's longest statement this week", "unit": "minutes",
+           "baseline": "median of the account's longest statement in each of the prior four weeks",
+           "summary": "Account's longest statement this week ran {account}, {x} its usual longest (normal ~{baseline}).",
+           "new_summary": "Account has no prior history of statement run times yet (longest this week {account}).",
            "usd_col": None},
-    "H6": {"kind": "anomaly", "entity_col": "executed_by", "metric_col": "read_tib",
-           "metric_label": "Heaviest scan hour this week", "unit": "tib",
-           "baseline": "95th percentile of the person's active hours over the prior 28 days, "
-                       "floored at the workspace's 95th-percentile person-hour",
-           "summary": "{entity}: {x} their usual busy-hour scan volume ({metric} in one hour, normal ~{baseline}).",
-           "new_summary": "NEW: {entity} first seen scanning this window ({metric} in one hour).",
+    "H6": {"kind": "anomaly", "aggregate": "peak", "entity_col": "executed_by", "metric_col": "read_tib",
+           "metric_label": "Account's busiest scan hour this week", "unit": "tib",
+           "baseline": "median of the account's busiest scan hour in each of the prior four weeks",
+           "summary": "Account scanned {account} in its busiest hour this week, {x} its usual (normal ~{baseline}).",
+           "new_summary": "Account has no prior history of SELECT scans yet ({account} in its busiest hour this week).",
            "usd_col": None},
     "H7": {"kind": "anomaly", "entity_col": "poller", "metric_col": "execs",
            "metric_label": "Short SELECTs this week", "unit": "count",
