@@ -113,9 +113,10 @@
   .model-pick .mp-label { font-size: 10px; color: var(--muted-2); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
   .model-pick select {
     background: var(--panel-2); border: 1px solid var(--border); color: var(--text); width: 100%;
-    font-family: var(--font-mono); font-size: 11px; padding: 6px 8px; border-radius: 7px; cursor: pointer;
+    font-family: var(--font-body); font-size: 12px; padding: 6px 8px; border-radius: 7px; cursor: pointer;
   }
   .model-pick select:focus { outline: none; border-color: var(--accent); }
+  .model-pick .mp-note { font-size: 10.5px; color: var(--coral); line-height: 1.35; }
   .theme-toggle {
     display: flex; align-items: center; gap: 8px; width: 100%;
     padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border);
@@ -604,6 +605,7 @@
       <label class="model-pick" title="Model that writes the plain-English explanations">
         <span class="mp-label">✨ AI model</span>
         <select id="modelSelect"></select>
+        <span class="mp-note" id="modelNote" style="display:none;"></span>
       </label>
       <button id="themeToggle" class="theme-toggle" title="Toggle light / dark" aria-label="Toggle light or dark theme"></button>
     </div>
@@ -961,6 +963,7 @@ function exportPdf(sources, opts = {}) {
 const todayStr = () => new Date().toISOString().slice(0,10);
 const charts = {};
 let chosenModel = localStorage.getItem("costopt_model") || null;   // explainer model override
+let MODELS = { models: [], groups: {}, error: null };              // the /api/models listing
 
 // ── theme (light / dark), persisted ──────────────────────────────────────────
 function initTheme() {
@@ -983,11 +986,19 @@ function applyTheme(t) {
 // ── explainer model picker, persisted ─────────────────────────────────────────
 async function initModelPicker() {
   const sel = $("#modelSelect"); if (!sel) return;
-  let models = [], def = META.ai_endpoint;
-  try { const d = await (await fetch("/api/models")).json(); models = d.models || []; def = d.default || def; }
-  catch(e) { models = [META.ai_endpoint]; }
-  if (!chosenModel) chosenModel = def;
-  sel.innerHTML = models.map(m => `<option value="${m}" ${m===chosenModel?"selected":""}>${m.replace("databricks-","")}</option>`).join("");
+  try { MODELS = await (await fetch("/api/models")).json(); }
+  catch(e) { MODELS = { models: [{ id: META.ai_endpoint, name: META.ai_endpoint, group: "fast" }],
+                        groups: { fast: "" }, default: META.ai_endpoint, error: e.message }; }
+  const listed = MODELS.models || [];
+  // A choice saved in another session may not be listed now; the picker must show what runs.
+  if (!listed.some(m => m.id === chosenModel)) chosenModel = MODELS.default || META.ai_endpoint;
+  sel.innerHTML = Object.entries(MODELS.groups || {}).map(([g, label]) => {
+    const opts = listed.filter(m => m.group === g).map(m =>
+      `<option value="${escapeHtml(m.id)}" ${m.id===chosenModel?"selected":""}>${escapeHtml(m.name)}</option>`).join("");
+    return opts ? `<optgroup label="${escapeHtml(label)}">${opts}</optgroup>` : "";
+  }).join("");
+  const note = $("#modelNote");
+  note.textContent = MODELS.error || ""; note.style.display = MODELS.error ? "" : "none";
   sel.addEventListener("change", () => { chosenModel = sel.value; localStorage.setItem("costopt_model", chosenModel); });
 }
 

@@ -43,6 +43,7 @@ import store_delta
 import tagging as tagging_content
 import boards as boards_content
 import genie_cost
+import models as chat_catalogue
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -285,7 +286,7 @@ def _explainer_model(model: Optional[str]) -> str:
     """Resolve the explainer endpoint: a caller override if it's a known FMAPI
     endpoint (guards against injection into the ai_query() literal), else the
     configured default. Only 'databricks-*' names are accepted."""
-    if model and re.fullmatch(r"databricks-[a-z0-9.\-]+", model):
+    if model and chat_catalogue.ENDPOINT_NAME.fullmatch(model):
         return model
     return AI_ENDPOINT
 
@@ -330,33 +331,31 @@ FROM ( {rows_sql} ) t
 
 # ── API: metadata (drives the UI, no warehouse needed) ───────────────────────
 
+def _failure_reason(e: Exception) -> str:
+    """A short reason for the UI. An error body the SDK can't parse carries its request log,
+    whose '< 502 Bad Gateway' line names the HTTP status."""
+    if isinstance(e, HTTPException):
+        return str(e.detail)
+    status = re.search(r"^< (\d{3}\b.*)$", str(e), re.M)
+    return f"HTTP {status.group(1).strip()}" if status else _sdk_message(e)[:200]
+
+
 @app.get("/api/models")
 def list_models(request: Request):
-    """Chat-capable FMAPI endpoints the customer can pick as the explainer model
-    (e.g. Haiku 4.5 for cheap, Sonnet for richer). Read live from the workspace so
-    the list reflects what's actually available; falls back to a sensible set."""
-    fallback = ["databricks-gpt-5-4-mini", "databricks-claude-haiku-4-5",
-                "databricks-gemini-3-5-flash", "databricks-claude-sonnet-4-5"]
+    """The chat models this workspace serves, for the explainer picker, by display name and
+    group. Read straight from the REST API and parsed for the few fields used, so a change in
+    the SDK's endpoint model can't break it. If listing fails, only the configured default is
+    offered, with the reason."""
     try:
-        client = _client_for(request)
-        names = []
-        for e in client.serving_endpoints.list():
-            n = getattr(e, "name", "")
-            if n.startswith("databricks-") and not any(k in n for k in ("embedding", "bge", "gte")):
-                names.append(n)
-        # keep chat-ish families, cheapest-first-ish ordering by a small priority map
-        pref = ["haiku", "mini", "nano", "flash-lite", "flash", "gpt-oss-20b", "gpt-5-4",
-                "sonnet", "gpt-5-5", "opus", "gpt-oss-120b", "qwen", "llama", "glm", "gemini"]
-        def rank(n):
-            for i, k in enumerate(pref):
-                if k in n:
-                    return i
-            return len(pref)
-        names = sorted(set(names), key=lambda n: (rank(n), n))
-        return {"models": names or fallback, "default": AI_ENDPOINT}
+        raw = _client_for(request).api_client.do("GET", "/api/2.0/serving-endpoints")
+        listed = [m._asdict() for m in chat_catalogue.chat_models(raw)]
+        return {"models": listed, "groups": chat_catalogue.GROUPS, "default": AI_ENDPOINT, "error": None}
     except Exception as e:  # noqa: BLE001
         logger.warning(f"list_models failed: {e}")
-        return {"models": fallback, "default": AI_ENDPOINT}
+        return {"models": [{"id": AI_ENDPOINT, "name": AI_ENDPOINT, "group": chat_catalogue.group_of(AI_ENDPOINT)}],
+                "groups": chat_catalogue.GROUPS, "default": AI_ENDPOINT,
+                "error": f"Couldn't list this workspace's models ({_failure_reason(e)}). "
+                         "Showing the configured default only."}
 
 
 @app.get("/api/whoami")
