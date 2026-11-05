@@ -729,18 +729,19 @@ def scan_start(request: Request, model: Optional[str] = None):
     if not created:
         return {"scan_id": scan_id, "status": "running"}
 
-    def _persist(sid: str, cli: WorkspaceClient):
+    def _persist(sid: str, cli: WorkspaceClient) -> Optional[str]:
         """Called on the scan thread when it finishes: compute self-cost, then
-        write the run + findings to the shared Delta store (best-effort)."""
+        write the run + findings to the shared Delta store (best-effort).
+        Returns None once saved, else why it wasn't."""
         view = scan_engine.scan_view(sid)
         if not view:
-            return
+            return "scan not found"
         try:
             cost = _compute_scan_cost(view, cli)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"persist: cost compute failed: {e}")
             cost = None
-        DELTA.save_scan(cli, view, cost)
+        return None if DELTA.save_scan(cli, view, cost) else DELTA.last_error
 
     t = threading.Thread(
         target=scan_engine.run_scan,

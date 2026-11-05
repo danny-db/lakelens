@@ -274,7 +274,8 @@ def run_scan(scan_id: str, client, run_sql: Callable, ai_explain: Callable, boun
       run_sql(sql, client) -> {columns, rows, total_rows}
       ai_explain(rubric, hunt_desc, rows_sql, client) -> str
       bounded(sql, n) -> sql capped to top-n
-      on_complete(scan_id, client) -> called after the scan finishes (persist to Delta)
+      on_complete(scan_id, client) -> called after the scan finishes (persist to Delta);
+                                      returns None once saved, else why it wasn't
     """
     alert_hunts = [h for h in catalogue.HUNTS if h["id"] in catalogue.ALERT_SPECS]
     # Record the scan's own start time (UTC) so we can attribute what THIS scan
@@ -315,12 +316,16 @@ def run_scan(scan_id: str, client, run_sql: Callable, ai_explain: Callable, boun
 
     STORE.update_scan(scan_id, status="complete", ended_at=_utc_now_iso())
     logger.info(f"scan {scan_id} complete")
-    # Persist to the shared Delta store (on this thread — it holds the OBO client).
+    # Persist to the shared Delta store (on this thread — it holds the OBO client). The page
+    # waits for `saved` to know the saved copy exists, or that there won't be one.
+    save_error = "no results store"
     if on_complete:
         try:
-            on_complete(scan_id, client)
+            save_error = on_complete(scan_id, client)
         except Exception as e:  # noqa: BLE001
+            save_error = str(e)
             logger.warning(f"scan {scan_id}: on_complete (persist) failed: {e}")
+    STORE.update_scan(scan_id, saved=save_error is None, save_error=save_error)
 
 
 def scan_view(scan_id: str) -> Optional[dict]:
@@ -351,4 +356,6 @@ def scan_view(scan_id: str) -> Optional[dict]:
         "ended_at": rec.get("ended_at"),
         "n_explains": rec.get("n_explains", 0),
         "wall_ms": rec.get("wall_ms", 0.0),
+        "saved": rec.get("saved"),            # None until the save settles after "complete"
+        "save_error": rec.get("save_error"),
     }

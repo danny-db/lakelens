@@ -1560,7 +1560,9 @@ async function pollScan() {
     $("#alertFilters").style.display = d.findings.length ? "flex" : "none";
     renderSummary(d);
     renderQueue();
-    if (d.status === "complete") { finishScan(d, true); }
+    // Every check has run at "complete"; the scan is finished once its save settles too.
+    if (d.status === "complete" && d.saved != null) { finishScan(d, true); }
+    else if (d.status === "complete") { $("#scanStatus").innerHTML = FINALISING; }
   } catch(e) {
     clearInterval(SCAN.poll); SCAN.poll = null;
     $("#scanStatus").innerHTML = `<span style="color:var(--coral)">✕ ${e.message}</span>`;
@@ -1588,17 +1590,25 @@ function pollLatestUntilDone() {
   }, 4000);
 }
 
+const FINALISING = `<span class="spin" style="width:12px;height:12px;border-color:var(--border);border-top-color:var(--accent);display:inline-block;vertical-align:middle"></span> Finalising…`;
+
 function finishScan(d, fromMemory) {
   if (SCAN.finished) return;            // idempotent — a late poll must not re-fire this
   SCAN.finished = true;
   clearInterval(SCAN.poll); SCAN.poll = null;
   const btn = $("#scanBtn"); btn.disabled = false; btn.innerHTML = "🔄 Re-run scan";
   $("#scanProgressWrap").style.display = "none";
-  // The persisted, comparison-annotated view (loadLatestScan) is the single source
-  // of truth for the finished state — we go straight to it rather than painting a
-  // "Scan complete…" message first (which would flash against loadLatestScan's text).
-  $("#scanStatus").innerHTML = `<span class="spin" style="width:12px;height:12px;border-color:var(--border);border-top-color:var(--accent);display:inline-block;vertical-align:middle"></span> Finalising…`;
-  setTimeout(loadLatestScan, fromMemory ? 3200 : 200);
+  // A saved scan is shown from its saved copy (loadLatestScan), which carries the comparison
+  // with the last run. One that wasn't saved, e.g. with no RESULTS_CATALOG, finishes as polled.
+  if (fromMemory && !d.saved) {
+    SCAN.meta = d;
+    $("#scanExportBtn").style.display = "";   // a scan exists → offer the PDF export
+    $("#scanStatus").innerHTML = `Scan complete · <b>${d.findings.length}</b> in queue (${d.counts.high||0} high, ${d.counts.medium||0} medium). `
+      + `Not saved (${escapeHtml(d.save_error || "no results store")}), so it isn't shared or compared with the next scan.`;
+    return;
+  }
+  $("#scanStatus").innerHTML = FINALISING;
+  loadLatestScan();
 }
 
 function renderSummary(d) {
