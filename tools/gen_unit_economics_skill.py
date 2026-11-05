@@ -104,10 +104,11 @@ def render() -> str:
         "`system.query.history` in the window.",
         "- Audit-workspace spend is the spend of workspaces with at least one event in "
         "`system.access.audit` in the window.",
-        f"- Data under management is active table data from `{boards.STORAGE_TABLE}`, each table at its "
-        "newest snapshot in the window unless it was dropped by the window's end. It lists the tables in "
-        "the current region's metastore, like the audit log, so the ratio divides the spend of the "
-        "workspaces in the audit log.",
+        f"- Data under management comes from `{boards.STORAGE_TABLE}`: each table at its newest snapshot in "
+        "the window unless it was dropped by the window's end, at its total size (active plus vacuumable "
+        "files) where it reports one and its active size otherwise. Cost per TiB is total spend over that "
+        "volume. The table lists only the current region's metastore, so on an account with workspaces "
+        "in several regions the ratio reads high; say so when you quote it.",
         "",
         "## Step 4. Visualise",
         "",

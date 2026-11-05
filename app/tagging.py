@@ -15,6 +15,8 @@ automatic. The queries here are all read-only.
 `custom_tags` on system.billing.usage is a MAP; `tags` on system.compute.* is a MAP.
 An empty map (or missing the expected key) = a tagging gap.
 """
+from boards import full_days
+
 
 # Which tag keys "count" as attribution. A resource with none of these is untagged
 # for cost purposes even if it has an incidental tag. Overridable per customer.
@@ -48,10 +50,11 @@ ORDER BY cluster_name
 LIMIT 200
 """
 
-# The COST of the gap: 30-day spend that carries no custom_tags, by product.
+# The COST of the gap: spend over the last 30 full days that carries no custom_tags, by product.
 # This is the "how much of the bill can't be attributed?" headline.
-UNTAGGED_SPEND_BY_PRODUCT = """
-WITH price AS (
+UNTAGGED_SPEND_BY_PRODUCT = f"""
+WITH {full_days(30)},
+price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
          pricing.effective_list.default AS unit_usd
   FROM system.billing.list_prices
@@ -67,15 +70,16 @@ FROM system.billing.usage u
 LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
   AND u.usage_start_time >= pr.price_start_time
   AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-WHERE u.usage_date >= current_date() - INTERVAL 30 DAYS
+WHERE u.usage_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
 GROUP BY 1
 HAVING sum(u.usage_quantity * pr.unit_usd) > 0
 ORDER BY untagged_usd DESC
 """
 
-# Coverage headline: overall tagged vs untagged 30-day $.
-TAG_COVERAGE = """
-WITH price AS (
+# Coverage headline: overall tagged vs untagged $ over the last 30 full days (the Overview's window).
+TAG_COVERAGE = f"""
+WITH {full_days(30)},
+price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
          pricing.effective_list.default AS unit_usd
   FROM system.billing.list_prices
@@ -87,7 +91,7 @@ FROM system.billing.usage u
 LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
   AND u.usage_start_time >= pr.price_start_time
   AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-WHERE u.usage_date >= current_date() - INTERVAL 30 DAYS
+WHERE u.usage_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
 """
 
 

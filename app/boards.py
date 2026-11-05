@@ -293,8 +293,10 @@ def compute_anomalies(panel: dict, columns: list, rows: list) -> list:
 # (they still prune there); inside an expression they cost Photon a slow path, so rows
 # carry days_back instead.
 
-def _econ_with(days: int) -> str:
-    return f"""WITH latest AS (   -- the newest ingestion day; billing is still writing to it
+def full_days(days: int) -> str:
+    """The CTEs latest, newest, bounds and win: a window of `days` full days, ending on the newest
+    usage day whose billing has fully landed. The Overview tiles use it too."""
+    return f"""latest AS (   -- the newest ingestion day; billing is still writing to it
   SELECT max(ingestion_date) AS day FROM system.billing.usage WHERE usage_date >= current_date() - INTERVAL 7 DAYS
 ),
 newest AS (   -- the usage day before it: full once its usage runs to midnight and its next-day records have landed
@@ -307,7 +309,11 @@ bounds AS (
               ELSE date_sub(l.day, 2) END AS end_date
   FROM latest l CROSS JOIN newest n
 ),
-win AS (SELECT date_sub(end_date, {days - 1}) AS start_date, end_date FROM bounds),
+win AS (SELECT date_sub(end_date, {days - 1}) AS start_date, end_date FROM bounds)"""
+
+
+def _econ_with(days: int) -> str:
+    return f"""WITH {full_days(days)},
 account_prices AS (
   SELECT sku_name, cloud, currency_code, usage_unit, price_start_time, price_end_time,
          pricing.default AS unit_price
@@ -354,11 +360,11 @@ ids AS (   -- each audit identity once per workspace and day; an email is a pers
   GROUP BY 1, 2, 3
 )"""
 
-# Data under management is active table data from this system table. It is new, so a panel
-# that reads it also has a variant without it, and an account that can't read it still gets
-# every other figure. A table counts once, at its newest snapshot in the window, unless it
-# was dropped by the window's end. It lists the tables in the current region's metastore,
-# like the audit log, so the ratio divides the spend of the workspaces in the audit log.
+# Data under management comes from this system table. It is new, so a panel that reads it
+# also has a variant without it, and an account that can't read it still gets every other
+# figure. A table counts once, at its newest snapshot in the window, unless it was dropped by
+# the window's end, at its total size (active plus vacuumable files) where it reports one and
+# its active size otherwise. It lists the tables in the current region's metastore.
 STORAGE_TABLE = "system.storage.table_metrics_history"
 
 
@@ -367,8 +373,8 @@ def _stored_total(storage: bool) -> str:
         return ",\nstored AS (SELECT CAST(NULL AS BIGINT) AS tables, CAST(NULL AS DOUBLE) AS tib)"
     return f""",
 stored AS (   -- each table at its newest snapshot in the window, unless dropped by its end
-  SELECT count(*) AS tables, sum(active_bytes) / POW(1024, 4) AS tib
-  FROM (SELECT active_bytes, table_dropped_time FROM {STORAGE_TABLE}
+  SELECT count(*) AS tables, sum(coalesce(total_bytes, active_bytes)) / POW(1024, 4) AS tib
+  FROM (SELECT total_bytes, active_bytes, table_dropped_time FROM {STORAGE_TABLE}
         WHERE snapshot_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
         QUALIFY row_number() OVER (PARTITION BY table_id ORDER BY snapshot_date DESC) = 1)
   WHERE table_dropped_time IS NULL OR to_date(table_dropped_time) > (SELECT end_date FROM win)
@@ -380,8 +386,9 @@ def _stored_weekly(storage: bool) -> str:
         return ",\nstored AS (SELECT CAST(NULL AS DOUBLE) AS wk, CAST(NULL AS DOUBLE) AS tib)"
     return f""",
 stored AS (   -- per week, each table at its newest snapshot in the week, unless dropped by the week's end
-  SELECT wk, sum(active_bytes) / POW(1024, 4) AS tib
-  FROM (SELECT floor(datediff(w.end_date, t.snapshot_date) / 7) AS wk, t.active_bytes, t.table_dropped_time,
+  SELECT wk, sum(coalesce(total_bytes, active_bytes)) / POW(1024, 4) AS tib
+  FROM (SELECT floor(datediff(w.end_date, t.snapshot_date) / 7) AS wk, t.total_bytes, t.active_bytes,
+               t.table_dropped_time,
                w.end_date
         FROM {STORAGE_TABLE} t CROSS JOIN win w
         WHERE t.snapshot_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
@@ -407,7 +414,7 @@ def _usd(expr: str, dp: int = 0) -> str:
 
 
 def _share(part: str, whole: str, of: str) -> str:
-    return f"concat(format_number(100 * {part} / {whole}, 1), '% of {of}')"
+    return f"concat(format_number(100 * {part} / nullif({whole}, 0), 1), '% of {of}')"
 
 
 def _count(expr: str, suffix: str = "") -> str:
@@ -417,27 +424,27 @@ def _count(expr: str, suffix: str = "") -> str:
 _NO_STORAGE = f"'needs {STORAGE_TABLE}'"
 
 ECON_KPIS = [
-    Kpi("Cost per query", "kpi", _usd("m.q_net_usd / m.queries", 4),
+    Kpi("Cost per query", "kpi", _usd("m.q_net_usd / nullif(m.queries, 0)", 4),
         _share("m.q_list_usd", "m.list_usd", "spend"),
         "Spend of the workspaces with finished queries / those queries"),
-    Kpi("Cost per MAU, all identities", "kpi", _usd("m.a_net_usd / m.mau", 2),
+    Kpi("Cost per MAU, all identities", "kpi", _usd("m.a_net_usd / nullif(m.mau, 0)", 2),
         _share("m.a_list_usd", "m.list_usd", "spend"),
         "Spend of the workspaces in the audit log / monthly active identities, people and service principals"),
-    Kpi("Cost per MAU, humans", "kpi", _usd("m.a_net_usd / m.mau_human", 2),
+    Kpi("Cost per MAU, humans", "kpi", _usd("m.a_net_usd / nullif(m.mau_human, 0)", 2),
         _share("m.a_list_usd", "m.list_usd", "spend"),
         "Spend of the workspaces in the audit log / monthly active people, the audit identities that are emails"),
     Kpi("Cost per TiB of data under management", "kpi",
-        f"CASE WHEN m.stored_tib > 0 THEN {_usd('m.a_net_usd / m.stored_tib', 2)} ELSE '' END",
+        f"CASE WHEN m.stored_tib > 0 THEN {_usd('m.net_usd / m.stored_tib', 2)} ELSE '' END",
         f"CASE WHEN m.stored_tib IS NULL THEN {_NO_STORAGE} "
-        f"ELSE concat({_share('m.a_list_usd', 'm.list_usd', 'spend')}, ' · ', {_count('m.stored_tables', ' tables')}) END",
-        "Spend of the workspaces in the audit log / TiB of active table data in this metastore"),
+        f"ELSE concat('all spend · ', {_count('m.stored_tables', ' tables')}) END",
+        "Total spend / total TiB of table data in this metastore"),
     Kpi("Window", "input", "concat(m.start_date, ' to ', m.end_date)", "''",
         "28 full days, ending on the newest day whose billing has finished landing"),
     Kpi("Total spend", "input", _usd("m.net_usd"), _count("m.workspaces", " workspaces"),
         "Usage × price, every workspace"),
     Kpi("Effective discount", "input",
         "CASE WHEN m.priced_list_usd IS NULL THEN '' ELSE concat("
-        "format_number(100 * (1 - m.priced_acct_usd / m.priced_list_usd), 1), '%', "
+        "format_number(100 * (1 - m.priced_acct_usd / nullif(m.priced_list_usd, 0)), 1), '%', "
         "CASE WHEN m.unpriced_rows > 0 THEN ' (partial)' ELSE '' END) END",
         _share("coalesce(m.priced_list_usd, 0)", "m.list_usd", "list spend priced"),
         "1 - account $ / list $, on priced SKUs"),
@@ -459,7 +466,7 @@ ECON_KPIS = [
     Kpi("Data under management", "input",
         f"CASE WHEN m.stored_tib IS NULL THEN '' ELSE {_count('m.stored_tib', ' TiB')} END",
         f"CASE WHEN m.stored_tib IS NULL THEN {_NO_STORAGE} ELSE {_count('m.stored_tables', ' tables')} END",
-        "Active table data, each table at its newest snapshot in the window"),
+        "Each table at its newest snapshot in the window: its total size, or its active size where it reports no total"),
 ]
 
 
@@ -549,8 +556,7 @@ users AS (SELECT floor(days_back / 7) AS wk, approx_count_distinct(identity) AS 
           FROM ids GROUP BY 1)
 SELECT date_sub(max(w.end_date), CAST(s.wk AS INT) * 7) AS week,
        round(sum(CASE WHEN q.queries > 0 THEN s.usd END) / sum(q.queries), 4) AS `cost per query`,
-       round(sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.usd END)
-             / nullif(max(st.tib), 0), 2) AS `cost per TiB under management`,
+       round(sum(s.usd) / nullif(max(st.tib), 0), 2) AS `cost per TiB under management`,
        round(sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.usd END) / max(u.wau), 2)
          AS `cost per weekly active user`
 FROM spend s
@@ -585,7 +591,7 @@ BOARDS = [
         "panels": [
             {
                 "id": "why_changed",
-                "title": "Why did cost change? (this week vs last)",
+                "title": "Why did cost change? (last full week vs the week before)",
                 "eli5": "Breaks the week-over-week change in total spend into WHY it moved: new "
                         "workloads, retired workloads, volume growth (existing things doing more), "
                         "and rate/mix (pricier compute or SKU mix). The four add up to the total "
@@ -680,8 +686,8 @@ FROM system.billing.usage u
 LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
   AND u.usage_start_time >= pr.price_start_time
   AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-WHERE u.usage_date >= current_date() - INTERVAL 12 WEEKS
-  AND u.usage_date < date_trunc('WEEK', current_date())   -- complete weeks only (drop partial current week)
+WHERE u.usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 12 WEEKS
+  AND u.usage_date < date_trunc('WEEK', current_date())   -- whole weeks only, at both ends
 GROUP BY 1 ORDER BY 1
 """,
             },
@@ -705,8 +711,8 @@ FROM system.billing.usage u
 LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
   AND u.usage_start_time >= pr.price_start_time
   AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-WHERE u.usage_date >= current_date() - INTERVAL 8 WEEKS
-  AND u.usage_date < date_trunc('WEEK', current_date())   -- complete weeks only
+WHERE u.usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS
+  AND u.usage_date < date_trunc('WEEK', current_date())   -- whole weeks only, at both ends
 GROUP BY 1, 2 HAVING sum(u.usage_quantity * pr.unit_usd) > 0
 ORDER BY 1, list_usd DESC
 """,
@@ -732,7 +738,7 @@ spend AS (
   LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
     AND u.usage_start_time >= pr.price_start_time
     AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-  WHERE u.usage_date >= current_date() - INTERVAL 30 DAYS
+  WHERE u.usage_date >= current_date() - INTERVAL 30 DAYS AND u.usage_date < current_date()
   GROUP BY 1
 )
 SELECT {WORKSPACE.label} AS workspace, c.list_usd, c.workspace_id
@@ -760,8 +766,8 @@ hist AS (
   LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
     AND u.usage_start_time >= pr.price_start_time
     AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-  WHERE u.usage_date >= current_date() - INTERVAL 26 WEEKS
-    AND u.usage_date < date_trunc('WEEK', current_date())   -- complete weeks only (no partial-week cliff)
+  WHERE u.usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 26 WEEKS
+    AND u.usage_date < date_trunc('WEEK', current_date())   -- whole weeks only, at both ends (no partial-week cliff)
   GROUP BY 1
 ),
 fc AS (
@@ -832,7 +838,7 @@ job_ap_runs AS (  -- task time each job spent on an all-purpose cluster, per clo
            unix_millis(t.period_end_time) - unix_millis(t.period_start_time) AS run_ms
     FROM system.lakeflow.job_task_run_timeline t
     LATERAL VIEW explode(t.compute_ids) exploded AS cluster_id
-    WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS
+    WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS AND t.period_start_time < current_date()
       AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
   ) r
   JOIN ap_clusters c ON r.workspace_id=c.workspace_id AND r.cluster_id=c.cluster_id
@@ -852,7 +858,7 @@ ap_hour AS (  -- each all-purpose cluster-hour at its own list price and at the 
     AND u.usage_start_time >= jp.price_start_time
     AND (jp.price_end_time IS NULL OR u.usage_start_time < jp.price_end_time)
   WHERE u.sku_name LIKE '%ALL_PURPOSE_COMPUTE%' AND u.usage_metadata.cluster_id IS NOT NULL
-    AND u.usage_date >= current_date() - INTERVAL 30 DAYS
+    AND u.usage_date >= current_date() - INTERVAL 30 DAYS AND u.usage_date < current_date()
   GROUP BY 1,2,3
 ),
 job_share AS (  -- the hour's busy time across every job decides each job's fair share of it
@@ -896,14 +902,14 @@ job_clusters AS (
   SELECT DISTINCT t.workspace_id, t.job_id, exploded.cluster_id
   FROM system.lakeflow.job_task_run_timeline t
   LATERAL VIEW explode(t.compute_ids) exploded AS cluster_id
-  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS
+  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS AND t.period_start_time < current_date()
     AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
 ),
 cpu AS (
   SELECT cluster_id, count(*) AS node_minutes,
          avg(cpu_user_percent + cpu_system_percent) AS cpu_pct
   FROM system.compute.node_timeline
-  WHERE start_time >= current_date() - INTERVAL 30 DAYS AND driver = false
+  WHERE start_time >= current_date() - INTERVAL 30 DAYS AND start_time < current_date() AND driver = false
     AND cluster_id IN (SELECT cluster_id FROM job_clusters)
   GROUP BY 1
 ),
@@ -943,14 +949,14 @@ job_clusters AS (
   SELECT DISTINCT t.workspace_id, t.job_id, exploded.cluster_id
   FROM system.lakeflow.job_task_run_timeline t
   LATERAL VIEW explode(t.compute_ids) exploded AS cluster_id
-  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS
+  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS AND t.period_start_time < current_date()
     AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
 ),
 mem AS (
   SELECT cluster_id, count(*) AS node_minutes,
          avg(mem_used_percent) AS mem_pct, max(mem_used_percent) AS peak_mem_pct
   FROM system.compute.node_timeline
-  WHERE start_time >= current_date() - INTERVAL 30 DAYS AND driver = false
+  WHERE start_time >= current_date() - INTERVAL 30 DAYS AND start_time < current_date() AND driver = false
     AND cluster_id IN (SELECT cluster_id FROM job_clusters)
   GROUP BY 1
 ),
@@ -985,7 +991,7 @@ job_clusters AS (
   SELECT DISTINCT t.workspace_id, t.job_id, exploded.cluster_id
   FROM system.lakeflow.job_task_run_timeline t
   LATERAL VIEW explode(t.compute_ids) exploded AS cluster_id
-  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS
+  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS AND t.period_start_time < current_date()
     AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
 ),
 cfg AS (
@@ -1020,7 +1026,7 @@ job_clusters AS (
   SELECT DISTINCT t.workspace_id, t.job_id, exploded.cluster_id
   FROM system.lakeflow.job_task_run_timeline t
   LATERAL VIEW explode(t.compute_ids) exploded AS cluster_id
-  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS
+  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS AND t.period_start_time < current_date()
     AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
 ),
 cfg AS (
@@ -1079,7 +1085,7 @@ WITH wh_hour AS (
     FROM system.billing.usage u JOIN system.billing.list_prices lp
       ON u.sku_name=lp.sku_name AND u.cloud=lp.cloud
      AND u.usage_start_time>=lp.price_start_time AND (lp.price_end_time IS NULL OR u.usage_start_time<lp.price_end_time)
-    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 14 DAYS
+    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 14 DAYS AND u.usage_date < current_date()
     QUALIFY ROW_NUMBER() OVER (PARTITION BY u.record_id ORDER BY lp.price_start_time DESC)=1
   ) GROUP BY 1,2
 ),
@@ -1091,7 +1097,7 @@ q AS (
          executed_by, execution_duration_ms,
          sum(execution_duration_ms) OVER (PARTITION BY compute.warehouse_id, date_trunc('HOUR', start_time)) AS busy_ms
   FROM system.query.history
-  WHERE start_time >= current_date() - INTERVAL 14 DAYS AND execution_duration_ms > 0
+  WHERE start_time >= current_date() - INTERVAL 14 DAYS AND start_time < current_date() AND execution_duration_ms > 0
 ),
 alloc AS (
   SELECT q.*, w.hour_usd,
@@ -1121,7 +1127,7 @@ WITH wh_hour AS (
     FROM system.billing.usage u JOIN system.billing.list_prices lp
       ON u.sku_name=lp.sku_name AND u.cloud=lp.cloud
      AND u.usage_start_time>=lp.price_start_time AND (lp.price_end_time IS NULL OR u.usage_start_time<lp.price_end_time)
-    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 14 DAYS
+    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 14 DAYS AND u.usage_date < current_date()
     QUALIFY ROW_NUMBER() OVER (PARTITION BY u.record_id ORDER BY lp.price_start_time DESC)=1
   ) GROUP BY 1,2
 ),
@@ -1142,7 +1148,7 @@ q AS (
          execution_duration_ms,
          sum(execution_duration_ms) OVER (PARTITION BY compute.warehouse_id, date_trunc('HOUR', start_time)) AS busy_ms
   FROM system.query.history
-  WHERE start_time >= current_date() - INTERVAL 14 DAYS AND execution_duration_ms > 0
+  WHERE start_time >= current_date() - INTERVAL 14 DAYS AND start_time < current_date() AND execution_duration_ms > 0
 ),
 alloc AS (
   SELECT q.*, w.hour_usd,
@@ -1179,7 +1185,7 @@ wh_hour AS (
     FROM system.billing.usage u JOIN system.billing.list_prices lp
       ON u.sku_name=lp.sku_name AND u.cloud=lp.cloud
      AND u.usage_start_time>=lp.price_start_time AND (lp.price_end_time IS NULL OR u.usage_start_time<lp.price_end_time)
-    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 14 DAYS
+    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 14 DAYS AND u.usage_date < current_date()
     QUALIFY ROW_NUMBER() OVER (PARTITION BY u.record_id ORDER BY lp.price_start_time DESC)=1
   ) GROUP BY 1,2
 ),
@@ -1203,7 +1209,7 @@ q AS (
          execution_duration_ms,
          sum(execution_duration_ms) OVER (PARTITION BY compute.warehouse_id, date_trunc('HOUR', start_time)) AS busy_ms
   FROM system.query.history
-  WHERE start_time >= current_date() - INTERVAL 14 DAYS AND execution_duration_ms > 0
+  WHERE start_time >= current_date() - INTERVAL 14 DAYS AND start_time < current_date() AND execution_duration_ms > 0
 ),
 alloc AS (
   SELECT q.*, w.hour_usd,
@@ -1239,7 +1245,7 @@ WITH wh_hour AS (
     FROM system.billing.usage u JOIN system.billing.list_prices lp
       ON u.sku_name=lp.sku_name AND u.cloud=lp.cloud
      AND u.usage_start_time>=lp.price_start_time AND (lp.price_end_time IS NULL OR u.usage_start_time<lp.price_end_time)
-    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 28 DAYS
+    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 28 DAYS AND u.usage_date < current_date()
     QUALIFY ROW_NUMBER() OVER (PARTITION BY u.record_id ORDER BY lp.price_start_time DESC)=1
   ) GROUP BY 1,2
 ),
@@ -1306,8 +1312,8 @@ JOIN price pr ON u.sku_name=pr.sku_name AND u.cloud=pr.cloud
   AND u.usage_start_time >= pr.price_start_time
   AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
 WHERE u.billing_origin_product = 'MODEL_SERVING'
-  AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
-  AND u.usage_date < date_trunc('WEEK', current_date())   -- complete weeks only
+  AND u.usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS
+  AND u.usage_date < date_trunc('WEEK', current_date())   -- whole weeks only, at both ends
 GROUP BY 1, 2 HAVING sum(u.usage_quantity * pr.unit_usd) > 0
 ORDER BY 1, list_usd DESC
 """,
@@ -1332,7 +1338,7 @@ JOIN price pr ON u.sku_name=pr.sku_name AND u.cloud=pr.cloud
   AND u.usage_start_time >= pr.price_start_time
   AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
 WHERE u.billing_origin_product = 'MODEL_SERVING'
-  AND u.usage_date >= current_date() - INTERVAL 30 DAYS
+  AND u.usage_date >= current_date() - INTERVAL 30 DAYS AND u.usage_date < current_date()
 GROUP BY 1 ORDER BY list_usd DESC NULLS LAST LIMIT 20
 """,
             },
@@ -1356,7 +1362,7 @@ SELECT coalesce(e.endpoint_name, 'unknown')          AS endpoint_name,
        sum(u.input_token_count + u.output_token_count) AS total_tokens
 FROM system.serving.endpoint_usage u
 LEFT JOIN ent e ON u.served_entity_id = e.served_entity_id
-WHERE u.request_time >= current_date() - INTERVAL 30 DAYS
+WHERE u.request_time >= current_date() - INTERVAL 30 DAYS AND u.request_time < current_date()
 GROUP BY 1 ORDER BY total_tokens DESC NULLS LAST LIMIT 25
 """,
             },
@@ -1384,8 +1390,8 @@ WHERE u.billing_origin_product = 'MODEL_SERVING'
   AND u.product_features.serving_type = 'FOUNDATION_MODEL'
   AND u.usage_type = 'COMPUTE_TIME'
   AND u.product_features.model_serving.offering_type <=> 'PROVISIONED_THROUGHPUT'
-  AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
-  AND u.usage_date < date_trunc('WEEK', current_date())   -- complete weeks only
+  AND u.usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS
+  AND u.usage_date < date_trunc('WEEK', current_date())   -- whole weeks only, at both ends
 GROUP BY 1, 2 HAVING sum(u.usage_quantity * pr.unit_usd) > 0
 ORDER BY 1, list_usd DESC
 """,
@@ -1412,7 +1418,7 @@ WITH wh_hour AS (
     FROM system.billing.usage u JOIN system.billing.list_prices lp
       ON u.sku_name=lp.sku_name AND u.cloud=lp.cloud
      AND u.usage_start_time>=lp.price_start_time AND (lp.price_end_time IS NULL OR u.usage_start_time<lp.price_end_time)
-    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 14 DAYS
+    WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 14 DAYS AND u.usage_date < current_date()
     QUALIFY ROW_NUMBER() OVER (PARTITION BY u.record_id ORDER BY lp.price_start_time DESC)=1
   ) GROUP BY 1,2
 ),
@@ -1426,7 +1432,7 @@ q AS (
          execution_duration_ms,
          sum(execution_duration_ms) OVER (PARTITION BY compute.warehouse_id, date_trunc('HOUR', start_time)) AS busy_ms
   FROM system.query.history
-  WHERE start_time >= current_date() - INTERVAL 14 DAYS AND execution_duration_ms > 0
+  WHERE start_time >= current_date() - INTERVAL 14 DAYS AND start_time < current_date() AND execution_duration_ms > 0
     AND statement_text ILIKE '%ai_query(%'
 ),
 alloc AS (
@@ -1470,9 +1476,9 @@ ORDER BY query_usd DESC NULLS LAST LIMIT 10
                 "note": "Billing sees every workspace, but query history and audit only list the "
                         "workspaces they cover, so each ratio divides only the spend of the workspaces "
                         "its denominator can see. User counts are approximate (approx_count_distinct). "
-                        "Data under management is active table data from "
+                        "Cost per TiB is total spend over the total size of the tables in "
                         "system.storage.table_metrics_history, which lists the tables in this region's "
-                        "metastore.",
+                        "metastore; on an account with workspaces in several regions it reads high.",
                 "anomaly": None,
                 "sql": _econ_kpi_sql(True),
                 "without_storage": _econ_kpi_sql(False),
@@ -1486,8 +1492,14 @@ ORDER BY query_usd DESC NULLS LAST LIMIT 10
                 "chart": "lines",
                 "note": "Weekly buckets do not overlap, so a jump shows in full in the week it happens. "
                         "The user ratio uses weekly active users for that reason: a rolling monthly count "
-                        "would spread one bad week across four. The data-under-management line starts "
-                        "when system.storage.table_metrics_history starts.",
+                        "would spread one bad week across four.",
+                "short_series": {"column": "cost per TiB under management",
+                                 "notice": "Cost per TiB under management has {weeks} so far, because "
+                                           "system.storage.table_metrics_history only holds recent "
+                                           "snapshots. Its line draws from its second week.",
+                                 "unreadable": "Cost per TiB under management needs "
+                                               "system.storage.table_metrics_history, which this account "
+                                               "can't read."},
                 "anomaly": {"type": "ts_spike", "time_col": "week", "unit": "usd",
                             "value_cols": ["cost per query", "cost per TiB under management",
                                            "cost per weekly active user"]},
@@ -1548,10 +1560,19 @@ def all_meta() -> list:
     return [board_meta(b) for b in BOARDS]
 
 
-def present(panel: dict, columns: list, rows: list) -> tuple[list, list, dict]:
-    """What a panel shows. The unit-economics result marks each row a kpi or an input: kpis
-    become the tiles above the table and inputs the table. With no account prices the
-    effective discount has nothing to say, so its row goes."""
+def present(panel: dict, columns: list, rows: list, storage: bool = True) -> tuple[list, list, dict]:
+    """What a panel shows. A series too short to draw as a line gets one notice saying why. The
+    unit-economics result marks each row a kpi or an input: kpis become the tiles above the
+    table and inputs the table. With no account prices the effective discount has nothing to
+    say, so its row goes."""
+    short = panel.get("short_series")
+    if short and short["column"] in columns:
+        if not storage:
+            return columns, rows, {"notice": short["unreadable"]}
+        i = columns.index(short["column"])
+        n = sum(r[i] is not None for r in rows)
+        weeks = {0: "no weeks", 1: "one week"}.get(n)
+        return columns, rows, ({"notice": short["notice"].format(weeks=weeks)} if weeks else {})
     if "kind" not in columns:
         return columns, rows, {}
     at = {c: i for i, c in enumerate(columns)}

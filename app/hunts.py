@@ -390,7 +390,7 @@ weekly AS (SELECT wk, count(*) AS v FROM chatter WHERE wk BETWEEN 0 AND 4 GROUP 
 contrib AS (
   SELECT warehouse_id, statement_type, executed_by, client_application, client_driver,
          count(*) AS stmts, count(DISTINCT session_id) AS sessions,
-         round(count(*)/count(DISTINCT session_id),1) AS stmts_per_session,
+         round(count(*) / nullif(count(DISTINCT session_id), 0), 1) AS stmts_per_session,
          max(workspace_id) AS workspace_id
   FROM chatter WHERE wk = 0
   GROUP BY 1, 2, 3, 4, 5
@@ -852,7 +852,7 @@ LIMIT 40
         "title": "Jobs — weekly movers",
         "eli5": "Shows week-over-week usage per job, so you can tell a genuinely new "
                 "workload apart from a cost that crept up with no story.",
-        "what": "Rank the current week, then compare each mover's trajectory. A brand-new "
+        "what": "Rank the latest complete week, then compare each mover's trajectory. A brand-new "
                 "job appearing is expected growth — forecast it. An existing job trending "
                 "up with no new work behind it is the optimisation target. A doubling bill is "
                 "only a problem if it isn't new work.",
@@ -862,7 +862,7 @@ LIMIT 40
         "measure": "M2",
         "explain_hunt_desc": "weekly DBUs per job (spend movers)",
         "explain_rubric": (
-            "rank the current week, then compare each mover's trajectory. usage_metadata also "
+            "rank the latest complete week, then compare each mover's trajectory. usage_metadata also "
             "carries job_run_id and the run-as identity; custom_tags attribute to teams once jobs are tagged."
         ),
         "sql": f"""
@@ -874,7 +874,7 @@ weekly AS (
          sum(usage_quantity)                AS dbus
   FROM system.billing.usage
   WHERE billing_origin_product = 'JOBS'
-    AND usage_date >= current_date() - INTERVAL 8 WEEKS
+    AND usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS AND usage_date < date_trunc('WEEK', current_date())   -- whole weeks only
   GROUP BY workspace_id, usage_metadata.job_id, date_trunc('WEEK', usage_date)
 )
 SELECT {WORKSPACE.label} AS workspace, {JOB.label} AS job_name, c.week, c.dbus, c.workspace_id, c.job_id
@@ -916,7 +916,7 @@ runs AS (
          min(period_start_time)                                            AS run_start,
          sum(timestampdiff(SECOND, period_start_time, period_end_time))    AS duration_s
   FROM system.lakeflow.job_run_timeline
-  WHERE period_start_time >= current_date() - INTERVAL 8 WEEKS
+  WHERE period_start_time >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS
   GROUP BY workspace_id, job_id, run_id
 ),
 weekly AS (
@@ -926,6 +926,7 @@ weekly AS (
          round(percentile_approx(duration_s, 0.50)/60, 1) AS p50_min,
          round(percentile_approx(duration_s, 0.95)/60, 1) AS p95_min
   FROM runs
+  WHERE run_start < date_trunc('WEEK', current_date())   -- whole weeks only
   GROUP BY workspace_id, job_id, date_trunc('WEEK', run_start)
 )
 SELECT {WORKSPACE.label} AS workspace, {JOB.label} AS job_name, c.week, c.runs, c.p50_min, c.p95_min,
@@ -967,7 +968,7 @@ weekly AS (
          max(workspace_id)              AS workspace_id
   FROM system.billing.usage
   WHERE billing_origin_product = 'DLT'
-    AND usage_date >= current_date() - INTERVAL 8 WEEKS
+    AND usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS AND usage_date < date_trunc('WEEK', current_date())   -- whole weeks only
   GROUP BY 1, 2
 )
 SELECT {PIPELINE.label} AS pipeline, c.week, c.dbus, c.pipeline_id
@@ -1654,7 +1655,7 @@ weekly AS (
     AND u.usage_start_time >= lp.price_start_time
     AND (lp.price_end_time IS NULL OR u.usage_start_time < lp.price_end_time)
   WHERE u.usage_metadata.warehouse_id IS NOT NULL
-    AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
+    AND u.usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS AND u.usage_date < date_trunc('WEEK', current_date())   -- whole weeks only
   GROUP BY 1, 2
 )
 SELECT {WAREHOUSE.label} AS warehouse, c.warehouse_id, c.week, c.dbus, c.list_usd
@@ -1765,7 +1766,7 @@ weekly AS (
     AND u.usage_start_time >= pr.price_start_time
     AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
   WHERE u.billing_origin_product IN ('JOBS', 'DLT')
-    AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
+    AND u.usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS AND u.usage_date < date_trunc('WEEK', current_date())   -- whole weeks only
   GROUP BY 1, 2, 3, 4
 )
 SELECT c.product, {WORKSPACE.label} AS workspace,
@@ -1811,7 +1812,7 @@ sj AS (
   WHERE u.billing_origin_product = 'JOBS'
     AND u.product_features.performance_target IS NOT NULL   -- serverless jobs only
     AND u.usage_metadata.job_id IS NOT NULL
-    AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
+    AND u.usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS AND u.usage_date < date_trunc('WEEK', current_date())   -- whole weeks only
 ),
 top_jobs AS (
   SELECT job_id FROM sj WHERE mode = 'PERFORMANCE_OPTIMIZED'
@@ -1854,7 +1855,7 @@ weekly AS (
                         THEN execution_duration_ms ELSE 0 END)/3600000.0, 1) AS over_cap_exec_hours,
          round(max(execution_duration_ms)/3600000.0, 1)          AS longest_exec_hours
   FROM system.query.history
-  WHERE start_time >= current_date() - INTERVAL 8 WEEKS
+  WHERE start_time >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS AND start_time < date_trunc('WEEK', current_date())   -- whole weeks only
   GROUP BY 1, 2
 )
 SELECT coalesce({WAREHOUSE.label}, 'no warehouse') AS warehouse, c.week, c.stmts_over_cap,
@@ -1882,7 +1883,7 @@ WITH {ctes("warehouse")},
 top_wh AS (   -- limit to the busiest warehouses so the table stays legible
   SELECT compute.warehouse_id AS warehouse_id
   FROM system.query.history
-  WHERE start_time >= current_date() - INTERVAL 8 WEEKS AND execution_duration_ms > 0
+  WHERE start_time >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS AND start_time < date_trunc('WEEK', current_date()) AND execution_duration_ms > 0
   GROUP BY 1 ORDER BY sum(execution_duration_ms) DESC LIMIT 8
 ),
 weekly AS (
@@ -1897,7 +1898,7 @@ weekly AS (
     SELECT compute.warehouse_id AS warehouse_id, workspace_id, start_time, read_bytes, spilled_local_bytes,
            execution_duration_ms
     FROM system.query.history
-    WHERE start_time >= current_date() - INTERVAL 8 WEEKS AND execution_duration_ms > 0
+    WHERE start_time >= date_trunc('WEEK', current_date()) - INTERVAL 8 WEEKS AND start_time < date_trunc('WEEK', current_date()) AND execution_duration_ms > 0
   ) q
   JOIN top_wh USING (warehouse_id)
   GROUP BY 1, 2

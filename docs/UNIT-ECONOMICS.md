@@ -14,9 +14,9 @@ hover and keeps it open on tap. The raw inputs they are built from sit in the ta
 
 Every query uses one window of 28 full days. Billing writes most of a day's records that day and the
 rest the next day, so the newest usage day counts only once its usage runs to midnight and its
-next-day records have landed. Otherwise the window ends the day before. On fevm on 5 Nov 2026, 89.8%
-of billing records landed the same day, 10.2% the next day and 0.03% later (mostly corrections), and
-2026-11-04 qualified with 324,304 next-day records against 304,494 for the day before. Query history
+next-day records have landed. Otherwise the window ends the day before. On one large demo account,
+89.8% of billing records landed the same day, 10.2% the next day and 0.03% later (mostly
+corrections), and the newest usage day qualified once its next-day batch matched the day before's. Query history
 (`start_time`), audit (`event_date`) and storage (`snapshot_date`) use the same dates. Ending on
 `current_date()` instead would count a partial day, and every unit cost would look cheaper than it
 is.
@@ -46,7 +46,8 @@ is.
 | Workspace set | Used by | Rule |
 |---|---|---|
 | Query workspaces | Cost per query | At least one `FINISHED` query in `system.query.history` in the window |
-| Audit workspaces | Cost per MAU (all and humans), cost per TiB of data under management | At least one event in `system.access.audit` in the window |
+| Audit workspaces | Cost per MAU (all and humans) | At least one event in `system.access.audit` in the window |
+| Every workspace | Cost per TiB of data under management | Total spend, against the tables the storage history lists |
 
 ## Metrics
 
@@ -55,17 +56,18 @@ is.
 | Cost per query | Spend of query workspaces / finished queries | Counts every finished query, including tiny metadata reads, so it is a fleet average. |
 | Cost per MAU, all identities | Spend of audit workspaces / distinct audit identities | People and service principals both count. |
 | Cost per MAU, humans | Spend of audit workspaces / identities that are emails | An email-like identity is a person; a UUID is a service principal. |
-| Cost per TiB of data under management | Spend of audit workspaces / TiB of active table data | See below. |
+| Cost per TiB of data under management | Total spend / total TiB of table data | See below. |
 | Effective discount | 1 - account-priced spend / list spend, on SKUs with an account price | Shown only when the account has prices; partial with some. |
 
-**Data under management** is `active_bytes` from `system.storage.table_metrics_history`: each table
-at its newest snapshot in the window, unless it was dropped by the window's end. That table lists
-the tables in the current region's metastore, like the audit log, so the ratio uses the spend of the
-workspaces in the audit log. It is a new system table. On fevm its history starts on 2026-10-29, it
-was still filling in (8,478 tables on the first day, 303,369 a week later), and `total_bytes` and
-`time_travel_bytes` were empty, which is why the board uses active data. Where the account can't
-read the table, the board runs a variant without it: that tile and its input row say what is
-missing, and every other figure still shows.
+**Data under management** comes from `system.storage.table_metrics_history`: each table at its
+newest snapshot in the window, unless it was dropped by the window's end, at its total size
+(`total_bytes`, active plus vacuumable files) where the table reports one and its `active_bytes`
+otherwise. Cost per TiB is total spend over that volume. The table lists only the current region's
+metastore, while total spend covers every workspace, so on an account with workspaces in several
+regions the ratio reads high. It is a new system table: on one large demo account its history began
+a week before this was written and was still filling in, and `total_bytes` was empty, so the board
+used active sizes there. Where the account can't read the table, the board runs a variant without
+it: that tile and its input row say what is missing, and every other figure still shows.
 
 Raw inputs in the table: the window, total spend (with the number of workspaces it covers), average
 daily spend over the last 7 days, active products, MAU, human MAU, WAU and DAU (all
@@ -83,8 +85,9 @@ warehouses, so serverless comes from `is_serverless`).
 The trend plots cost per query, cost per TiB of data under management and cost per weekly active
 user over twelve non-overlapping weeks, on a logarithmic axis because the three sit orders of
 magnitude apart. Weekly active users stand in for MAU there: a rolling 28-day count would spread one
-bad week across four and hide the jump. The data-under-management line starts when the table
-metrics history does.
+bad week across four and hide the jump. Cost per TiB under management is each week's total spend over
+that week's data volume. Its line starts when the table metrics history does, and while it has fewer
+than two weeks the panel says so, because one point can't draw a line.
 
 The detector compares the latest week of each cost with the median of its earlier weeks. A week at
 `ANOMALY_MEDIUM_X` times that normal is medium and at `ANOMALY_HIGH_X` times is high: the same

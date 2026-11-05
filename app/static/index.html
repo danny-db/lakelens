@@ -1001,10 +1001,15 @@ async function initModelPicker() {
   try { MODELS = await (await fetch("/api/models")).json(); }
   catch(e) { MODELS = { models: [{ id: META.ai_endpoint, name: META.ai_endpoint, group: "fast" }],
                         groups: { fast: "" }, default: META.ai_endpoint, error: e.message }; }
-  const listed = MODELS.models || [];
-  // A choice saved in another session may not be listed now; the picker must show what runs.
-  if (!listed.some(m => m.id === chosenModel)) chosenModel = MODELS.default || META.ai_endpoint;
-  sel.innerHTML = Object.entries(MODELS.groups || {}).map(([g, label]) => {
+  // Local copies: Tokenomics reads MODELS too, so the picker's fallbacks must not change it.
+  const listed = (MODELS.models || []).slice();
+  const ids = listed.map(m => m.id);
+  // The picker must show what runs. A choice saved in another session may not be listed now, and the
+  // configured default may not be served in this workspace, so fall back to the first listed model.
+  if (!ids.includes(chosenModel)) chosenModel = ids.includes(MODELS.default) ? MODELS.default : (ids[0] || MODELS.default || META.ai_endpoint);
+  if (!listed.length) listed.push({ id: chosenModel, name: chosenModel, group: Object.keys(MODELS.groups || {})[0] || "fast" });
+  const groups = Object.keys(MODELS.groups || {}).length ? MODELS.groups : { [listed[0].group]: "" };
+  sel.innerHTML = Object.entries(groups).map(([g, label]) => {
     const opts = listed.filter(m => m.group === g).map(m =>
       `<option value="${escapeHtml(m.id)}" ${m.id===chosenModel?"selected":""}>${escapeHtml(m.name)}</option>`).join("");
     return opts ? `<optgroup label="${escapeHtml(label)}">${opts}</optgroup>` : "";
@@ -1015,6 +1020,13 @@ async function initModelPicker() {
 }
 
 // ── number / value formatting ────────────────────────────────────────────
+// Axis labels: $950, $12k, $3.5M (a $3.5M tick read as "$3500k").
+function axisUsd(v) {
+  const a = Math.abs(Number(v)), sign = v < 0 ? "-$" : "$";
+  if (a >= 1e6) return sign + (a / 1e6).toFixed(a >= 1e7 ? 0 : 1).replace(/\.0$/, "") + "M";
+  if (a >= 1e3) return sign + (a / 1e3).toFixed(0) + "k";
+  return sign + a;
+}
 function fmtUsd(v) {
   const n = Number(v);
   if (v === null || v === undefined || isNaN(n)) return "—";
@@ -1065,7 +1077,8 @@ function renderTable(columns, rows, total) {
       const col = columns[i];
       if (looksNumeric(col) && cell !== null && cell !== "" && !isNaN(Number(cell))) {
         td.className = "num";
-        td.textContent = isUsdCol(col) ? fmtUsd(cell) : col === "share_pct" ? `${Number(cell).toLocaleString(undefined, {maximumFractionDigits: 1})}%` : fmtNum(cell);
+        // every *pct* column holds 0-100 (shares, failure rates, node CPU and memory percent)
+        td.textContent = isUsdCol(col) ? fmtUsd(cell) : /(^|_)pct(_|$)/i.test(col) ? `${Number(cell).toLocaleString(undefined, {maximumFractionDigits: 1})}%` : fmtNum(cell);
       } else {
         td.textContent = cell === null ? "—" : String(cell);
       }
@@ -1374,7 +1387,7 @@ function renderWarehouseChart(id, data, res) {
       },
       scales: {
         x: { ticks: { color: tick, font:{size:11, family:"PlexMono"} }, grid: { color: grid } },
-        y: { ticks: { color: tick, font:{size:11, family:"PlexMono"}, callback: v => "$"+(v>=1000?(v/1000)+"k":v) }, grid: { color: grid }, title: { display:true, text:"Weekly list-price $", color: tick, font:{size:11} } },
+        y: { ticks: { color: tick, font:{size:11, family:"PlexMono"}, callback: axisUsd }, grid: { color: grid }, title: { display:true, text:"Weekly list-price $", color: tick, font:{size:11} } },
       },
     },
   });
@@ -1411,9 +1424,9 @@ async function loadKpis() {
   }
 }
 function kpiShell(label, icon, id, cls) {
-  const foot = { spend:"list-price DBU cost, all products",
-                 idle:"unallocated warehouse capacity",
-                 topsku:"biggest line on the bill",
+  const foot = { spend:"30 full days, list price, all products",
+                 idle:"14 full days of unallocated warehouse capacity",
+                 topsku:"biggest line on the bill, 30 full days",
                  hunts:"across 6 categories" }[id] || "";
   return `<div class="card kpi ${cls}" id="kpi-${id}">
     <div class="label">${icon} ${label}</div>
@@ -1453,9 +1466,9 @@ function buildAlerts() {
   // filter chips
   $("#filterSev").innerHTML = `<span class="flabel">Severity</span>` +
     ["all","high","medium"].map(s=>`<button class="fbtn ${s==='all'?'active':''}" data-sev="${s}">${s[0].toUpperCase()+s.slice(1)}</button>`).join("");
-  const stStates = ["all","new","acknowledged","in_progress","resolved","dismissed"];
+  const stStates = ["all","new","acknowledged","in_progress","resolved","dismissed"];   // stored values; labels in STATUS_LABEL
   $("#filterStatus").innerHTML = `<span class="flabel">Status</span>` +
-    stStates.map(s=>`<button class="fbtn ${s==='all'?'active':''}" data-status="${s}">${s==='all'?'All':s.replace('_',' ')}</button>`).join("");
+    stStates.map(s=>`<button class="fbtn ${s==='all'?'active':''}" data-status="${s}">${s==='all'?'All':statusLabel(s)}</button>`).join("");
   $$("#filterSev .fbtn").forEach(b=>b.addEventListener("click",()=>{ alertFilter.sev=b.dataset.sev; setActive("#filterSev",b); renderQueue(); }));
   $$("#filterStatus .fbtn").forEach(b=>b.addEventListener("click",()=>{ alertFilter.status=b.dataset.status; setActive("#filterStatus",b); renderQueue(); }));
   // Load the latest persisted scan from the shared Delta store, so everyone
@@ -1706,6 +1719,11 @@ function renderQueue() {
   items.forEach(f => host.appendChild(alertCard(f)));
 }
 
+// A finding nobody has triaged yet is stored as "new", which read like the NEW trend badge
+// beside "= FLAT". Show it as untriaged; the stored value stays the same.
+const STATUS_LABEL = { new: "untriaged", in_progress: "in progress" };
+const statusLabel = s => STATUS_LABEL[s] || s;
+
 function alertCard(f) {
   const st = f.triage?.status || "new";
   const card = document.createElement("div");
@@ -1747,7 +1765,7 @@ function alertCard(f) {
       <div class="alert-main">
         <div class="alert-title-row">
           <h4>${f.title}</h4>
-          <span class="status-pill st-${st}">${st.replace('_',' ')}</span>
+          <span class="status-pill st-${st}" title="triage status">${statusLabel(st)}</span>
           ${trendBadge}
         </div>
         <div class="alert-summary">${escapeHtml(f.summary)}</div>
@@ -1951,7 +1969,8 @@ function renderTokPriced() {
     box.innerHTML = `No $ per DBU: ${escapeHtml(Object.values(p.missing || {})[0] || "no billing rows")}. DBUs are shown without $.`;
   } else {
     box.innerHTML = `Priced for <b>${escapeHtml(p.cloud)}</b> · region <b>${escapeHtml(p.region || "not in billing")}</b> · `
-      + `<b>${escapeHtml(p.tier)}</b> tier, read from this workspace's own billing (workspace ${escapeHtml(p.workspace_id)}). `
+      + `<b>${escapeHtml(p.tier)}</b> tier, read from the billing of this workspace, `
+      + `<b>${escapeHtml(p.workspace_name || "workspace " + p.workspace_id)}</b>. `
       + `Each model's SKU and $/DBU are under <a href="#tokSkuMap">Which bill line each model lands on</a>.`;
   }
 }
@@ -2295,7 +2314,7 @@ function _boardChartDraw(panel, cols, rows, host, cid) {
   const muted = cs.getPropertyValue("--muted").trim();
   const baseScales = {
     x: { ticks:{ color:tick, font:{size:10, family:"DM Mono"}, maxRotation:0, autoSkip:true }, grid:{ color:grid } },
-    y: { ticks:{ color:tick, font:{size:10, family:"DM Mono"}, callback:v=>"$"+(Math.abs(v)>=1000?(v/1000).toFixed(0)+"k":v) }, grid:{ color:grid } },
+    y: { ticks:{ color:tick, font:{size:10, family:"DM Mono"}, callback:axisUsd }, grid:{ color:grid } },
   };
   const chart = panel.chart;
   let cfg;
@@ -2320,10 +2339,12 @@ function _boardChartDraw(panel, cols, rows, host, cid) {
     // orders of magnitude apart (cents per query, hundreds per TiB), so the value axis is
     // logarithmic: every line stays readable and a doubling is the same height on each.
     const labels = rows.map(r => String(r[0]).slice(0,10));
-    const datasets = cols.slice(1).map((c, i) => ({ label: c,
-      data: rows.map(r => r[i+1] == null ? null : Number(r[i+1])),
-      borderColor: BOARD_PALETTE[i % BOARD_PALETTE.length], backgroundColor: "transparent",
-      borderWidth: 2, tension: .3, pointRadius: 2, spanGaps: true }));
+    const datasets = cols.slice(1).map((c, i) => {
+      const data = rows.map(r => r[i+1] == null ? null : Number(r[i+1]));
+      const lone = data.filter(v => v != null).length === 1;   // one point can't draw a line, so make it visible
+      return { label: c, data, borderColor: BOARD_PALETTE[i % BOARD_PALETTE.length], backgroundColor: "transparent",
+               borderWidth: 2, tension: .3, pointRadius: lone ? 5 : 2, spanGaps: true };
+    });
     cfg = { type:"line", data:{ labels, datasets },
       options: baseOpts(muted, { x: baseScales.x, y: { type:"logarithmic", grid:{ color:grid },
         ticks:{ color:tick, font:{size:10, family:"DM Mono"},
@@ -2335,7 +2356,7 @@ function _boardChartDraw(panel, cols, rows, host, cid) {
     const horiz = rows.length > 8;
     const labels = rows.map(r => { const s=String(r[0]); return s.length>30?s.slice(0,28)+"…":s; });
     const fullLabels = rows.map(r => String(r[0]));   // untruncated, for the tooltip title
-    const valAxis = { ticks:{ color:tick, font:{size:10, family:"DM Mono"}, callback:v=>"$"+(Math.abs(v)>=1000?(v/1000).toFixed(0)+"k":v) }, grid:{ color:grid }, beginAtZero:true };
+    const valAxis = { ticks:{ color:tick, font:{size:10, family:"DM Mono"}, callback:axisUsd }, grid:{ color:grid }, beginAtZero:true };
     const catAxis = { ticks:{ color:tick, font:{size:10, family:"DM Mono"}, autoSkip:false }, grid:{ color:grid } };
     // Series label = the PLOTTED value column (r[1] = second col), NOT the last col
     // (which is often a secondary count like "statements" and was mislabelling the bar).
@@ -2403,7 +2424,7 @@ function _boardChartDraw(panel, cols, rows, host, cid) {
         datasets:[{ label:"Δ cost vs last week", data: parts.map(p=>p[1]),
           backgroundColor: parts.map(p=>p[1]>=0?pos:neg), borderRadius:4 }] },
       options: { ...baseOpts(muted, {}), indexAxis:"y",
-        scales:{ x:{ ticks:{ color:tick, font:{size:10,family:"DM Mono"}, callback:v=>{ const a=Math.abs(v); const s=a>=1000?(a/1000).toFixed(0)+"k":String(a); return (v<0?"-$":"$")+s; } }, grid:{ color:grid } },
+        scales:{ x:{ ticks:{ color:tick, font:{size:10,family:"DM Mono"}, callback:axisUsd }, grid:{ color:grid } },
                  y:{ ticks:{ color:tick, font:{size:11,family:"DM Mono"} }, grid:{ color:grid } } } } };
   }
   charts[cid] = new Chart(cv, cfg);
@@ -2581,7 +2602,9 @@ async function renderPanel(boardId, panel, host) {
       });
       slot.appendChild(nb);
     }
-    // 3) headline tiles when the panel has them, then the chart or table (the evidence)
+    // 3) a notice when the data can't support part of the view, headline tiles when the panel
+    //    has them, then the chart or table (the evidence)
+    if (d.notice) slot.insertAdjacentHTML("beforeend", `<div class="panel-note">ℹ️ ${escapeHtml(d.notice)}</div>`);
     if (d.tiles && d.tiles.length) {
       slot.insertAdjacentHTML("beforeend", kpiTiles(d.tiles, d.price_basis));
       slot.querySelectorAll(".kpi-info").forEach(b => b.addEventListener("click", () => b.closest(".kpi").classList.toggle("open")));
@@ -2721,7 +2744,9 @@ $$("#nav button").forEach(b => b.addEventListener("click", () => {
   }
   initTheme();
   try { const svg = await (await fetch("/static/logo.svg")).text(); const el = $("#brandLogo"); if (el) el.innerHTML = svg; } catch(e) {}
-  await initModelPicker();
+  // Listing models can take seconds (a sign-in without model-serving is listed twice), so the page
+  // doesn't wait for it; only Tokenomics, which prices the listed models, is built after it.
+  const picker = initModelPicker();
   const lhc = $("#loopHuntCount"); if (lhc) lhc.textContent = META.hunts.length;
   buildMaturity();
   buildAlerts();
@@ -2729,8 +2754,9 @@ $$("#nav button").forEach(b => b.addEventListener("click", () => {
   buildTune();
   buildProve();
   buildTagging();
-  buildTokenomics();
   loadKpis();
+  await picker.catch(() => {});
+  buildTokenomics();
 })();
 </script>
 </body>

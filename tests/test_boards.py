@@ -163,6 +163,15 @@ class UnitEconomicsTable(unittest.TestCase):
         self.assertIn("Effective discount", [r[0] for r in rows])
         self.assertEqual(extra["price_basis"], "account price where set, list otherwise")
 
+    def test_a_one_week_storage_series_says_why_it_is_a_dot(self):
+        _, panel = boards.find_panel("econ", "trend")
+        cols = ["week", "cost per query", "cost per TiB under management", "cost per weekly active user"]
+        rows = [["2026-10-28", "0.03", None, "68.7"], ["2026-11-04", "0.04", "5975.52", "67.3"]]
+        self.assertIn("one week so far", boards.present(panel, cols, rows)[2]["notice"])
+        self.assertIn("can't read", boards.present(panel, cols, rows, storage=False)[2]["notice"])
+        rows[0][2] = "6000.00"
+        self.assertEqual(boards.present(panel, cols, rows)[2], {})
+
     def test_other_panels_pass_through(self):
         self.assertEqual(boards.present({}, ["week", "usd"], [["w", "1"]]), (["week", "usd"], [["w", "1"]], {}))
 

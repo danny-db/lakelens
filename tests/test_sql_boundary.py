@@ -55,7 +55,7 @@ class SqlBoundary(unittest.TestCase):
     def test_a_panel_runs_without_storage_when_the_account_cannot_read_it(self):
         calls = self.executing(NO_STORAGE, ROWS)
         panel = {"sql": "with storage", "without_storage": "without storage"}
-        self.assertEqual(self.app._panel_rows(panel, None, "econ/kpis"), ROWS)
+        self.assertEqual(self.app._panel_rows(panel, None, "econ/kpis"), (ROWS, False))
         self.assertEqual(calls, ["with storage", "without storage"])
 
     def test_a_panel_without_a_storage_variant_reports_the_failure(self):

@@ -19,7 +19,7 @@ The window holds full days only. Billing writes most of a day's records that day
 
 The headline unit costs, then the raw inputs they are built from, over one window of full days. Each figure uses your account price where one is set and list price otherwise. Coverage says which workspaces each figure rests on. Hover or tap ⓘ for a definition.
 
-Billing sees every workspace, but query history and audit only list the workspaces they cover, so each ratio divides only the spend of the workspaces its denominator can see. User counts are approximate (approx_count_distinct). Data under management is active table data from system.storage.table_metrics_history, which lists the tables in this region's metastore.
+Billing sees every workspace, but query history and audit only list the workspaces they cover, so each ratio divides only the spend of the workspaces its denominator can see. User counts are approximate (approx_count_distinct). Cost per TiB is total spend over the total size of the tables in system.storage.table_metrics_history, which lists the tables in this region's metastore; on an account with workspaces in several regions it reads high.
 
 ```sql
 WITH latest AS (   -- the newest ingestion day; billing is still writing to it
@@ -79,8 +79,8 @@ ids AS (   -- each audit identity once per workspace and day; an email is a pers
   GROUP BY 1, 2, 3
 ),
 stored AS (   -- each table at its newest snapshot in the window, unless dropped by its end
-  SELECT count(*) AS tables, sum(active_bytes) / POW(1024, 4) AS tib
-  FROM (SELECT active_bytes, table_dropped_time FROM system.storage.table_metrics_history
+  SELECT count(*) AS tables, sum(coalesce(total_bytes, active_bytes)) / POW(1024, 4) AS tib
+  FROM (SELECT total_bytes, active_bytes, table_dropped_time FROM system.storage.table_metrics_history
         WHERE snapshot_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
         QUALIFY row_number() OVER (PARTITION BY table_id ORDER BY snapshot_date DESC) = 1)
   WHERE table_dropped_time IS NULL OR to_date(table_dropped_time) > (SELECT end_date FROM win)
@@ -135,17 +135,17 @@ m AS (   -- one row; each ratio's spend is limited to the workspaces its denomin
   CROSS JOIN stored st
 )
 SELECT inline(array(
-  named_struct('metric', 'Cost per query', 'kind', 'kpi', 'value', concat('$', format_number(m.q_net_usd / m.queries, 4)),
-               'coverage', concat(format_number(100 * m.q_list_usd / m.list_usd, 1), '% of spend'), 'definition', 'Spend of the workspaces with finished queries / those queries',
+  named_struct('metric', 'Cost per query', 'kind', 'kpi', 'value', concat('$', format_number(m.q_net_usd / nullif(m.queries, 0), 4)),
+               'coverage', concat(format_number(100 * m.q_list_usd / nullif(m.list_usd, 0), 1), '% of spend'), 'definition', 'Spend of the workspaces with finished queries / those queries',
                'has_account_prices', m.priced_list_usd IS NOT NULL),
-  named_struct('metric', 'Cost per MAU, all identities', 'kind', 'kpi', 'value', concat('$', format_number(m.a_net_usd / m.mau, 2)),
-               'coverage', concat(format_number(100 * m.a_list_usd / m.list_usd, 1), '% of spend'), 'definition', 'Spend of the workspaces in the audit log / monthly active identities, people and service principals',
+  named_struct('metric', 'Cost per MAU, all identities', 'kind', 'kpi', 'value', concat('$', format_number(m.a_net_usd / nullif(m.mau, 0), 2)),
+               'coverage', concat(format_number(100 * m.a_list_usd / nullif(m.list_usd, 0), 1), '% of spend'), 'definition', 'Spend of the workspaces in the audit log / monthly active identities, people and service principals',
                'has_account_prices', m.priced_list_usd IS NOT NULL),
-  named_struct('metric', 'Cost per MAU, humans', 'kind', 'kpi', 'value', concat('$', format_number(m.a_net_usd / m.mau_human, 2)),
-               'coverage', concat(format_number(100 * m.a_list_usd / m.list_usd, 1), '% of spend'), 'definition', 'Spend of the workspaces in the audit log / monthly active people, the audit identities that are emails',
+  named_struct('metric', 'Cost per MAU, humans', 'kind', 'kpi', 'value', concat('$', format_number(m.a_net_usd / nullif(m.mau_human, 0), 2)),
+               'coverage', concat(format_number(100 * m.a_list_usd / nullif(m.list_usd, 0), 1), '% of spend'), 'definition', 'Spend of the workspaces in the audit log / monthly active people, the audit identities that are emails',
                'has_account_prices', m.priced_list_usd IS NOT NULL),
-  named_struct('metric', 'Cost per TiB of data under management', 'kind', 'kpi', 'value', CASE WHEN m.stored_tib > 0 THEN concat('$', format_number(m.a_net_usd / m.stored_tib, 2)) ELSE '' END,
-               'coverage', CASE WHEN m.stored_tib IS NULL THEN 'needs system.storage.table_metrics_history' ELSE concat(concat(format_number(100 * m.a_list_usd / m.list_usd, 1), '% of spend'), ' · ', concat(format_number(m.stored_tables, 0), ' tables')) END, 'definition', 'Spend of the workspaces in the audit log / TiB of active table data in this metastore',
+  named_struct('metric', 'Cost per TiB of data under management', 'kind', 'kpi', 'value', CASE WHEN m.stored_tib > 0 THEN concat('$', format_number(m.net_usd / m.stored_tib, 2)) ELSE '' END,
+               'coverage', CASE WHEN m.stored_tib IS NULL THEN 'needs system.storage.table_metrics_history' ELSE concat('all spend · ', concat(format_number(m.stored_tables, 0), ' tables')) END, 'definition', 'Total spend / total TiB of table data in this metastore',
                'has_account_prices', m.priced_list_usd IS NOT NULL),
   named_struct('metric', 'Window', 'kind', 'input', 'value', concat(m.start_date, ' to ', m.end_date),
                'coverage', '', 'definition', '28 full days, ending on the newest day whose billing has finished landing',
@@ -153,8 +153,8 @@ SELECT inline(array(
   named_struct('metric', 'Total spend', 'kind', 'input', 'value', concat('$', format_number(m.net_usd, 0)),
                'coverage', concat(format_number(m.workspaces, 0), ' workspaces'), 'definition', 'Usage × price, every workspace',
                'has_account_prices', m.priced_list_usd IS NOT NULL),
-  named_struct('metric', 'Effective discount', 'kind', 'input', 'value', CASE WHEN m.priced_list_usd IS NULL THEN '' ELSE concat(format_number(100 * (1 - m.priced_acct_usd / m.priced_list_usd), 1), '%', CASE WHEN m.unpriced_rows > 0 THEN ' (partial)' ELSE '' END) END,
-               'coverage', concat(format_number(100 * coalesce(m.priced_list_usd, 0) / m.list_usd, 1), '% of list spend priced'), 'definition', '1 - account $ / list $, on priced SKUs',
+  named_struct('metric', 'Effective discount', 'kind', 'input', 'value', CASE WHEN m.priced_list_usd IS NULL THEN '' ELSE concat(format_number(100 * (1 - m.priced_acct_usd / nullif(m.priced_list_usd, 0)), 1), '%', CASE WHEN m.unpriced_rows > 0 THEN ' (partial)' ELSE '' END) END,
+               'coverage', concat(format_number(100 * coalesce(m.priced_list_usd, 0) / nullif(m.list_usd, 0), 1), '% of list spend priced'), 'definition', '1 - account $ / list $, on priced SKUs',
                'has_account_prices', m.priced_list_usd IS NOT NULL),
   named_struct('metric', 'Avg daily spend, last 7 days', 'kind', 'input', 'value', concat('$', format_number(m.daily_net_usd, 0)),
                'coverage', '', 'definition', 'Spend in the last 7 days of the window / 7',
@@ -187,7 +187,7 @@ SELECT inline(array(
                'coverage', '', 'definition', 'read_bytes of those queries',
                'has_account_prices', m.priced_list_usd IS NOT NULL),
   named_struct('metric', 'Data under management', 'kind', 'input', 'value', CASE WHEN m.stored_tib IS NULL THEN '' ELSE concat(format_number(m.stored_tib, 0), ' TiB') END,
-               'coverage', CASE WHEN m.stored_tib IS NULL THEN 'needs system.storage.table_metrics_history' ELSE concat(format_number(m.stored_tables, 0), ' tables') END, 'definition', 'Active table data, each table at its newest snapshot in the window',
+               'coverage', CASE WHEN m.stored_tib IS NULL THEN 'needs system.storage.table_metrics_history' ELSE concat(format_number(m.stored_tables, 0), ' tables') END, 'definition', 'Each table at its newest snapshot in the window: its total size, or its active size where it reports no total',
                'has_account_prices', m.priced_list_usd IS NOT NULL)
 )) FROM m
 ```
@@ -198,7 +198,7 @@ If the account can't read `system.storage.table_metrics_history`, replace the `s
 
 Cost per query, per TiB of data under management and per weekly active user, one 7-day bucket at a time, ending where the table above ends. A unit cost jumping above its own normal means the same work got pricier.
 
-Weekly buckets do not overlap, so a jump shows in full in the week it happens. The user ratio uses weekly active users for that reason: a rolling monthly count would spread one bad week across four. The data-under-management line starts when system.storage.table_metrics_history starts.
+Weekly buckets do not overlap, so a jump shows in full in the week it happens. The user ratio uses weekly active users for that reason: a rolling monthly count would spread one bad week across four.
 
 ```sql
 WITH latest AS (   -- the newest ingestion day; billing is still writing to it
@@ -258,8 +258,9 @@ ids AS (   -- each audit identity once per workspace and day; an email is a pers
   GROUP BY 1, 2, 3
 ),
 stored AS (   -- per week, each table at its newest snapshot in the week, unless dropped by the week's end
-  SELECT wk, sum(active_bytes) / POW(1024, 4) AS tib
-  FROM (SELECT floor(datediff(w.end_date, t.snapshot_date) / 7) AS wk, t.active_bytes, t.table_dropped_time,
+  SELECT wk, sum(coalesce(total_bytes, active_bytes)) / POW(1024, 4) AS tib
+  FROM (SELECT floor(datediff(w.end_date, t.snapshot_date) / 7) AS wk, t.total_bytes, t.active_bytes,
+               t.table_dropped_time,
                w.end_date
         FROM system.storage.table_metrics_history t CROSS JOIN win w
         WHERE t.snapshot_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
@@ -276,8 +277,7 @@ users AS (SELECT floor(days_back / 7) AS wk, approx_count_distinct(identity) AS 
           FROM ids GROUP BY 1)
 SELECT date_sub(max(w.end_date), CAST(s.wk AS INT) * 7) AS week,
        round(sum(CASE WHEN q.queries > 0 THEN s.usd END) / sum(q.queries), 4) AS `cost per query`,
-       round(sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.usd END)
-             / nullif(max(st.tib), 0), 2) AS `cost per TiB under management`,
+       round(sum(s.usd) / nullif(max(st.tib), 0), 2) AS `cost per TiB under management`,
        round(sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.usd END) / max(u.wau), 2)
          AS `cost per weekly active user`
 FROM spend s
@@ -455,7 +455,7 @@ Query 1 returns these rows already computed. `kind` is kpi for the headline unit
 | Cost per query | Spend of the workspaces with finished queries / those queries |
 | Cost per MAU, all identities | Spend of the workspaces in the audit log / monthly active identities, people and service principals |
 | Cost per MAU, humans | Spend of the workspaces in the audit log / monthly active people, the audit identities that are emails |
-| Cost per TiB of data under management | Spend of the workspaces in the audit log / TiB of active table data in this metastore |
+| Cost per TiB of data under management | Total spend / total TiB of table data in this metastore |
 | Effective discount | 1 - account $ / list $, on priced SKUs |
 
 Raw inputs in the same table:
@@ -472,13 +472,13 @@ Raw inputs in the same table:
 - Data read: read_bytes of finished queries.
 - DBSQL queries: Finished queries on a SQL warehouse.
 - DBSQL data read: read_bytes of those queries.
-- Data under management: Active table data, each table at its newest snapshot in the window.
+- Data under management: Each table at its newest snapshot in the window: its total size, or its active size where it reports no total.
 
 What the workspace sets mean:
 
 - Query-workspace spend is the spend of workspaces with at least one finished query in `system.query.history` in the window.
 - Audit-workspace spend is the spend of workspaces with at least one event in `system.access.audit` in the window.
-- Data under management is active table data from `system.storage.table_metrics_history`, each table at its newest snapshot in the window unless it was dropped by the window's end. It lists the tables in the current region's metastore, like the audit log, so the ratio divides the spend of the workspaces in the audit log.
+- Data under management comes from `system.storage.table_metrics_history`: each table at its newest snapshot in the window unless it was dropped by the window's end, at its total size (active plus vacuumable files) where it reports one and its active size otherwise. Cost per TiB is total spend over that volume. The table lists only the current region's metastore, so on an account with workspaces in several regions the ratio reads high; say so when you quote it.
 
 ## Step 4. Visualise
 

@@ -448,10 +448,12 @@ def get_kpis(request: Request):
     client = _client_for(request)
     kpis: dict[str, Any] = {}
 
-    # 30-day total list-price DBU $ across the account (region-scoped system tables).
+    # Total list-price DBU $ across the account over the last 30 full days (the same window
+    # rule as Unit economics, so a partial day never counts).
     try:
-        kpis["spend_30d"] = _run_scalar("""
-            WITH price AS (SELECT sku_name, cloud, price_start_time, price_end_time,
+        kpis["spend_30d"] = _run_scalar(f"""
+            WITH {boards_content.full_days(30)},
+            price AS (SELECT sku_name, cloud, price_start_time, price_end_time,
                                   pricing.effective_list.default AS unit_usd
                            FROM system.billing.list_prices)
             SELECT round(sum(u.usage_quantity * pr.unit_usd), 0)
@@ -459,16 +461,17 @@ def get_kpis(request: Request):
             LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
               AND u.usage_start_time >= pr.price_start_time
               AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-            WHERE u.usage_date >= current_date() - INTERVAL 30 DAYS
+            WHERE u.usage_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
         """, client)
     except Exception as e:
         logger.warning(f"kpi spend_30d failed: {e}")
         kpis["spend_30d"] = None
 
-    # Top product (SKU) by 30-day $.
+    # Top product (SKU) by $ over the same 30 full days.
     try:
-        top = _run_sql("""
-            WITH price AS (SELECT sku_name, cloud, price_start_time, price_end_time,
+        top = _run_sql(f"""
+            WITH {boards_content.full_days(30)},
+            price AS (SELECT sku_name, cloud, price_start_time, price_end_time,
                                   pricing.effective_list.default AS unit_usd
                            FROM system.billing.list_prices)
             SELECT u.sku_name, round(sum(u.usage_quantity * pr.unit_usd), 0) AS usd
@@ -476,7 +479,7 @@ def get_kpis(request: Request):
             LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
               AND u.usage_start_time >= pr.price_start_time
               AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-            WHERE u.usage_date >= current_date() - INTERVAL 30 DAYS
+            WHERE u.usage_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
             GROUP BY 1 ORDER BY usd DESC NULLS LAST LIMIT 1
         """, client)
         kpis["top_sku"] = {"name": top["rows"][0][0], "usd": top["rows"][0][1]} if top["rows"] else None
@@ -484,10 +487,11 @@ def get_kpis(request: Request):
         logger.warning(f"kpi top_sku failed: {e}")
         kpis["top_sku"] = None
 
-    # Total unallocated (idle) warehouse $ over 14d — the M1b headline, summed.
+    # Total unallocated (idle) warehouse $ over the last 14 full days — the M1b headline, summed.
     try:
-        kpis["idle_14d"] = _run_scalar("""
-            WITH wh_hour AS (
+        kpis["idle_14d"] = _run_scalar(f"""
+            WITH {boards_content.full_days(14)},
+            wh_hour AS (
               SELECT warehouse_id, hour, sum(usage_quantity * unit_usd) AS hour_usd FROM (
                 SELECT u.usage_metadata.warehouse_id AS warehouse_id,
                        date_trunc('HOUR', u.usage_start_time) AS hour,
@@ -495,7 +499,8 @@ def get_kpis(request: Request):
                 FROM system.billing.usage u JOIN system.billing.list_prices lp
                   ON u.sku_name=lp.sku_name AND u.cloud=lp.cloud
                  AND u.usage_start_time>=lp.price_start_time AND (lp.price_end_time IS NULL OR u.usage_start_time<lp.price_end_time)
-                WHERE u.usage_metadata.warehouse_id IS NOT NULL AND u.usage_date >= current_date() - INTERVAL 14 DAYS
+                WHERE u.usage_metadata.warehouse_id IS NOT NULL
+                  AND u.usage_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY u.record_id ORDER BY lp.price_start_time DESC) = 1
               ) GROUP BY 1,2),
             cfg_hist AS (SELECT warehouse_id, max_clusters, change_time AS valid_from,
@@ -504,7 +509,8 @@ def get_kpis(request: Request):
             busy AS (SELECT compute.warehouse_id AS warehouse_id, date_trunc('HOUR',start_time) AS hour,
                             sum(execution_duration_ms) AS busy_ms
                      FROM system.query.history
-                     WHERE start_time >= current_date() - INTERVAL 14 DAYS AND execution_duration_ms>0 GROUP BY 1,2),
+                     WHERE start_time >= (SELECT start_date FROM win) AND start_time < (SELECT date_add(end_date, 1) FROM win)
+                       AND execution_duration_ms>0 GROUP BY 1,2),
             hour_alloc AS (SELECT w.warehouse_id, w.hour, w.hour_usd, coalesce(b.busy_ms,0) AS busy_ms,
                              GREATEST(coalesce(c.max_clusters,1)*3600000.0, coalesce(b.busy_ms,0)) AS capacity_ms
                            FROM wh_hour w LEFT JOIN cfg_hist c ON c.warehouse_id=w.warehouse_id
@@ -545,18 +551,18 @@ def run_hunt(hunt_id: str, request: Request):
 # the callouts it returns are what render above the chart. The rule detects; the
 # optional AI pass only narrates the rule's finding — never invents a number.
 
-def _panel_rows(p: dict, client: WorkspaceClient, where: str) -> dict[str, Any]:
-    """A panel's rows. Charts need every row to build the series, so this is unbounded (like
-    the Prove measures); panels are pre-aggregated in SQL (weeks, top-N), so row counts are
-    small. A panel that reads system.storage also has a variant without it, run when the
-    account has no such table or the user can't read it."""
+def _panel_rows(p: dict, client: WorkspaceClient, where: str) -> tuple[dict[str, Any], bool]:
+    """A panel's rows, and whether they include system.storage. Charts need every row to build
+    the series, so this is unbounded (like the Prove measures); panels are pre-aggregated in
+    SQL (weeks, top-N), so row counts are small. A panel that reads system.storage also has a
+    variant without it, run when the account has no such table or the user can't read it."""
     try:
-        return _run_sql(p["sql"], client, max_rows=None)
+        return _run_sql(p["sql"], client, max_rows=None), True
     except HTTPException as e:
         if not p.get("without_storage") or "system.storage" not in str(e.detail).replace("`", ""):
             raise
         logger.warning(f"panel {where} runs without system.storage: {e.detail}")
-        return _run_sql(p["without_storage"], client, max_rows=None)
+        return _run_sql(p["without_storage"], client, max_rows=None), False
 
 
 @app.get("/api/board/{board_id}/{panel_id}")
@@ -565,8 +571,8 @@ def run_panel(board_id: str, panel_id: str, request: Request):
     if not p:
         raise HTTPException(404, f"unknown panel {board_id}/{panel_id}")
     try:
-        out = _panel_rows(p, _client_for(request), f"{board_id}/{panel_id}")
-        columns, rows, extra = boards_content.present(p, out["columns"], out["rows"])
+        out, storage = _panel_rows(p, _client_for(request), f"{board_id}/{panel_id}")
+        columns, rows, extra = boards_content.present(p, out["columns"], out["rows"], storage)
         anomalies = boards_content.compute_anomalies(p, columns, rows)
         return {"board": board_id, "panel": panel_id, "chart": p["chart"],
                 "columns": columns, "rows": rows,
@@ -590,8 +596,8 @@ def narrate_panel(board_id: str, panel_id: str, request: Request, model: Optiona
         raise HTTPException(404, f"unknown panel {board_id}/{panel_id}")
     client = _client_for(request)
     try:
-        out = _panel_rows(p, client, f"{board_id}/{panel_id}")
-        columns, rows, _ = boards_content.present(p, out["columns"], out["rows"])
+        out, storage = _panel_rows(p, client, f"{board_id}/{panel_id}")
+        columns, rows, _ = boards_content.present(p, out["columns"], out["rows"], storage)
         anomalies = boards_content.compute_anomalies(p, columns, rows)
         if not anomalies:
             return {"board": board_id, "panel": panel_id, "anomalies": [],
@@ -993,12 +999,24 @@ def _workspace_prices(client: WorkspaceClient) -> pricing.Prices:
     return pricing.workspace_prices(out["rows"])
 
 
+def _workspace_name(client: WorkspaceClient) -> Optional[str]:
+    """This workspace's name, or None when the user can't read system.access.workspaces_latest."""
+    try:
+        out = _run_sql("SELECT workspace_name FROM system.access.workspaces_latest WHERE workspace_id = :workspace_id",
+                       client, max_rows=1, params=[{"name": "workspace_id", "value": _workspace_id()}])
+    except HTTPException as e:
+        logger.warning(f"workspace name lookup failed: {e.detail}")
+        return None
+    return (out["rows"][0][0] or None) if out["rows"] else None
+
+
 @app.get("/api/token/prices")
 def token_prices(request: Request):
     """The cloud, tier and region this workspace bills in, and the $ per DBU of each model SKU,
     for the Tokenomics calculator and rate card."""
-    prices = _workspace_prices(_client_for(request))
-    return {"workspace_id": _workspace_id(), **pricing.as_json(prices)}
+    client = _client_for(request)
+    prices = _workspace_prices(client)
+    return {"workspace_id": _workspace_id(), "workspace_name": _workspace_name(client), **pricing.as_json(prices)}
 
 
 @app.get("/api/token/actuals")
