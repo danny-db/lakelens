@@ -283,16 +283,30 @@ def compute_anomalies(panel: dict, columns: list, rows: list) -> list:
 
 
 # ── Unit economics: shared SQL ───────────────────────────────────────────────
-# Every unit-economics query reads one window. The newest billing day is still
-# loading, so the window ends the day before it; query history and audit use the
-# same dates. A row is priced at the account's own price when one exists for its
-# SKU, otherwise at list, so a missing price never turns into an invented discount.
-# account_prices is one CTE so a test can swap in synthetic prices. The window
-# bounds appear as scalar subqueries only in WHERE (they still prune there); inside
-# an expression they cost Photon a slow path, so rows carry days_back instead.
+# Every unit-economics query reads one window of full days. Billing writes most of a
+# day's records that day and the rest the next day, so the newest usage day counts only
+# once its usage runs to midnight and its next-day records have landed; otherwise the
+# window ends the day before. Query history and audit use the same dates. A row is priced
+# at the account's own price when one exists for its SKU, otherwise at list, so a missing
+# price never turns into an invented discount. account_prices is one CTE so a test can
+# swap in synthetic prices. The window bounds appear as scalar subqueries only in WHERE
+# (they still prune there); inside an expression they cost Photon a slow path, so rows
+# carry days_back instead.
 
 def _econ_with(days: int) -> str:
-    return f"""WITH bounds AS (SELECT date_sub(max(usage_date), 1) AS end_date FROM system.billing.usage),
+    return f"""WITH latest AS (   -- the newest ingestion day; billing is still writing to it
+  SELECT max(ingestion_date) AS day FROM system.billing.usage WHERE usage_date >= current_date() - INTERVAL 7 DAYS
+),
+newest AS (   -- the usage day before it: full once its usage runs to midnight and its next-day records have landed
+  SELECT max(u.usage_end_time) AS last_end, count(CASE WHEN u.ingestion_date = l.day THEN 1 END) AS next_day_records
+  FROM system.billing.usage u CROSS JOIN latest l
+  WHERE u.usage_date = (SELECT date_sub(day, 1) FROM latest)
+),
+bounds AS (
+  SELECT CASE WHEN n.last_end >= l.day AND n.next_day_records > 0 THEN date_sub(l.day, 1)
+              ELSE date_sub(l.day, 2) END AS end_date
+  FROM latest l CROSS JOIN newest n
+),
 win AS (SELECT date_sub(end_date, {days - 1}) AS start_date, end_date FROM bounds),
 account_prices AS (
   SELECT sku_name, cloud, currency_code, usage_unit, price_start_time, price_end_time,
@@ -340,23 +354,56 @@ ids AS (   -- each audit identity once per workspace and day; an email is a pers
   GROUP BY 1, 2, 3
 )"""
 
+# Data under management is active table data from this system table. It is new, so a panel
+# that reads it also has a variant without it, and an account that can't read it still gets
+# every other figure. A table counts once, at its newest snapshot in the window, unless it
+# was dropped by the window's end. It lists the tables in the current region's metastore,
+# like the audit log, so the ratio divides the spend of the workspaces in the audit log.
+STORAGE_TABLE = "system.storage.table_metrics_history"
+
+
+def _stored_total(storage: bool) -> str:
+    if not storage:
+        return ",\nstored AS (SELECT CAST(NULL AS BIGINT) AS tables, CAST(NULL AS DOUBLE) AS tib)"
+    return f""",
+stored AS (   -- each table at its newest snapshot in the window, unless dropped by its end
+  SELECT count(*) AS tables, sum(active_bytes) / POW(1024, 4) AS tib
+  FROM (SELECT active_bytes, table_dropped_time FROM {STORAGE_TABLE}
+        WHERE snapshot_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
+        QUALIFY row_number() OVER (PARTITION BY table_id ORDER BY snapshot_date DESC) = 1)
+  WHERE table_dropped_time IS NULL OR to_date(table_dropped_time) > (SELECT end_date FROM win)
+)"""
+
+
+def _stored_weekly(storage: bool) -> str:
+    if not storage:
+        return ",\nstored AS (SELECT CAST(NULL AS DOUBLE) AS wk, CAST(NULL AS DOUBLE) AS tib)"
+    return f""",
+stored AS (   -- per week, each table at its newest snapshot in the week, unless dropped by the week's end
+  SELECT wk, sum(active_bytes) / POW(1024, 4) AS tib
+  FROM (SELECT floor(datediff(w.end_date, t.snapshot_date) / 7) AS wk, t.active_bytes, t.table_dropped_time,
+               w.end_date
+        FROM {STORAGE_TABLE} t CROSS JOIN win w
+        WHERE t.snapshot_date BETWEEN (SELECT start_date FROM win) AND (SELECT end_date FROM win)
+        QUALIFY row_number() OVER (PARTITION BY floor(datediff(w.end_date, t.snapshot_date) / 7), t.table_id
+                                   ORDER BY t.snapshot_date DESC) = 1)
+  WHERE table_dropped_time IS NULL OR to_date(table_dropped_time) > date_sub(end_date, CAST(wk AS INT) * 7)
+  GROUP BY wk
+)"""
+
 
 class Kpi(NamedTuple):
-    """One row of the unit-economics table, as SQL over the one-row `m` CTE."""
+    """One row of the unit-economics result, as SQL over the one-row `m` CTE. A kpi is a
+    headline tile above the table; an input is a row of the table."""
     metric: str
-    value: str        # at list price, or the raw count
-    discounted: str   # at the account's own prices; '' where price doesn't apply
-    coverage: str     # which workspaces the figure rests on
+    kind: str         # 'kpi' or 'input'
+    value: str        # at the account's own price where one is set, list price otherwise; or a count
+    coverage: str     # which workspaces or tables the figure rests on
     definition: str
 
 
 def _usd(expr: str, dp: int = 0) -> str:
     return f"concat('$', format_number({expr}, {dp}))"
-
-
-def _at_account_prices(expr: str, dp: int = 0) -> str:
-    return (f"CASE WHEN m.priced_list_usd IS NULL THEN 'unavailable: no account prices' "
-            f"ELSE concat({_usd(expr, dp)}, CASE WHEN m.unpriced_rows > 0 THEN ' (partial)' ELSE '' END) END")
 
 
 def _share(part: str, whole: str, of: str) -> str:
@@ -367,44 +414,52 @@ def _count(expr: str, suffix: str = "") -> str:
     return f"concat(format_number({expr}, 0), '{suffix}')"
 
 
+_NO_STORAGE = f"'needs {STORAGE_TABLE}'"
+
 ECON_KPIS = [
-    Kpi("Window", "concat(m.start_date, ' to ', m.end_date)", "''", "''",
-        "28 full days before the newest billing day"),
-    Kpi("Total spend", _usd("m.list_usd"), _at_account_prices("m.net_usd"),
-        _count("m.workspaces", " workspaces"), "Usage × price, every workspace"),
-    Kpi("Effective discount", "''",
-        "CASE WHEN m.priced_list_usd IS NULL THEN 'unavailable: no account prices' ELSE concat("
+    Kpi("Cost per query", "kpi", _usd("m.q_net_usd / m.queries", 4),
+        _share("m.q_list_usd", "m.list_usd", "spend"),
+        "Spend of the workspaces with finished queries / those queries"),
+    Kpi("Cost per MAU, all identities", "kpi", _usd("m.a_net_usd / m.mau", 2),
+        _share("m.a_list_usd", "m.list_usd", "spend"),
+        "Spend of the workspaces in the audit log / monthly active identities, people and service principals"),
+    Kpi("Cost per MAU, humans", "kpi", _usd("m.a_net_usd / m.mau_human", 2),
+        _share("m.a_list_usd", "m.list_usd", "spend"),
+        "Spend of the workspaces in the audit log / monthly active people, the audit identities that are emails"),
+    Kpi("Cost per TiB of data under management", "kpi",
+        f"CASE WHEN m.stored_tib > 0 THEN {_usd('m.a_net_usd / m.stored_tib', 2)} ELSE '' END",
+        f"CASE WHEN m.stored_tib IS NULL THEN {_NO_STORAGE} "
+        f"ELSE concat({_share('m.a_list_usd', 'm.list_usd', 'spend')}, ' · ', {_count('m.stored_tables', ' tables')}) END",
+        "Spend of the workspaces in the audit log / TiB of active table data in this metastore"),
+    Kpi("Window", "input", "concat(m.start_date, ' to ', m.end_date)", "''",
+        "28 full days, ending on the newest day whose billing has finished landing"),
+    Kpi("Total spend", "input", _usd("m.net_usd"), _count("m.workspaces", " workspaces"),
+        "Usage × price, every workspace"),
+    Kpi("Effective discount", "input",
+        "CASE WHEN m.priced_list_usd IS NULL THEN '' ELSE concat("
         "format_number(100 * (1 - m.priced_acct_usd / m.priced_list_usd), 1), '%', "
         "CASE WHEN m.unpriced_rows > 0 THEN ' (partial)' ELSE '' END) END",
         _share("coalesce(m.priced_list_usd, 0)", "m.list_usd", "list spend priced"),
         "1 - account $ / list $, on priced SKUs"),
-    Kpi("Avg daily spend, last 7 days", _usd("m.daily_list_usd"), _at_account_prices("m.daily_net_usd"),
-        "''", "Spend in the last 7 days of the window / 7"),
-    Kpi("Active products", _count("m.products"), "''", "''", "Billing products with spend"),
-    Kpi("MAU, all identities (approx)", _count("m.mau"), "''", _count("m.a_workspaces", " workspaces in audit"),
+    Kpi("Avg daily spend, last 7 days", "input", _usd("m.daily_net_usd"), "''",
+        "Spend in the last 7 days of the window / 7"),
+    Kpi("Active products", "input", _count("m.products"), "''", "Billing products with spend"),
+    Kpi("MAU, all identities (approx)", "input", _count("m.mau"), _count("m.a_workspaces", " workspaces in audit"),
         "Distinct audit identities, 28 days"),
-    Kpi("MAU, humans (approx)", _count("m.mau_human"), "''", _count("m.a_workspaces", " workspaces in audit"),
+    Kpi("MAU, humans (approx)", "input", _count("m.mau_human"), _count("m.a_workspaces", " workspaces in audit"),
         "Audit identities that are emails"),
-    Kpi("WAU (approx)", _count("m.wau"), "''", "''", "Distinct audit identities, last 7 days"),
-    Kpi("DAU (approx)", _count("m.dau"), "''", "''", "Distinct audit identities, last day"),
-    Kpi("Finished queries", _count("m.queries"), "''", _count("m.q_workspaces", " workspaces with queries"),
+    Kpi("WAU (approx)", "input", _count("m.wau"), "''", "Distinct audit identities, last 7 days"),
+    Kpi("DAU (approx)", "input", _count("m.dau"), "''", "Distinct audit identities, last day"),
+    Kpi("Finished queries", "input", _count("m.queries"), _count("m.q_workspaces", " workspaces with queries"),
         "query.history rows, status FINISHED"),
-    Kpi("Data read", _count("m.read_tib", " TiB"), "''", "''", "read_bytes of finished queries"),
-    Kpi("DBSQL queries", _count("m.sql_queries"), "''", _count("m.sql_workspaces", " workspaces with DBSQL"),
+    Kpi("Data read", "input", _count("m.read_tib", " TiB"), "''", "read_bytes of finished queries"),
+    Kpi("DBSQL queries", "input", _count("m.sql_queries"), _count("m.sql_workspaces", " workspaces with DBSQL"),
         "Finished queries on a SQL warehouse"),
-    Kpi("DBSQL data read", _count("m.sql_read_tib", " TiB"), "''", "''", "read_bytes of those queries"),
-    Kpi("a. Cost per query", _usd("m.q_list_usd / m.queries", 4), _at_account_prices("m.q_net_usd / m.queries", 4),
-        _share("m.q_list_usd", "m.list_usd", "spend"), "Query-workspace spend / queries"),
-    Kpi("b. Cost per MAU, all", _usd("m.a_list_usd / m.mau", 2), _at_account_prices("m.a_net_usd / m.mau", 2),
-        _share("m.a_list_usd", "m.list_usd", "spend"), "Audit-workspace spend / MAU"),
-    Kpi("c. Cost per MAU, human", _usd("m.a_list_usd / m.mau_human", 2),
-        _at_account_prices("m.a_net_usd / m.mau_human", 2),
-        _share("m.a_list_usd", "m.list_usd", "spend"), "Audit-workspace spend / human MAU"),
-    Kpi("d. Cost per TiB read", _usd("m.q_list_usd / m.read_tib", 2), _at_account_prices("m.q_net_usd / m.read_tib", 2),
-        _share("m.q_list_usd", "m.list_usd", "spend"), "Query-workspace spend / TiB read"),
-    Kpi("e. DBSQL cost per TiB read", _usd("m.dbsql_list_usd / m.sql_read_tib", 2),
-        _at_account_prices("m.dbsql_net_usd / m.sql_read_tib", 2),
-        _share("m.dbsql_list_usd", "m.sql_list_usd", "SQL spend"), "DBSQL-workspace SQL spend / TiB read"),
+    Kpi("DBSQL data read", "input", _count("m.sql_read_tib", " TiB"), "''", "read_bytes of those queries"),
+    Kpi("Data under management", "input",
+        f"CASE WHEN m.stored_tib IS NULL THEN '' ELSE {_count('m.stored_tib', ' TiB')} END",
+        f"CASE WHEN m.stored_tib IS NULL THEN {_NO_STORAGE} ELSE {_count('m.stored_tables', ' tables')} END",
+        "Active table data, each table at its newest snapshot in the window"),
 ]
 
 
@@ -413,7 +468,8 @@ def _sql_str(s: str) -> str:
     return f"'{s}'"
 
 
-_ECON_KPI_SQL = _econ_with(28) + _ECON_ACTIVITY + """,
+def _econ_kpi_sql(storage: bool) -> str:
+    return _econ_with(28) + _ECON_ACTIVITY + _stored_total(storage) + """,
 spend AS (   -- per workspace
   SELECT workspace_id,
          sum(list_usd) AS list_usd,
@@ -421,9 +477,6 @@ spend AS (   -- per workspace
          sum(CASE WHEN acct_usd IS NOT NULL THEN list_usd END) AS priced_list_usd,
          sum(acct_usd) AS priced_acct_usd,
          count(CASE WHEN acct_usd IS NULL AND list_usd > 0 THEN 1 END) AS unpriced_rows,
-         sum(CASE WHEN product = 'SQL' THEN list_usd END) AS sql_list_usd,
-         sum(CASE WHEN product = 'SQL' THEN coalesce(acct_usd, list_usd) END) AS sql_net_usd,
-         sum(CASE WHEN floor(days_back / 7) = 0 THEN list_usd END) AS week_list_usd,
          sum(CASE WHEN floor(days_back / 7) = 0 THEN coalesce(acct_usd, list_usd) END) AS week_net_usd,
          collect_set(CASE WHEN list_usd > 0 THEN product END) AS products
   FROM priced GROUP BY 1
@@ -448,32 +501,33 @@ m AS (   -- one row; each ratio's spend is limited to the workspaces its denomin
          sum(s.unpriced_rows) AS unpriced_rows,
          count(CASE WHEN s.list_usd > 0 THEN 1 END) AS workspaces,
          size(array_distinct(flatten(collect_list(s.products)))) AS products,
-         sum(s.week_list_usd) / 7 AS daily_list_usd, sum(s.week_net_usd) / 7 AS daily_net_usd,
+         sum(s.week_net_usd) / 7 AS daily_net_usd,
          sum(q.queries) AS queries, sum(q.read_bytes) / POW(1024, 4) AS read_tib,
          count(q.workspace_id) AS q_workspaces,
          sum(CASE WHEN q.queries > 0 THEN s.list_usd END) AS q_list_usd,
          sum(CASE WHEN q.queries > 0 THEN s.net_usd END) AS q_net_usd,
          sum(q.sql_queries) AS sql_queries, sum(q.sql_read_bytes) / POW(1024, 4) AS sql_read_tib,
          count(CASE WHEN q.sql_queries > 0 THEN 1 END) AS sql_workspaces,
-         sum(s.sql_list_usd) AS sql_list_usd,
-         sum(CASE WHEN q.sql_queries > 0 THEN s.sql_list_usd END) AS dbsql_list_usd,
-         sum(CASE WHEN q.sql_queries > 0 THEN s.sql_net_usd END) AS dbsql_net_usd,
          max(u.mau) AS mau, max(u.mau_human) AS mau_human, max(u.wau) AS wau, max(u.dau) AS dau,
          max(size(u.audit_workspaces)) AS a_workspaces,
          sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.list_usd END) AS a_list_usd,
-         sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.net_usd END) AS a_net_usd
+         sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.net_usd END) AS a_net_usd,
+         max(st.tables) AS stored_tables, max(st.tib) AS stored_tib
   FROM spend s
   FULL OUTER JOIN q ON s.workspace_id = q.workspace_id
   CROSS JOIN users u
   CROSS JOIN win w
+  CROSS JOIN stored st
 )
 SELECT inline(array(
 """ + ",\n".join(
-    f"  named_struct('metric', {_sql_str(k.metric)}, 'value', {k.value}, 'discounted', {k.discounted},\n"
-    f"               'coverage', {k.coverage}, 'definition', {_sql_str(k.definition)})"
-    for k in ECON_KPIS) + """
+        f"  named_struct('metric', {_sql_str(k.metric)}, 'kind', {_sql_str(k.kind)}, 'value', {k.value},\n"
+        f"               'coverage', {k.coverage}, 'definition', {_sql_str(k.definition)},\n"
+        f"               'has_account_prices', m.priced_list_usd IS NOT NULL)"
+        for k in ECON_KPIS) + """
 )) FROM m
 """
+
 
 _ECON_SPLIT_SQL = _econ_with(28) + """
 SELECT {label} AS {label_as},
@@ -484,23 +538,25 @@ GROUP BY 1 HAVING sum(coalesce(acct_usd, list_usd)) > 0
 ORDER BY spend_usd DESC
 """
 
-_ECON_TREND_SQL = _econ_with(84) + _ECON_ACTIVITY + """,
+
+def _econ_trend_sql(storage: bool) -> str:
+    return _econ_with(84) + _ECON_ACTIVITY + _stored_weekly(storage) + """,
 spend AS (SELECT workspace_id, floor(days_back / 7) AS wk, sum(coalesce(acct_usd, list_usd)) AS usd
           FROM priced GROUP BY 1, 2),
-q AS (SELECT workspace_id, floor(days_back / 7) AS wk, sum(queries) AS queries, sum(read_bytes) AS read_bytes
-      FROM queries GROUP BY 1, 2),
+q AS (SELECT workspace_id, floor(days_back / 7) AS wk, sum(queries) AS queries FROM queries GROUP BY 1, 2),
 users AS (SELECT floor(days_back / 7) AS wk, approx_count_distinct(identity) AS wau,
                  collect_set(workspace_id) AS audit_workspaces
           FROM ids GROUP BY 1)
 SELECT date_sub(max(w.end_date), CAST(s.wk AS INT) * 7) AS week,
        round(sum(CASE WHEN q.queries > 0 THEN s.usd END) / sum(q.queries), 4) AS `cost per query`,
-       round(sum(CASE WHEN q.queries > 0 THEN s.usd END) / (sum(q.read_bytes) / POW(1024, 4)), 2)
-         AS `cost per TiB read`,
+       round(sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.usd END)
+             / nullif(max(st.tib), 0), 2) AS `cost per TiB under management`,
        round(sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.usd END) / max(u.wau), 2)
          AS `cost per weekly active user`
 FROM spend s
 LEFT JOIN q ON s.workspace_id = q.workspace_id AND s.wk = q.wk
 LEFT JOIN users u ON s.wk = u.wk
+LEFT JOIN stored st ON s.wk = st.wk
 CROSS JOIN win w
 GROUP BY s.wk ORDER BY week
 """
@@ -1391,7 +1447,7 @@ ORDER BY query_usd DESC NULLS LAST LIMIT 10
     },
 
     # ══════════════════════════════════════════════════════════════════════════
-    # UNIT ECONOMICS — what a query, a TiB read and an active user cost.
+    # UNIT ECONOMICS — what a query, an active user and a TiB under management cost.
     # Danny's Genie One skill, rebuilt on system tables only (it read internal
     # finance tables). tools/gen_unit_economics_skill.py writes the skill back
     # out from this SQL.
@@ -1400,38 +1456,43 @@ ORDER BY query_usd DESC NULLS LAST LIMIT 10
         "id": "econ",
         "label": "Unit economics",
         "icon": "\U0001F9EE",
-        "blurb": "What a query, a terabyte read and an active user cost this account, from system "
-                 "tables only, with the share of spend each ratio rests on.",
+        "blurb": "What a query, an active user and a terabyte under management cost this account, from "
+                 "system tables only, with the share of spend each ratio rests on.",
         "panels": [
             {
                 "id": "kpis",
                 "title": "Unit economics (28 days)",
-                "eli5": "The raw inputs and the unit costs built from them, over one window. Value is "
-                        "at list price; discounted uses your account prices where they exist. Coverage "
-                        "says which workspaces each figure rests on.",
+                "eli5": "The headline unit costs, then the raw inputs they are built from, over one window "
+                        "of full days. Each figure uses your account price where one is set and list price "
+                        "otherwise. Coverage says which workspaces each figure rests on. Hover or tap ⓘ "
+                        "for a definition.",
                 "chart": "table",
                 "note": "Billing sees every workspace, but query history and audit only list the "
                         "workspaces they cover, so each ratio divides only the spend of the workspaces "
                         "its denominator can see. User counts are approximate (approx_count_distinct). "
-                        "With no rows in system.billing.account_prices, the discounted column and the "
-                        "effective discount say unavailable rather than guess.",
+                        "Data under management is active table data from "
+                        "system.storage.table_metrics_history, which lists the tables in this region's "
+                        "metastore.",
                 "anomaly": None,
-                "sql": _ECON_KPI_SQL,
+                "sql": _econ_kpi_sql(True),
+                "without_storage": _econ_kpi_sql(False),
             },
             {
                 "id": "trend",
                 "title": "Weekly unit costs (12 weeks)",
-                "eli5": "Cost per query, per TiB read and per weekly active user, one 7-day bucket at a "
-                        "time, ending where the table above ends. A unit cost jumping above its own "
-                        "normal means the same work got pricier.",
+                "eli5": "Cost per query, per TiB of data under management and per weekly active user, one "
+                        "7-day bucket at a time, ending where the table above ends. A unit cost jumping "
+                        "above its own normal means the same work got pricier.",
                 "chart": "lines",
                 "note": "Weekly buckets do not overlap, so a jump shows in full in the week it happens. "
                         "The user ratio uses weekly active users for that reason: a rolling monthly count "
-                        "would spread one bad week across four.",
+                        "would spread one bad week across four. The data-under-management line starts "
+                        "when system.storage.table_metrics_history starts.",
                 "anomaly": {"type": "ts_spike", "time_col": "week", "unit": "usd",
-                            "value_cols": ["cost per query", "cost per TiB read",
+                            "value_cols": ["cost per query", "cost per TiB under management",
                                            "cost per weekly active user"]},
-                "sql": _ECON_TREND_SQL,
+                "sql": _econ_trend_sql(True),
+                "without_storage": _econ_trend_sql(False),
             },
             {
                 "id": "by_product",
@@ -1485,6 +1546,22 @@ def board_meta(b: dict) -> dict:
 
 def all_meta() -> list:
     return [board_meta(b) for b in BOARDS]
+
+
+def present(panel: dict, columns: list, rows: list) -> tuple[list, list, dict]:
+    """What a panel shows. The unit-economics result marks each row a kpi or an input: kpis
+    become the tiles above the table and inputs the table. With no account prices the
+    effective discount has nothing to say, so its row goes."""
+    if "kind" not in columns:
+        return columns, rows, {}
+    at = {c: i for i, c in enumerate(columns)}
+    priced = any(str(r[at["has_account_prices"]]).lower() == "true" for r in rows)
+    keep = [c for c in columns if c not in ("kind", "has_account_prices")]
+    tiles = [{c: r[at[c]] for c in keep} for r in rows if r[at["kind"]] == "kpi"]
+    table = [[r[at[c]] for c in keep] for r in rows
+             if r[at["kind"]] != "kpi" and (priced or r[at["metric"]] != "Effective discount")]
+    basis = "account price where set, list otherwise" if priced else "list price"
+    return keep, table, {"tiles": tiles, "price_basis": basis}
 
 
 def find_panel(board_id: str, panel_id: str):

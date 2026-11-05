@@ -167,6 +167,10 @@
   .kpi.accent-teal .val { color: var(--teal); }
   .kpi.accent-coral .val { color: var(--coral); }
   .kpi .spark { position: absolute; right: -6px; bottom: -6px; font-size: 46px; opacity: .05; }
+  .board-kpis { margin: 4px 0 18px; }
+  .kpi .kpi-info { background: none; border: 0; padding: 0 2px; color: var(--muted-2); font-size: 13px; cursor: help; }
+  .kpi .kpi-def { display: none; font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.45; }
+  .kpi.open .kpi-def { display: block; }
 
   /* ── Loop / maturity ── */
   .loop { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 28px; }
@@ -570,6 +574,9 @@
   @media (max-width: 860px) {
     .kpi-row, .maturity { grid-template-columns: repeat(2, 1fr); }
     .loop, .practice-grid { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .board-kpis { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -2536,6 +2543,17 @@ async function renderGenieResult(box, conv, resp, item, cid) {
   return true;
 }
 
+// Headline figures as tiles, like the Overview's. ⓘ shows the definition on hover and keeps it open on tap.
+function kpiTiles(tiles, basis) {
+  return `<div class="kpi-row board-kpis">` + tiles.map(t => `
+    <div class="card kpi">
+      <div class="label">${escapeHtml(t.metric)}<button type="button" class="kpi-info" title="${escapeHtml(t.definition)}" aria-label="What this measures">ⓘ</button></div>
+      <div class="val">${t.value ? escapeHtml(t.value) : "—"}</div>
+      <div class="foot">${escapeHtml([t.coverage, basis].filter(Boolean).join(" · "))}</div>
+      <div class="kpi-def">${escapeHtml(t.definition)}</div>
+    </div>`).join("") + `</div>`;
+}
+
 async function renderPanel(boardId, panel, host) {
   const wrap = document.createElement("div"); wrap.className = "board-panel card"; wrap.style.padding = "18px 20px";
   wrap.innerHTML = `<h3>${panel.title}</h3><p class="peli5">${panel.eli5}</p>
@@ -2563,7 +2581,11 @@ async function renderPanel(boardId, panel, host) {
       });
       slot.appendChild(nb);
     }
-    // 3) the chart or table (the evidence)
+    // 3) headline tiles when the panel has them, then the chart or table (the evidence)
+    if (d.tiles && d.tiles.length) {
+      slot.insertAdjacentHTML("beforeend", kpiTiles(d.tiles, d.price_basis));
+      slot.querySelectorAll(".kpi-info").forEach(b => b.addEventListener("click", () => b.closest(".kpi").classList.toggle("open")));
+    }
     if (!d.rows || !d.rows.length) {
       slot.insertAdjacentHTML("beforeend", `<div class="result-status clean" style="padding:8px 0;"><span class="badge-clean">✓</span> No data in this window.</div>`);
     } else if (panel.chart === "table") {

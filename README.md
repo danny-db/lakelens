@@ -49,7 +49,7 @@ flowchart LR
 
 📖 **[Full catalogue](docs/CATALOGUE.md)**: every hunt, Tune practice and measure, with what it finds, how to read it, what to do, how it is graded and the system tables it reads.
 
-🧮 **[Unit economics](docs/UNIT-ECONOMICS.md)**: cost per query, per active user and per TiB read, and the effective discount, from system tables only. Also a [Genie One skill](docs/skills/unit-economics/SKILL.md).
+🧮 **[Unit economics](docs/UNIT-ECONOMICS.md)**: cost per query, per active user and per TiB of data under management, and the effective discount, from system tables only. Also a [Genie One skill](docs/skills/unit-economics/SKILL.md).
 
 | Tab | What it does |
 |---|---|

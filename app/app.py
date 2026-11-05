@@ -545,20 +545,33 @@ def run_hunt(hunt_id: str, request: Request):
 # the callouts it returns are what render above the chart. The rule detects; the
 # optional AI pass only narrates the rule's finding — never invents a number.
 
+def _panel_rows(p: dict, client: WorkspaceClient, where: str) -> dict[str, Any]:
+    """A panel's rows. Charts need every row to build the series, so this is unbounded (like
+    the Prove measures); panels are pre-aggregated in SQL (weeks, top-N), so row counts are
+    small. A panel that reads system.storage also has a variant without it, run when the
+    account has no such table or the user can't read it."""
+    try:
+        return _run_sql(p["sql"], client, max_rows=None)
+    except HTTPException as e:
+        if not p.get("without_storage") or "system.storage" not in str(e.detail).replace("`", ""):
+            raise
+        logger.warning(f"panel {where} runs without system.storage: {e.detail}")
+        return _run_sql(p["without_storage"], client, max_rows=None)
+
+
 @app.get("/api/board/{board_id}/{panel_id}")
 def run_panel(board_id: str, panel_id: str, request: Request):
     b, p = boards_content.find_panel(board_id, panel_id)
     if not p:
         raise HTTPException(404, f"unknown panel {board_id}/{panel_id}")
     try:
-        # Charts need every row to build the series, so this caller is unbounded
-        # (like the Prove measures). Panels are pre-aggregated in SQL (weeks,
-        # top-N), so the row counts are small.
-        out = _run_sql(p["sql"], _client_for(request), max_rows=None)
-        anomalies = boards_content.compute_anomalies(p, out["columns"], out["rows"])
+        out = _panel_rows(p, _client_for(request), f"{board_id}/{panel_id}")
+        columns, rows, extra = boards_content.present(p, out["columns"], out["rows"])
+        anomalies = boards_content.compute_anomalies(p, columns, rows)
         return {"board": board_id, "panel": panel_id, "chart": p["chart"],
-                "columns": out["columns"], "rows": out["rows"],
-                "total_rows": out["total_rows"], "anomalies": anomalies}
+                "columns": columns, "rows": rows,
+                "total_rows": out["total_rows"] - (len(out["rows"]) - len(rows)),
+                "anomalies": anomalies, **extra}
     except HTTPException:
         raise
     except Exception as e:
@@ -577,8 +590,9 @@ def narrate_panel(board_id: str, panel_id: str, request: Request, model: Optiona
         raise HTTPException(404, f"unknown panel {board_id}/{panel_id}")
     client = _client_for(request)
     try:
-        out = _run_sql(p["sql"], client, max_rows=None)
-        anomalies = boards_content.compute_anomalies(p, out["columns"], out["rows"])
+        out = _panel_rows(p, client, f"{board_id}/{panel_id}")
+        columns, rows, _ = boards_content.present(p, out["columns"], out["rows"])
+        anomalies = boards_content.compute_anomalies(p, columns, rows)
         if not anomalies:
             return {"board": board_id, "panel": panel_id, "anomalies": [],
                     "narration": "No anomalies detected in this view for the current window."}

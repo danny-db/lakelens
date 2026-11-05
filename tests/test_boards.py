@@ -133,6 +133,40 @@ class DecompDriver(unittest.TestCase):
             self.assertEqual(severities(spec, self.COLS, self.row(700, 400, scale)), [])
 
 
+class UnitEconomicsTable(unittest.TestCase):
+    COLS = ["metric", "kind", "value", "coverage", "definition", "has_account_prices"]
+
+    def result(self, priced):
+        flag = "true" if priced else "false"
+        return [[k.metric, k.kind, "v", "c", k.definition, flag] for k in boards.ECON_KPIS]
+
+    def shown(self, priced):
+        _, panel = boards.find_panel("econ", "kpis")
+        return boards.present(panel, self.COLS, self.result(priced))
+
+    def test_the_four_unit_costs_are_tiles_and_the_rest_is_the_table(self):
+        cols, rows, extra = self.shown(priced=False)
+        self.assertEqual([t["metric"] for t in extra["tiles"]],
+                         ["Cost per query", "Cost per MAU, all identities", "Cost per MAU, humans",
+                          "Cost per TiB of data under management"])
+        self.assertEqual(cols, ["metric", "value", "coverage", "definition"])
+        self.assertNotIn("Cost per query", [r[0] for r in rows])
+        self.assertTrue(all(t["definition"] for t in extra["tiles"]))
+
+    def test_without_account_prices_figures_are_list_price_and_the_discount_row_goes(self):
+        _, rows, extra = self.shown(priced=False)
+        self.assertEqual(extra["price_basis"], "list price")
+        self.assertNotIn("Effective discount", [r[0] for r in rows])
+
+    def test_with_account_prices_the_effective_discount_stays(self):
+        _, rows, extra = self.shown(priced=True)
+        self.assertIn("Effective discount", [r[0] for r in rows])
+        self.assertEqual(extra["price_basis"], "account price where set, list otherwise")
+
+    def test_other_panels_pass_through(self):
+        self.assertEqual(boards.present({}, ["week", "usd"], [["w", "1"]]), (["week", "usd"], [["w", "1"]], {}))
+
+
 class Catalogue(unittest.TestCase):
     def test_generated_skill_matches_the_board_sql(self):
         sys.path.insert(0, os.path.join(ROOT, "tools"))

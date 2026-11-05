@@ -1,4 +1,5 @@
-"""The SQL boundary: a system-table read that races a file change runs once more. Needs the
+"""The SQL boundary: a system-table read that races a file change runs once more, and a panel
+that reads system.storage runs without it where the account can't read that table. Needs the
 app's requirements (FastAPI, Databricks SDK). Run from the repo root:
     python3 -m unittest discover tests
 """
@@ -50,6 +51,18 @@ class SqlBoundary(unittest.TestCase):
         with self.assertRaises(HTTPException):
             self.app._run_sql("SELECT 1", None)
         self.assertEqual(len(calls), 1)
+
+    def test_a_panel_runs_without_storage_when_the_account_cannot_read_it(self):
+        calls = self.executing(NO_STORAGE, ROWS)
+        panel = {"sql": "with storage", "without_storage": "without storage"}
+        self.assertEqual(self.app._panel_rows(panel, None, "econ/kpis"), ROWS)
+        self.assertEqual(calls, ["with storage", "without storage"])
+
+    def test_a_panel_without_a_storage_variant_reports_the_failure(self):
+        from fastapi import HTTPException
+        self.executing(NO_STORAGE)
+        with self.assertRaises(HTTPException):
+            self.app._panel_rows({"sql": "with storage"}, None, "usage/trend")
 
 
 if __name__ == "__main__":
