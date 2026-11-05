@@ -72,7 +72,7 @@ Compute you are paying for while it does little or no work - warehouses that nev
 - **What to do:** Fix the tool first - e.g. a BI tool's refresh schedule left at its aggressive default, or a monitoring tool that should have its own small warehouse. Then move always-on tools onto a small serverless warehouse where a short auto-stop is practical.
 - **Alerts:** Account zero-read statements this week (a total) versus the account's normal (median of the account's prior four weekly totals): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M3 The “After” Scoreboard - weekly $ per warehouse
-- **Reads:** `system.compute.warehouses`, `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.compute.warehouses`, `system.query.history`
 
 #### H4 Warehouses that never sleep
 
@@ -81,7 +81,7 @@ Compute you are paying for while it does little or no work - warehouses that nev
 - **What to do:** If a warehouse never stops AND a chatty client is hitting it (see the Chatter hunt), fix the client or move it to its own small serverless warehouse. If it never stops because of genuine round-the-clock load, that is fine - just confirm the size matches the load (see Queue Pressure).
 - **Alerts:** Informational (no alert)
 - **Prove the fix with:** M3 The “After” Scoreboard - weekly $ per warehouse
-- **Reads:** `system.compute.warehouse_events`, `system.compute.warehouses`
+- **Reads:** `system.access.workspaces_latest`, `system.compute.warehouse_events`, `system.compute.warehouses`
 
 #### H14 Idle cores
 
@@ -90,7 +90,7 @@ Compute you are paying for while it does little or no work - warehouses that nev
 - **What to do:** Right-size on this evidence: start with a small cluster and step up only when the metrics say so. Use fewer, larger nodes for shuffle-heavy work rather than many small ones.
 - **Alerts:** Informational (no alert)
 - **Prove the fix with:** M2 Exact $ per job and per pipeline
-- **Reads:** `system.compute.node_timeline`
+- **Reads:** `system.access.workspaces_latest`, `system.compute.clusters`, `system.compute.node_timeline`
 
 #### H16 Jobs running on All-Purpose compute
 
@@ -99,7 +99,7 @@ Compute you are paying for while it does little or no work - warehouses that nev
 - **What to do:** Move the job to Jobs Compute (an ephemeral cluster that spins up per run and terminates after) or Serverless Jobs. That drops it to the Jobs rate and removes idle-between-runs billing. Interim: shorten the cluster's auto-termination so it stops soon after the last run.
 - **Alerts:** Account job runs on All-Purpose compute this week (a total) versus the account's normal (median of the account's prior four weekly totals): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M2 Exact $ per job and per pipeline
-- **Reads:** `system.billing.list_prices`, `system.billing.usage`, `system.compute.clusters`, `system.lakeflow.job_task_run_timeline`, `system.lakeflow.jobs`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.list_prices`, `system.billing.usage`, `system.compute.clusters`, `system.lakeflow.job_run_timeline`, `system.lakeflow.job_task_run_timeline`, `system.lakeflow.jobs`
 
 #### H18 Idle cores on interactive clusters
 
@@ -108,7 +108,7 @@ Compute you are paying for while it does little or no work - warehouses that nev
 - **What to do:** Right-size on this evidence: fewer / smaller nodes, or move the scheduled work to Jobs compute (which terminates per run). Shorten auto-termination so it can't sit idle for hours. For notebook work, serverless notebooks scale to zero.
 - **Alerts:** Account idle node-minutes on interactive clusters this week (a total) versus the account's normal (median of the account's prior four weekly totals): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M2 Exact $ per job and per pipeline
-- **Reads:** `system.compute.clusters`, `system.compute.node_timeline`
+- **Reads:** `system.access.workspaces_latest`, `system.compute.clusters`, `system.compute.node_timeline`
 
 #### H19 Databricks Apps compute
 
@@ -117,7 +117,7 @@ Compute you are paying for while it does little or no work - warehouses that nev
 - **What to do:** Audit per-app traffic (Apps UI Insights, or OAuth-consent as a breadth signal); stop or undeploy apps no one uses, and consolidate per-workspace/per-env duplicates. Apps that only need business-hours availability don't need to run overnight.
 - **Alerts:** Account Databricks Apps DBUs this week (a total) versus the account's normal (median of the account's prior four weekly totals (complete days)): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M2 Exact $ per job and per pipeline
-- **Reads:** `system.billing.usage`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.usage`
 
 ### Heavy Reads & Spill
 
@@ -130,7 +130,7 @@ Queries that read far more data than they need, or run out of memory and spill t
 - **What to do:** Bound the source with an incremental watermark so it only reads new rows; bound the target with incremental_predicates on a date column; cluster the target on that same column so old data can be skipped; and update only the rows that changed.
 - **Alerts:** Account MERGE reads this week (a total) versus the account's normal (median of the account's prior four weekly MERGE read totals): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M4 Benchmark a fix - per-statement efficiency, week over week
-- **Reads:** `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`, `system.query.history`
 
 #### H2 Disk spill
 
@@ -139,7 +139,7 @@ Queries that read far more data than they need, or run out of memory and spill t
 - **What to do:** Rewrite first - shorten lookbacks, stage a re-used CTE into a temp table, and de-duplicate the small side before joins. Only if a clean query still spills should you increase the warehouse/cluster size. Open the worst offender's query profile to see which step spills.
 - **Alerts:** Account disk spill this week (a total) versus the account's normal (median of the account's prior four weekly spill totals): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M4 Benchmark a fix - per-statement efficiency, week over week
-- **Reads:** `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`, `system.query.history`
 
 #### H6 Unusually heavy scan hours across the account
 
@@ -170,7 +170,7 @@ Statements that run for hours, or the same small query fired thousands of times.
 - **What to do:** Set a workspace-wide statement timeout so runaways stop themselves; the platform default is TWO DAYS. A few times the account's usual longest statement (the normal this check shows) is a sensible starting point, and long ETL can raise its own limit per session. Note: changing the workspace setting restarts running warehouses, so schedule it.
 - **Alerts:** Account's longest statement this week (a peak) versus the account's normal (median of the account's longest statement in each of the prior four weeks): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M5 Timeout guardrail scoreboard
-- **Reads:** `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`, `system.query.history`
 
 #### H7 Repeated identical queries (polling)
 
@@ -179,7 +179,7 @@ Statements that run for hours, or the same small query fired thousands of times.
 - **What to do:** Find what re-runs the statement (open ‘example_statement_id’ in Query History) and make it event-driven: a table-update trigger runs work only when the source changes. If a dashboard or app reads the same result again and again, point it at a cached or materialised result instead. Otherwise lower the frequency to what downstream actually needs.
 - **Alerts:** Account repeat runs of identical SELECTs this week (a total) versus the account's normal (median of the account's prior four weekly totals of repeat runs): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M3 The “After” Scoreboard - weekly $ per warehouse
-- **Reads:** `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`, `system.query.history`
 
 ### Right-Sizing & Config
 
@@ -192,7 +192,7 @@ Are your warehouses and clusters the right size and shape for the work? This cat
 - **What to do:** Decide warehouse by warehouse, by load shape. Spiky, idle-heavy workloads suit serverless (scales in seconds, stops in minutes). Steady, predictable load can suit a right-sized classic warehouse with spot and committed-use discounts. Keep different workload types on separate warehouses so one noisy client can't queue everyone.
 - **Alerts:** Account queue wait this week (a total) versus the account's normal (median of the account's prior four weekly queue-wait totals): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M3 The “After” Scoreboard - weekly $ per warehouse
-- **Reads:** `system.compute.warehouses`, `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.compute.warehouses`, `system.query.history`
 
 #### H9 Warehouse config audit
 
@@ -201,7 +201,7 @@ Are your warehouses and clusters the right size and shape for the work? This cat
 - **What to do:** Agree a baseline for each warehouse (type, size, auto-stop) and re-run this audit weekly. Any difference from the baseline is a conversation, not a surprise.
 - **Alerts:** Informational (no alert)
 - **Prove the fix with:** M3 The “After” Scoreboard - weekly $ per warehouse
-- **Reads:** `system.compute.warehouses`
+- **Reads:** `system.access.workspaces_latest`, `system.compute.warehouses`
 
 #### H17 Warehouses with auto-stop disabled
 
@@ -210,7 +210,7 @@ Are your warehouses and clusters the right size and shape for the work? This cat
 - **What to do:** Set auto_stop_minutes to a short value that fits the workload's idle gaps so it suspends when idle, and drop min_clusters to 1 unless sustained concurrency needs more. For genuinely bursty BI, a serverless warehouse auto-stops in minutes.
 - **Alerts:** Classic warehouses with auto-stop off: medium whenever a row exists (a configuration state, no magnitude)
 - **Prove the fix with:** M3 The “After” Scoreboard - weekly $ per warehouse
-- **Reads:** `system.compute.warehouses`
+- **Reads:** `system.access.workspaces_latest`, `system.compute.warehouses`
 
 #### H22 Serverless jobs in Performance-optimized mode
 
@@ -219,7 +219,7 @@ Are your warehouses and clusters the right size and shape for the work? This cat
 - **What to do:** For latency-tolerant jobs - scheduled batch, backfills, overnight ETL, anything with no downstream deadline - turn OFF ‘Performance optimization’ on the job's serverless compute (Job → task → Compute → Serverless → Performance optimized). That accepts a slower cold start in exchange for fewer DBUs. Keep Performance-optimized only where a run has a real SLA or a waiting consumer. Prove the change with M6 (the job's Performance-optimized line should fall, replaced by a smaller Standard line).
 - **Alerts:** Account Performance-optimized serverless job spend this week (a total) versus the account's normal (median of the account's prior four weekly totals (complete days)): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M6 Serverless job cost by performance mode
-- **Reads:** `system.billing.list_prices`, `system.billing.usage`, `system.lakeflow.jobs`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.list_prices`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`
 
 ### Spend Trends & Attribution
 
@@ -241,7 +241,7 @@ Where the money goes and which way it is trending - by product, by job, by pipel
 - **What to do:** Tag jobs consistently (team / domain / environment) so cost has an owner; turn the daily thresholds you already watch into budget alerts; and review the top movers monthly, applying read-amplification and spill analysis inside them.
 - **Alerts:** Informational (no alert)
 - **Prove the fix with:** M2 Exact $ per job and per pipeline
-- **Reads:** `system.billing.usage`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`
 
 #### H12 Jobs - who got slower?
 
@@ -250,7 +250,7 @@ Where the money goes and which way it is trending - by product, by job, by pipel
 - **What to do:** For each riser, look one level deeper: cluster utilisation during runs, then the shuffle/spill per stage in the Spark UI. Right-size on evidence. Spot instances suit retryable batch jobs - but not continuous pipelines, where an eviction restarts work and costs more than it saves.
 - **Alerts:** Informational (no alert)
 - **Prove the fix with:** M2 Exact $ per job and per pipeline
-- **Reads:** `system.lakeflow.job_run_timeline`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`
 
 #### H13 Pipelines - cost per pipeline
 
@@ -259,7 +259,7 @@ Where the money goes and which way it is trending - by product, by job, by pipel
 - **What to do:** Prefer fewer, larger workers (less shuffle) and a bigger driver when one pipeline drives many tables; start small and step up on evidence; avoid spot for continuous change-data pipelines; and consider splitting a mega-pipeline. For merge-heavy targets: turn on Photon and deletion vectors, keep the real business key as the merge key and put the time column in the ordering/clustering, never in the key.
 - **Alerts:** Informational (no alert)
 - **Prove the fix with:** M2 Exact $ per job and per pipeline
-- **Reads:** `system.billing.usage`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.usage`, `system.lakeflow.pipelines`
 
 #### H20 Frequently-failing jobs
 
@@ -268,7 +268,7 @@ Where the money goes and which way it is trending - by product, by job, by pipel
 - **What to do:** Root-cause the recurring failures (read the termination reason and the run logs); add an early-abort timeout so a doomed run dies fast instead of burning a full window; and pause or fix broken schedules that never succeed.
 - **Alerts:** Account compute on failed job runs this week (a total) versus the account's normal (median of the account's prior four weekly totals): high at 3x, medium at 2x, medium when the account has no prior history; rows are the top contributors with their share
 - **Prove the fix with:** M2 Exact $ per job and per pipeline
-- **Reads:** `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`
 
 #### H23 Predictive Optimization cost drivers
 
@@ -388,46 +388,46 @@ Tune the platform. Pick the right compute for each workload, and use features li
 - **What it shows:** Prices individual queries on a shared warehouse by allocating each a slice of the warehouse-hour's cost in proportion to its execution time.
 - **How to read it:** Warehouses bill by uptime, not by query, so per-query cost is an ALLOCATION. Each query gets a share of its warehouse-hour's cost against the warehouse's cluster-hours of capacity - so the shares never exceed the real cost. Use it to price a specific expensive query (e.g. an investigation scan) and to show a per-query before/after.
 - **Use when:** you want to price one specific expensive query (e.g. an investigation scan) and show a per-query before/after.
-- **Reads:** `system.billing.list_prices`, `system.billing.usage`, `system.compute.warehouses`, `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.list_prices`, `system.billing.usage`, `system.compute.warehouses`, `system.query.history`
 
 ### M3 The “After” Scoreboard - weekly $ per warehouse
 
 - **What it shows:** The headline proof. Weekly spend per warehouse over eight weeks - fix something, then watch this line step down.
 - **How to read it:** Every warehouse-level fix (chatter, auto-stop, placement, downsizing) lands here. Compare weeks of the same-shape workload. Remember classic warehouses carry a separate cloud-infrastructure bill next to this usage line.
 - **Use when:** you changed a warehouse's size, auto-stop, or moved a workload - the headline proof. Watch its weekly line step down.
-- **Reads:** `system.billing.list_prices`, `system.billing.usage`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.list_prices`, `system.billing.usage`, `system.compute.warehouses`
 
 ### M1b Warehouse idle cost - the residual
 
 - **What it shows:** For each warehouse: total cost, the part that did actual work, and the unallocated (idle) remainder - plus average utilisation.
 - **How to read it:** High idle cost with low utilisation points to an auto-stop or right-sizing conversation, not a query problem. This is an ALLOCATION PROXY, not measured idle: it uses each warehouse's cluster-hours of capacity as the denominator, a sound but simplified floor. The dollars are Databricks list-price DBU cost - Finance applies your contract rate and (for classic) the separate cloud bill.
 - **Use when:** you suspect a warehouse is billing while idle - shows the idle $ and utilisation so you can prove an auto-stop / right-sizing fix.
-- **Reads:** `system.billing.list_prices`, `system.billing.usage`, `system.compute.warehouses`, `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.list_prices`, `system.billing.usage`, `system.compute.warehouses`, `system.query.history`
 
 ### M2 Exact $ per job and per pipeline
 
 - **What it shows:** Exact weekly dollars for each job and pipeline - the before/after for any job or pipeline fix is two rows of this table.
 - **How to read it:** Because usage carries the entity ID, this is DIRECTLY attributed (not an allocation) wherever the ID is populated. Usage with no job/pipeline ID (some shared or serverless products) shows up as its own ‘unattributed’ row rather than being dropped, so the dollars reconcile.
 - **Use when:** you fixed a job or pipeline (moved to Jobs compute, right-sized, cut failures) - the before/after is two rows of this table.
-- **Reads:** `system.billing.list_prices`, `system.billing.usage`, `system.lakeflow.jobs`, `system.lakeflow.pipelines`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.list_prices`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`, `system.lakeflow.pipelines`
 
 ### M6 Serverless job cost by performance mode
 
 - **What it shows:** For the top serverless jobs: weekly dollars split into Performance-optimized vs Standard mode - the direct before/after for a performance-mode change.
 - **How to read it:** Both modes bill at the same $/DBU rate, so this splits each job's weekly serverless spend by performance_target to make a mode change visible. Before a change, a job's spend sits entirely in the Performance-optimized column; after you disable performance optimization, subsequent weeks shift into the Standard column at a lower DBU total for the same work. Limited to the top jobs by Performance-optimized spend so the table stays legible. List-price DBU cost, directly attributed by job_id.
 - **Use when:** you switched a serverless job from Performance-optimized to Standard mode (H22) - watch that job's Performance-optimized column fall, replaced by a smaller Standard column.
-- **Reads:** `system.billing.list_prices`, `system.billing.usage`, `system.lakeflow.jobs`
+- **Reads:** `system.access.workspaces_latest`, `system.billing.list_prices`, `system.billing.usage`, `system.lakeflow.job_run_timeline`, `system.lakeflow.jobs`
 
 ### M5 Timeout guardrail scoreboard
 
 - **What it shows:** Counts statements per warehouse that ran longer than a one-hour cap - your baseline before setting timeouts, and zero after.
 - **How to read it:** A statement timeout caps EXECUTION time (time actually running), not total elapsed time (which includes queueing and fetching results), so this tests execution time - what a timeout would really have killed. Baseline now (expect the multi-hour offenders); confirm zero after the caps go in.
 - **Use when:** you set (or plan to set) a statement timeout - baseline the over-cap runners now, confirm zero after.
-- **Reads:** `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.compute.warehouses`, `system.query.history`
 
 ### M4 Benchmark a fix - per-statement efficiency, week over week
 
 - **What it shows:** For the busiest warehouses, average read / spill / duration per statement each week - so after a fix you can see the per-run numbers fall.
 - **How to read it:** This is the before/after benchmark. Pick the warehouse behind a fix and read down its weekly rows: average bytes read, spilled, and execution minutes per statement. A successful read-amplification or spill fix shows the averages step DOWN in the weeks after you ship it, while the row count (runs) holds - proof the work got cheaper per run, not just quieter.
 - **Use when:** you fixed read-amplification or spill and want to prove work got cheaper PER RUN (not just quieter) - watch the averages fall while run count holds.
-- **Reads:** `system.compute.warehouses`, `system.query.history`
+- **Reads:** `system.access.workspaces_latest`, `system.compute.warehouses`, `system.query.history`

@@ -18,7 +18,7 @@ from typing import Literal, Optional, Union
 
 from typing_extensions import TypedDict
 
-from names import JOB, PIPELINE, WAREHOUSE, WORKSPACE, ctes
+from names import CLUSTER, JOB, PIPELINE, WAREHOUSE, WORKSPACE, ctes
 
 
 # The six plain-English categories the hunts are grouped into on the Spot page.
@@ -244,15 +244,18 @@ LIMIT 20
             "target in both its match and rewrite phases."
         ),
         "sql": f"""
-WITH merges AS (
-  SELECT statement_id, executed_by, read_bytes, written_bytes, total_duration_ms,
-         read_bytes/POW(1024,4) AS read_tib, {_wk("start_time")} AS wk,
-         coalesce(nullif(regexp_extract(statement_text, '(?i)MERGE\\\\s+INTO\\\\s+([`\\\\w.]+)', 1), ''),
-                  'job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
-                  executed_by) AS merge_target
-  FROM system.query.history
-  WHERE statement_type = 'MERGE' AND read_bytes > 0
-    AND start_time >= current_timestamp() - INTERVAL 35 DAYS
+WITH {ctes("job")},
+merges AS (
+  SELECT *, coalesce(merge_table, 'job ' || job_id, 'notebook ' || notebook_id, executed_by) AS merge_target
+  FROM (
+    SELECT statement_id, executed_by, workspace_id, read_bytes, written_bytes, total_duration_ms,
+           read_bytes/POW(1024,4) AS read_tib, {_wk("start_time")} AS wk,
+           nullif(regexp_extract(statement_text, '(?i)MERGE\\\\s+INTO\\\\s+([`\\\\w.]+)', 1), '') AS merge_table,
+           query_source.job_info.job_id AS job_id, query_source.notebook_id AS notebook_id
+    FROM system.query.history
+    WHERE statement_type = 'MERGE' AND read_bytes > 0
+      AND start_time >= current_timestamp() - INTERVAL 35 DAYS
+  )
 ),
 weekly AS (SELECT wk, sum(read_tib) AS v FROM merges WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
 {_account_normal("weekly")},
@@ -262,15 +265,17 @@ contrib AS (
          CAST(sum(read_bytes) AS DOUBLE)/NULLIF(sum(written_bytes),0) AS read_write_ratio,
          sum(total_duration_ms)/60000.0                         AS mins,
          max_by(statement_id, read_bytes)                       AS heaviest_statement_id,
-         max_by(executed_by, read_bytes)                        AS executed_by
+         max_by(executed_by, read_bytes)                        AS executed_by,
+         max(CASE WHEN merge_table IS NULL THEN job_id END)     AS job_id,
+         max(workspace_id)                                      AS workspace_id
   FROM merges WHERE wk = 0
   GROUP BY 1
 )
-SELECT merge_target, executed_by, heaviest_statement_id, runs, read_tib, written_gib,
-       read_write_ratio, mins,
-       {_vs_account("read_tib")}
-FROM contrib CROSS JOIN acct
-ORDER BY read_tib DESC
+SELECT coalesce({JOB.tagged}, c.merge_target) AS merge_target, c.executed_by, c.heaviest_statement_id, c.runs,
+       c.read_tib, c.written_gib, c.read_write_ratio, c.mins, c.job_id,
+       {_vs_account("c.read_tib")}
+FROM contrib c {JOB.join} CROSS JOIN acct
+ORDER BY c.read_tib DESC
 LIMIT 20
 """,
     },
@@ -309,9 +314,10 @@ LIMIT 20
             "problem."
         ),
         "sql": f"""
-WITH spills AS (
-  SELECT statement_id, executed_by, read_bytes, total_duration_ms,
-         spilled_local_bytes/POW(1024,4) AS spill_tib, {_wk("start_time")} AS wk,
+WITH {ctes("job")},
+spills AS (
+  SELECT statement_id, executed_by, workspace_id, query_source.job_info.job_id AS job_id, read_bytes,
+         total_duration_ms, spilled_local_bytes/POW(1024,4) AS spill_tib, {_wk("start_time")} AS wk,
          coalesce('job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
                   'query ' || query_source.sql_query_id, 'dashboard ' || query_source.dashboard_id,
                   executed_by) AS source
@@ -326,14 +332,17 @@ contrib AS (
          sum(read_bytes)/POW(1024,3)          AS read_gib,
          sum(total_duration_ms)/60000.0       AS mins,
          max_by(statement_id, spill_tib)      AS worst_statement_id,
-         max_by(executed_by, spill_tib)       AS executed_by
+         max_by(executed_by, spill_tib)       AS executed_by,
+         max(job_id)                          AS job_id,
+         max(workspace_id)                    AS workspace_id
   FROM spills WHERE wk = 0
   GROUP BY 1
 )
-SELECT source, executed_by, worst_statement_id, statements, spill_tib, read_gib, mins,
-       {_vs_account("spill_tib")}
-FROM contrib CROSS JOIN acct
-ORDER BY spill_tib DESC
+SELECT coalesce({JOB.tagged}, c.source) AS source, c.executed_by, c.worst_statement_id, c.statements,
+       c.spill_tib, c.read_gib, c.mins, c.job_id,
+       {_vs_account("c.spill_tib")}
+FROM contrib c {JOB.join} CROSS JOIN acct
+ORDER BY c.spill_tib DESC
 LIMIT 20
 """,
     },
@@ -368,10 +377,10 @@ LIMIT 20
             "means the client opens a fresh connection per statement (pool churn)."
         ),
         "sql": f"""
-WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL),
+WITH {ctes("warehouse")},
 chatter AS (
   SELECT compute.warehouse_id AS warehouse_id, statement_type, executed_by, client_application,
-         client_driver, session_id, {_wk("start_time")} AS wk
+         client_driver, session_id, workspace_id, {_wk("start_time")} AS wk
   FROM system.query.history
   WHERE read_bytes = 0
     AND start_time >= current_timestamp() - INTERVAL 35 DAYS
@@ -381,16 +390,18 @@ weekly AS (SELECT wk, count(*) AS v FROM chatter WHERE wk BETWEEN 0 AND 4 GROUP 
 contrib AS (
   SELECT warehouse_id, statement_type, executed_by, client_application, client_driver,
          count(*) AS stmts, count(DISTINCT session_id) AS sessions,
-         round(count(*)/count(DISTINCT session_id),1) AS stmts_per_session
+         round(count(*)/count(DISTINCT session_id),1) AS stmts_per_session,
+         max(workspace_id) AS workspace_id
   FROM chatter WHERE wk = 0
   GROUP BY 1, 2, 3, 4, 5
 )
-SELECT coalesce(wh.warehouse_name, c.warehouse_id) AS warehouse, c.statement_type, c.executed_by,
+SELECT {WAREHOUSE.label} AS warehouse, c.statement_type, c.executed_by,
        c.client_application, c.client_driver, c.stmts, c.sessions, c.stmts_per_session,
        coalesce(c.client_application, c.client_driver, 'unknown client') || ' (' || c.executed_by
-         || ') on ' || coalesce(wh.warehouse_name, c.warehouse_id, 'a cluster') AS client,
+         || ') on ' || coalesce({WAREHOUSE.label}, 'a cluster') AS client,
+       c.warehouse_id,
        {_vs_account("c.stmts")}
-FROM contrib c LEFT JOIN wh ON c.warehouse_id = wh.warehouse_id CROSS JOIN acct
+FROM contrib c {WAREHOUSE.join} CROSS JOIN acct
 ORDER BY c.stmts DESC
 LIMIT 50
 """,
@@ -421,15 +432,18 @@ LIMIT 50
             "confirming against actual billed usage."
         ),
         "inventory": True,  # lists all warehouses' events — a reference view, not a waste list
-        "sql": """
-WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL)
-SELECT coalesce(wh.warehouse_name, e.warehouse_id) AS warehouse, e.event_type,
-       count(*) AS events, max(e.event_time) AS last_seen
-FROM system.compute.warehouse_events e
-LEFT JOIN wh ON e.warehouse_id = wh.warehouse_id
-WHERE e.event_time >= current_date() - INTERVAL 14 DAYS
-GROUP BY 1, 2
-ORDER BY 1, 2
+        "sql": f"""
+WITH {ctes("warehouse")},
+events AS (
+  SELECT warehouse_id, event_type, count(*) AS events, max(event_time) AS last_seen,
+         max(workspace_id) AS workspace_id
+  FROM system.compute.warehouse_events
+  WHERE event_time >= current_date() - INTERVAL 14 DAYS
+  GROUP BY 1, 2
+)
+SELECT {WAREHOUSE.label} AS warehouse, c.event_type, c.events, c.last_seen, c.warehouse_id
+FROM events c {WAREHOUSE.join}
+ORDER BY warehouse, c.event_type
 """,
     },
 
@@ -468,8 +482,10 @@ ORDER BY 1, 2
             "execution_status and the query profile). Large queued_min = a capacity problem (see H8)."
         ),
         "sql": f"""
-WITH stmts AS (
+WITH {ctes("job")},
+stmts AS (
   SELECT statement_id, start_time, {_wk("start_time")} AS wk,
+         workspace_id, query_source.job_info.job_id AS job_id,
          total_duration_ms/60000.0               AS total_min,
          waiting_at_capacity_duration_ms/60000.0 AS queued_min,
          waiting_for_compute_duration_ms/60000.0 AS provisioning_min,
@@ -487,11 +503,11 @@ contrib AS (
   SELECT * FROM stmts WHERE wk = 0
   QUALIFY row_number() OVER (PARTITION BY source ORDER BY total_min DESC) = 1
 )
-SELECT statement_id, start_time, source, total_min, queued_min, provisioning_min, exec_min,
-       read_files, read_gib,
-       {_vs_account("total_min")}
-FROM contrib CROSS JOIN acct
-ORDER BY total_min DESC
+SELECT c.statement_id, c.start_time, coalesce({JOB.tagged}, c.source) AS source, c.total_min, c.queued_min,
+       c.provisioning_min, c.exec_min, c.read_files, c.read_gib, c.job_id,
+       {_vs_account("c.total_min")}
+FROM contrib c {JOB.join} CROSS JOIN acct
+ORDER BY c.total_min DESC
 LIMIT 20
 """,
     },
@@ -598,11 +614,15 @@ LIMIT 50
             "tables; the example statement shows which."
         ),
         "sql": f"""
-WITH runs AS (
+WITH {ctes("job")},
+runs AS (
   SELECT executed_by, client_application,
          coalesce('query ' || query_source.sql_query_id, 'dashboard ' || query_source.dashboard_id,
                   'job ' || query_source.job_info.job_id, 'notebook ' || query_source.notebook_id,
                   'alert ' || query_source.alert_id, 'genie space ' || query_source.genie_space_id) AS source,
+         CASE WHEN query_source.sql_query_id IS NULL AND query_source.dashboard_id IS NULL
+              THEN query_source.job_info.job_id END AS job_id,
+         workspace_id,
          statement_id, execution_duration_ms, from_result_cache,
          -- identical means the same text and the same parameters, so a lookup with new values is not a repeat
          xxhash64(statement_text, to_json(query_parameters)) AS statement_key,
@@ -619,6 +639,8 @@ hourly AS (
          count_if(from_result_cache) AS cached,
          sum(execution_duration_ms)  AS exec_ms,
          max(source)                 AS source,
+         max_by(job_id, source)      AS job_id,
+         max_by(workspace_id, source) AS workspace_id,
          max(client_application)     AS client_application,
          any_value(statement_id)     AS statement_id
   FROM runs
@@ -635,20 +657,23 @@ contrib AS (
          round(100 * sum(cached) / sum(execs), 1)  AS from_cache_pct,
          sum(exec_ms)/3600000.0                    AS execution_hours,
          max(source)                               AS source,
+         max_by(job_id, source)                    AS job_id,
+         max_by(workspace_id, source)              AS workspace_id,
          max(client_application)                   AS client_application,
          any_value(statement_id)                   AS example_statement_id
   FROM hourly WHERE wk = 0
   GROUP BY 1, 2
   HAVING sum(repeats) > 0
 )
-SELECT executed_by,
-       CASE WHEN executed_by LIKE '%@%' THEN 'human' ELSE 'service_principal' END AS owner_type,
-       source, client_application, repeats, execs, hours_repeating, peak_runs_in_an_hour,
-       from_cache_pct, execution_hours, example_statement_id,
-       coalesce(source, client_application, 'unattributed') || ' (' || executed_by || ')' AS poller,
-       {_vs_account("repeats")}
-FROM contrib CROSS JOIN acct
-ORDER BY repeats DESC
+SELECT c.executed_by,
+       CASE WHEN c.executed_by LIKE '%@%' THEN 'human' ELSE 'service_principal' END AS owner_type,
+       coalesce({JOB.tagged}, c.source) AS source, c.client_application, c.repeats, c.execs, c.hours_repeating,
+       c.peak_runs_in_an_hour, c.from_cache_pct, c.execution_hours, c.example_statement_id,
+       coalesce({JOB.tagged}, c.source, c.client_application, 'unattributed') || ' (' || c.executed_by || ')' AS poller,
+       c.job_id,
+       {_vs_account("c.repeats")}
+FROM contrib c {JOB.join} CROSS JOIN acct
+ORDER BY c.repeats DESC
 LIMIT 50
 """,
     },
@@ -687,9 +712,9 @@ LIMIT 50
             "warehouse monitoring for DBSQL) means there is room to downsize."
         ),
         "sql": f"""
-WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL),
+WITH {ctes("warehouse")},
 stmts AS (
-  SELECT compute.warehouse_id AS warehouse_id, {_wk("start_time")} AS wk,
+  SELECT compute.warehouse_id AS warehouse_id, workspace_id, {_wk("start_time")} AS wk,
          waiting_at_capacity_duration_ms, execution_duration_ms
   FROM system.query.history
   WHERE start_time >= current_timestamp() - INTERVAL 35 DAYS
@@ -700,15 +725,16 @@ contrib AS (
   SELECT warehouse_id,
          count_if(waiting_at_capacity_duration_ms > 0)  AS stmts_queued,
          sum(waiting_at_capacity_duration_ms)/3600000.0 AS queued_hours,
-         sum(execution_duration_ms)/3600000.0           AS exec_hours
+         sum(execution_duration_ms)/3600000.0           AS exec_hours,
+         max(workspace_id)                              AS workspace_id
   FROM stmts WHERE wk = 0
   GROUP BY 1
   HAVING sum(waiting_at_capacity_duration_ms) > 0
 )
-SELECT coalesce(wh.warehouse_name, c.warehouse_id, 'no warehouse') AS warehouse,
-       c.stmts_queued, c.queued_hours, c.exec_hours,
+SELECT coalesce({WAREHOUSE.label}, 'no warehouse') AS warehouse,
+       c.stmts_queued, c.queued_hours, c.exec_hours, c.warehouse_id,
        {_vs_account("c.queued_hours")}
-FROM contrib c LEFT JOIN wh ON c.warehouse_id = wh.warehouse_id CROSS JOIN acct
+FROM contrib c {WAREHOUSE.join} CROSS JOIN acct
 ORDER BY c.queued_hours DESC
 LIMIT 50
 """,
@@ -738,12 +764,18 @@ LIMIT 50
             "frame findings as 'worth a conversation', not proven waste."
         ),
         "inventory": True,  # lists every warehouse's config — a reference view, not a waste list
-        "sql": """
-SELECT warehouse_id, warehouse_name, warehouse_type, warehouse_size,
-       min_clusters, max_clusters, auto_stop_minutes, change_time
-FROM system.compute.warehouses
-QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) = 1
-   AND delete_time IS NULL
+        "sql": f"""
+WITH {ctes("warehouse")},
+cfg AS (
+  SELECT warehouse_id, workspace_id, warehouse_type, warehouse_size,
+         min_clusters, max_clusters, auto_stop_minutes, change_time
+  FROM system.compute.warehouses
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) = 1
+     AND delete_time IS NULL
+)
+SELECT c.warehouse_id, {WAREHOUSE.label} AS warehouse, c.warehouse_type, c.warehouse_size,
+       c.min_clusters, c.max_clusters, c.auto_stop_minutes, c.change_time
+FROM cfg c {WAREHOUSE.join}
 """,
     },
 
@@ -833,17 +865,21 @@ LIMIT 40
             "rank the current week, then compare each mover's trajectory. usage_metadata also "
             "carries job_run_id and the run-as identity; custom_tags attribute to teams once jobs are tagged."
         ),
-        "sql": """
-SELECT workspace_id,
-       usage_metadata.job_id,
-       any_value(usage_metadata.job_name) AS job_name,
-       date_trunc('WEEK', usage_date)     AS week,
-       sum(usage_quantity)                AS dbus
-FROM system.billing.usage
-WHERE billing_origin_product = 'JOBS'
-  AND usage_date >= current_date() - INTERVAL 8 WEEKS
-GROUP BY workspace_id, usage_metadata.job_id, date_trunc('WEEK', usage_date)
-ORDER BY week DESC, dbus DESC
+        "sql": f"""
+WITH {ctes("job")},
+weekly AS (
+  SELECT workspace_id,
+         usage_metadata.job_id              AS job_id,
+         date_trunc('WEEK', usage_date)     AS week,
+         sum(usage_quantity)                AS dbus
+  FROM system.billing.usage
+  WHERE billing_origin_product = 'JOBS'
+    AND usage_date >= current_date() - INTERVAL 8 WEEKS
+  GROUP BY workspace_id, usage_metadata.job_id, date_trunc('WEEK', usage_date)
+)
+SELECT {WORKSPACE.label} AS workspace, {JOB.label} AS job_name, c.week, c.dbus, c.workspace_id, c.job_id
+FROM weekly c {WORKSPACE.join} {JOB.join}
+ORDER BY c.week DESC, c.dbus DESC
 LIMIT 100
 """,
     },
@@ -873,23 +909,29 @@ LIMIT 100
             "and idle-cores hunt. This is a reference trend, not proven waste."
         ),
         "inventory": True,  # lists all jobs by run count — a reference view, not a waste list
-        "sql": """
-WITH runs AS (
+        "sql": f"""
+WITH {ctes("job")},
+runs AS (
   SELECT workspace_id, job_id, run_id,
          min(period_start_time)                                            AS run_start,
          sum(timestampdiff(SECOND, period_start_time, period_end_time))    AS duration_s
   FROM system.lakeflow.job_run_timeline
   WHERE period_start_time >= current_date() - INTERVAL 8 WEEKS
   GROUP BY workspace_id, job_id, run_id
+),
+weekly AS (
+  SELECT workspace_id, job_id,
+         date_trunc('WEEK', run_start)                 AS week,
+         count(*)                                      AS runs,
+         round(percentile_approx(duration_s, 0.50)/60, 1) AS p50_min,
+         round(percentile_approx(duration_s, 0.95)/60, 1) AS p95_min
+  FROM runs
+  GROUP BY workspace_id, job_id, date_trunc('WEEK', run_start)
 )
-SELECT workspace_id, job_id,
-       date_trunc('WEEK', run_start)                 AS week,
-       count(*)                                      AS runs,
-       round(percentile_approx(duration_s, 0.50)/60, 1) AS p50_min,
-       round(percentile_approx(duration_s, 0.95)/60, 1) AS p95_min
-FROM runs
-GROUP BY workspace_id, job_id, date_trunc('WEEK', run_start)
-ORDER BY runs DESC
+SELECT {WORKSPACE.label} AS workspace, {JOB.label} AS job_name, c.week, c.runs, c.p50_min, c.p95_min,
+       c.workspace_id, c.job_id
+FROM weekly c {WORKSPACE.join} {JOB.join}
+ORDER BY c.runs DESC
 """,
     },
 
@@ -916,15 +958,21 @@ ORDER BY runs DESC
             "rank by dbus; for the expensive ones, divide by table count for a rough $/table "
             "comparison, then check utilisation with H14 and warnings with the pipeline event log."
         ),
-        "sql": """
-SELECT usage_metadata.dlt_pipeline_id AS pipeline_id,
-       date_trunc('WEEK', usage_date) AS week,
-       sum(usage_quantity)            AS dbus
-FROM system.billing.usage
-WHERE billing_origin_product = 'DLT'
-  AND usage_date >= current_date() - INTERVAL 8 WEEKS
-GROUP BY 1, 2
-ORDER BY dbus DESC
+        "sql": f"""
+WITH {ctes("pipeline")},
+weekly AS (
+  SELECT usage_metadata.dlt_pipeline_id AS pipeline_id,
+         date_trunc('WEEK', usage_date) AS week,
+         sum(usage_quantity)            AS dbus,
+         max(workspace_id)              AS workspace_id
+  FROM system.billing.usage
+  WHERE billing_origin_product = 'DLT'
+    AND usage_date >= current_date() - INTERVAL 8 WEEKS
+  GROUP BY 1, 2
+)
+SELECT {PIPELINE.label} AS pipeline, c.week, c.dbus, c.pipeline_id
+FROM weekly c {PIPELINE.join}
+ORDER BY c.dbus DESC
 """,
     },
 
@@ -953,14 +1001,21 @@ ORDER BY dbus DESC
             "discovery list; recommend confirming a cluster's hour-by-hour utilisation before resizing."
         ),
         "inventory": True,  # busiest-clusters discovery list — a reference view, not a waste list
-        "sql": """
-SELECT cluster_id, count(*) AS node_minutes,
-       round(avg(cpu_user_percent + cpu_system_percent), 1) AS avg_cpu_pct
-FROM system.compute.node_timeline
-WHERE start_time >= current_date() - INTERVAL 7 DAYS
-GROUP BY 1
-ORDER BY node_minutes DESC
-LIMIT 10
+        "sql": f"""
+WITH {ctes("cluster")},
+busiest AS (
+  SELECT cluster_id, count(*) AS node_minutes,
+         round(avg(cpu_user_percent + cpu_system_percent), 1) AS avg_cpu_pct,
+         max(workspace_id) AS workspace_id
+  FROM system.compute.node_timeline
+  WHERE start_time >= current_date() - INTERVAL 7 DAYS
+  GROUP BY 1
+  ORDER BY node_minutes DESC
+  LIMIT 10
+)
+SELECT {CLUSTER.label} AS cluster, c.node_minutes, c.avg_cpu_pct, c.cluster_id
+FROM busiest c {CLUSTER.join}
+ORDER BY c.node_minutes DESC
 """,
     },
 
@@ -1008,13 +1063,11 @@ LIMIT 10
             "the saving is the rate difference on that job's DBUs, not the whole cluster."
         ),
         "sql": f"""
-WITH latest_clusters AS (
-  SELECT workspace_id, cluster_id, cluster_name, cluster_source
+WITH {ctes("job", "cluster")},
+latest_clusters AS (
+  SELECT workspace_id, cluster_id, cluster_source
   FROM system.compute.clusters
   QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC)=1
-),
-job_names AS (
-  SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2
 ),
 rates AS (
   SELECT try_divide(sum(CASE WHEN u.billing_origin_product = 'ALL_PURPOSE' THEN u.usage_quantity * p.pricing.effective_list.default END),
@@ -1037,9 +1090,10 @@ task_clusters AS (
 ),
 runs AS (
   SELECT t.workspace_id, t.job_id, t.run_id, {_wk("min(t.period_start_time)")} AS wk,
-         collect_set(coalesce(c.cluster_name, c.cluster_id)) AS clusters
+         collect_set({CLUSTER.label}) AS clusters
   FROM task_clusters t
   JOIN latest_clusters c ON t.workspace_id = c.workspace_id AND t.cluster_id = c.cluster_id
+  {CLUSTER.join}
   WHERE c.cluster_source IN ('UI','API')                     -- all-purpose only
   GROUP BY 1, 2, 3
 ),
@@ -1051,14 +1105,14 @@ contrib AS (
   FROM runs WHERE wk = 0
   GROUP BY 1, 2
 )
-SELECT c.workspace_id,
-       coalesce(jn.job_name, CAST(c.job_id AS STRING)) AS job_name,
+SELECT {WORKSPACE.label} AS workspace,
+       {JOB.label} AS job_name,
        c.clusters, c.run_count,
        round(r.all_purpose_usd_dbu, 3) AS all_purpose_usd_dbu, round(r.jobs_usd_dbu, 3) AS jobs_usd_dbu,
        round(100 * (1 - try_divide(r.jobs_usd_dbu, r.all_purpose_usd_dbu))) AS pct_saving,
+       c.workspace_id, c.job_id,
        {_vs_account("c.run_count")}
-FROM contrib c
-LEFT JOIN job_names jn ON c.workspace_id=jn.workspace_id AND c.job_id=jn.job_id
+FROM contrib c {WORKSPACE.join} {JOB.join}
 CROSS JOIN rates r CROSS JOIN acct
 ORDER BY c.run_count DESC
 LIMIT 50
@@ -1087,15 +1141,21 @@ LIMIT 50
             "the fix is to set an auto-stop. This is a config signal — confirm the warehouse isn't "
             "deliberately kept warm for a real 24/7 SLA before acting."
         ),
-        "sql": """
-SELECT warehouse_id, warehouse_name, warehouse_type, warehouse_size,
-       min_clusters, max_clusters, auto_stop_minutes, change_time
-FROM system.compute.warehouses
-QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1
-   AND delete_time IS NULL
-   AND auto_stop_minutes = 0
-   AND warehouse_type = 'CLASSIC'
-ORDER BY min_clusters DESC, warehouse_size DESC
+        "sql": f"""
+WITH {ctes("warehouse")},
+cfg AS (
+  SELECT warehouse_id, workspace_id, warehouse_type, warehouse_size,
+         min_clusters, max_clusters, auto_stop_minutes, change_time
+  FROM system.compute.warehouses
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1
+     AND delete_time IS NULL
+     AND auto_stop_minutes = 0
+     AND warehouse_type = 'CLASSIC'
+)
+SELECT c.warehouse_id, {WAREHOUSE.label} AS warehouse, c.warehouse_type, c.warehouse_size,
+       c.min_clusters, c.max_clusters, c.auto_stop_minutes, c.change_time
+FROM cfg c {WAREHOUSE.join}
+ORDER BY c.min_clusters DESC, c.warehouse_size DESC
 """,
     },
 
@@ -1133,7 +1193,8 @@ ORDER BY min_clusters DESC, warehouse_size DESC
             "to Jobs compute. Confirm the cluster isn't a deliberately-warm interactive one before acting."
         ),
         "sql": f"""
-WITH latest_clusters AS (
+WITH {ctes("cluster")},
+latest_clusters AS (
   SELECT workspace_id, cluster_id, cluster_name, cluster_source, auto_termination_minutes
   FROM system.compute.clusters
   QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC)=1
@@ -1158,10 +1219,11 @@ contrib AS (
   FROM samples WHERE wk = 0
   GROUP BY 1, 2, 3, 4, 5
 )
-SELECT coalesce(cluster_name, cluster_id) AS cluster, cluster_source, auto_termination_minutes,
-       round(idle_node_minutes, 1) AS idle_node_minutes, node_minutes, avg_cpu_pct, peak_cpu_pct,
-       {_vs_account("idle_node_minutes")}
-FROM contrib CROSS JOIN acct
+SELECT {CLUSTER.label} AS cluster, c.cluster_source, c.auto_termination_minutes,
+       round(c.idle_node_minutes, 1) AS idle_node_minutes, c.node_minutes, c.avg_cpu_pct, c.peak_cpu_pct,
+       c.cluster_id,
+       {_vs_account("c.idle_node_minutes")}
+FROM contrib c {CLUSTER.join} CROSS JOIN acct
 ORDER BY idle_node_minutes DESC
 LIMIT 50
 """,
@@ -1198,7 +1260,8 @@ LIMIT 50
             "USED, so recommend confirming traffic (Apps Insights) before stopping."
         ),
         "sql": f"""
-WITH daily AS (
+WITH {ctes("workspace")},
+daily AS (
   SELECT coalesce(usage_metadata.app_name, 'unnamed app') AS app_name, workspace_id, usage_date,
          {_wk_day("usage_date")} AS wk, sum(usage_quantity) AS dbus
   FROM system.billing.usage
@@ -1218,9 +1281,10 @@ contrib AS (
   FROM daily WHERE wk = 0
   GROUP BY 1, 2
 )
-SELECT app_name, workspace_id, round(dbus_7d, 1) AS dbus_7d, days_billed_7d, avg_daily_dbus, last_billed,
-       {_vs_account("dbus_7d")}
-FROM contrib CROSS JOIN acct
+SELECT c.app_name, {WORKSPACE.label} AS workspace, round(c.dbus_7d, 1) AS dbus_7d, c.days_billed_7d,
+       c.avg_daily_dbus, c.last_billed, c.workspace_id,
+       {_vs_account("c.dbus_7d")}
+FROM contrib c {WORKSPACE.join} CROSS JOIN acct
 ORDER BY dbus_7d DESC
 LIMIT 50
 """,
@@ -1258,7 +1322,7 @@ LIMIT 50
             "cancellations are normal - focus on the chronic high-rate ones."
         ),
         "sql": f"""
-WITH job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
+WITH {ctes("job")},
 runs AS (
   SELECT workspace_id, job_id, {_wk("period_start_time")} AS wk,
          result_state IN ('ERROR','FAILED','TIMED_OUT','CANCELLED') AS failed,
@@ -1278,11 +1342,12 @@ contrib AS (
   GROUP BY 1, 2
   HAVING count_if(failed) > 0
 )
-SELECT c.workspace_id,
-       coalesce(jn.job_name, CAST(c.job_id AS STRING)) AS job_name,
+SELECT {WORKSPACE.label} AS workspace,
+       {JOB.label} AS job_name,
        c.total_runs, c.failed_runs, c.failure_rate_pct, round(c.wasted_hours, 1) AS wasted_hours,
+       c.workspace_id, c.job_id,
        {_vs_account("c.wasted_hours")}
-FROM contrib c LEFT JOIN job_names jn ON c.workspace_id=jn.workspace_id AND c.job_id=jn.job_id
+FROM contrib c {WORKSPACE.join} {JOB.join}
 CROSS JOIN acct
 ORDER BY c.wasted_hours DESC
 LIMIT 50
@@ -1383,7 +1448,7 @@ WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
          pricing.effective_list.default AS unit_usd FROM system.billing.list_prices
 ),
-job_name AS (SELECT workspace_id, job_id, max(name) AS name FROM system.lakeflow.jobs GROUP BY 1, 2),
+{ctes("job")},
 daily AS (
   SELECT u.workspace_id, u.usage_metadata.job_id AS job_id, u.usage_date,
          {_wk_day("u.usage_date")}           AS wk,
@@ -1409,12 +1474,11 @@ contrib AS (
   FROM daily WHERE wk = 0
   GROUP BY 1, 2
 )
-SELECT c.workspace_id,
-       coalesce(jn.name, CAST(c.job_id AS STRING), 'unknown job') AS job_name,
-       c.job_id, round(c.usd_7d, 2) AS usd_7d, round(c.dbus_7d, 1) AS dbus_7d, c.active_days,
+SELECT {WORKSPACE.label} AS workspace,
+       coalesce({JOB.label}, 'unknown job') AS job_name,
+       c.job_id, round(c.usd_7d, 2) AS usd_7d, round(c.dbus_7d, 1) AS dbus_7d, c.active_days, c.workspace_id,
        {_vs_account("c.usd_7d")}
-FROM contrib c
-LEFT JOIN job_name jn ON c.workspace_id = jn.workspace_id AND c.job_id = jn.job_id
+FROM contrib c {WORKSPACE.join} {JOB.join}
 CROSS JOIN acct
 ORDER BY c.usd_7d DESC
 LIMIT 50
@@ -1954,7 +2018,7 @@ ALERT_SPECS: dict[str, AlertSpec] = {
             "summary": "Account ran {account} jobs on All-Purpose compute this week, {x} its usual (normal ~{baseline}).",
             "new_summary": "Account has no prior history of jobs on All-Purpose compute yet ({account} runs this week).",
             "usd_col": None},
-    "H17": {"kind": "presence", "entity_col": "warehouse_name",
+    "H17": {"kind": "presence", "entity_col": "warehouse",
             "metric_label": "Classic warehouses with auto-stop off", "usd_col": None,
             "summary": "{n} classic warehouse(s) never auto-stop, including {entity}."},
     "H18": {"kind": "anomaly", "aggregate": "additive", "entity_col": "cluster", "metric_col": "idle_node_minutes",

@@ -35,8 +35,9 @@ SOURCES = {
 }
 
 # system.lakeflow.jobs lists only some of the jobs that run (on one large account,
-# 7,519 of the 24,853 that query history names), while billing names every job it
-# bills, so a job the jobs table misses takes its latest billed name.
+# 7,519 of the 24,853 that query history names), so a job it misses takes the latest
+# name its bills or runs carry: a one-time run has no job definition, and a run on an
+# all-purpose cluster bills without its job.
 _BILLED_JOBS = """
     UNION ALL
     SELECT workspace_id, usage_metadata.job_id, trim(max_by(usage_metadata.job_name, usage_end_time)),
@@ -44,6 +45,11 @@ _BILLED_JOBS = """
     FROM system.billing.usage
     WHERE usage_metadata.job_id IS NOT NULL AND usage_metadata.job_name IS NOT NULL
       AND usage_date >= current_date() - INTERVAL 8 WEEKS
+    GROUP BY 1, 2
+    UNION ALL
+    SELECT workspace_id, job_id, trim(max_by(run_name, period_start_time)), 1, max(period_start_time)
+    FROM system.lakeflow.job_run_timeline
+    WHERE run_name IS NOT NULL AND period_start_time >= current_date() - INTERVAL 8 WEEKS
     GROUP BY 1, 2"""
 
 _WORKSPACES = """workspace_names AS (
