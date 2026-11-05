@@ -263,7 +263,11 @@ def compare_runs(current: dict, previous: Optional[dict]) -> dict:
     """Annotate the current run's findings with run-over-run trend vs the previous
     run, and compute a run-level summary. Pure function — no I/O.
 
-    Adds to each finding: trend ('new'|'better'|'worse'|'flat'), prev_metric_value.
+    A finding's saved metric_label names what its number measures, so two runs are
+    compared only when the labels match. A hunt whose definition changed between them
+    gets trend 'changed' and no previous value.
+
+    Adds to each finding: trend ('new'|'better'|'worse'|'flat'|'changed'), prev_metric_value.
     Adds top-level: resolved_since (findings present last run, gone now), deltas."""
     prev_by_hunt = {}
     if previous:
@@ -287,6 +291,10 @@ def compare_runs(current: dict, previous: Optional[dict]) -> dict:
             f["trend"] = "new"
             f["prev_metric_value"] = None
             continue
+        if p.get("metric_label") != f.get("metric_label"):
+            f["trend"] = "changed"
+            f["prev_metric_value"] = None
+            continue
         f["prev_metric_value"] = p.get("metric_value")
         cur_n, prev_n = metric_num(f), metric_num(p)
         if cur_n is None or prev_n is None:
@@ -303,11 +311,12 @@ def compare_runs(current: dict, previous: Optional[dict]) -> dict:
             else:
                 f["trend"] = "flat"
 
-    # resolved = present last run, absent now (dropped below threshold or fixed)
+    # resolved = present last run, absent now (dropped below threshold or fixed), under the
+    # definition the hunt still measures; an alert raised under an older one has not cleared.
     resolved = []
     if previous:
         for hid, p in prev_by_hunt.items():
-            if hid not in seen_now:
+            if hid not in seen_now and p.get("metric_label") == catalogue.ALERT_SPECS.get(hid, {}).get("metric_label"):
                 resolved.append({"hunt_id": hid, "title": p.get("title"),
                                  "prev_severity": p.get("severity"),
                                  "prev_metric_value": p.get("metric_value")})

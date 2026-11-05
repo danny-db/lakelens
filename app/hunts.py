@@ -1819,6 +1819,10 @@ ORDER BY 1, 2
 #   vs_normal >= ANOMALY_HIGH_X is high, >= ANOMALY_MEDIUM_X is medium, NEW is
 #   medium, anything else is low (no alert).
 # kind "presence": a config state with no time series. Any row is a medium alert.
+#
+# metric_label names what a finding's number measures. Run-over-run trend compares two
+# scans only when their labels match, so give a hunt a new metric_label whenever the
+# definition of its number changes.
 
 
 class AnomalySpec(TypedDict):

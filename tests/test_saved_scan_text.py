@@ -15,8 +15,8 @@ H7 = next(h for h in hunts.HUNTS if h["id"] == "H7")
 RUN = ["scan-1", "2026-11-03 11:43:36", "2026-11-03 11:50:00", "danny", 16, 2, 1, 1, 14, 40.0, 0.1, 0.0, 0.1]
 
 
-def stored(hunt_id, title):
-    return [hunt_id, title, "old-category", "medium", "saved summary", "Short SELECTs this week", "1,234",
+def stored(hunt_id, title, metric_label="Short SELECTs this week"):
+    return [hunt_id, title, "old-category", "medium", "saved summary", metric_label, "1,234",
             None, 3, "M9", "old action", "", json.dumps({"columns": [], "rows": []}), 1234.0]
 
 
@@ -43,7 +43,8 @@ class SavedScanText(unittest.TestCase):
         self.assertEqual((f["title"], f["action"]), ("A hunt that was removed", "old action"))
 
     def test_cleared_since_last_scan_uses_current_titles(self):
-        previous = store_with([stored("H7", "Polling every 20 seconds")]).load_run(None, "scan-0")
+        renamed = stored("H7", "Polling every 20 seconds", hunts.ALERT_SPECS["H7"]["metric_label"])
+        previous = store_with([renamed]).load_run(None, "scan-0")
         current = store_delta.compare_runs({"findings": []}, previous)
         self.assertEqual(current["resolved_since"][0]["title"], H7["title"])
 

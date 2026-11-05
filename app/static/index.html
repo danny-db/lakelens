@@ -465,6 +465,7 @@
   .trend-worse  { color: var(--coral); background: rgba(255,107,74,.14); }
   .trend-better { color: var(--teal);  background: var(--teal-dim); }
   .trend-flat   { color: var(--muted-2); background: var(--panel-2); }
+  .trend-changed { color: var(--amber); background: rgba(255,192,67,.12); }
   .vs-normal { font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 5px; color: var(--amber); background: rgba(255,192,67,.12); }
   .vs-normal.high { color: var(--coral); background: rgba(255,107,74,.14); }
   .vs-normal.new { color: var(--blue); background: rgba(74,168,255,.14); }
@@ -1657,9 +1658,11 @@ function alertCard(f) {
     worse:   {t:"▲ WORSE", c:"trend-worse"},
     better:  {t:"▼ BETTER",c:"trend-better"},
     flat:    {t:"= FLAT",  c:"trend-flat"},
+    changed: {t:"DEFINITION CHANGED", c:"trend-changed",
+              tip:"this hunt measures something different from the last scan, so the two numbers are not compared"},
   };
   const tr = f.trend ? trendMap[f.trend] : null;
-  const trendBadge = tr ? `<span class="trend-badge ${tr.c}">${tr.t}</span>` : "";
+  const trendBadge = tr ? `<span class="trend-badge ${tr.c}"${tr.tip ? ` title="${tr.tip}"` : ""}>${tr.t}</span>` : "";
   // How the account compares with its own normal. Older saved scans have no `vs`.
   const vs = f.vs || {};
   const vsBadge = vs.reading === "anomaly" && vs.x != null
