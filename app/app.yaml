@@ -28,7 +28,7 @@ env:
   # The scan prices its own AI cost from the app's published rate card (rate_card.json).
   #   databricks serving-endpoints list
   - name: AI_ENDPOINT
-    value: "databricks-gpt-5-4-mini"
+    value: "databricks-gpt-6-luna"
   # Alert severity: a row is high at ANOMALY_HIGH_X times its own usual (trailing
   # 28 days) and medium at ANOMALY_MEDIUM_X. An entity with no history is medium.
   - name: ANOMALY_HIGH_X

@@ -54,7 +54,7 @@ logger = logging.getLogger("uvicorn.error")
 WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
 # The model-serving endpoint for the plain-English explainers. A cheap tier is plenty.
 # A scan's AI cost is priced from the rate card for whichever model it used (pricing.py).
-AI_ENDPOINT = os.getenv("AI_ENDPOINT", "databricks-gpt-5-4-mini")
+AI_ENDPOINT = os.getenv("AI_ENDPOINT", "databricks-gpt-6-luna")
 # Where scan results are persisted (shared, durable). The app
 # writes here AS THE LOGGED-IN USER, so they need CREATE on this catalog/schema.
 # REQUIRED: set RESULTS_CATALOG to a catalog the app's users can write to (e.g. a

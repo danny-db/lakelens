@@ -25,7 +25,7 @@ variables:
     default: "lakelens"
   ai_endpoint:
     description: "Model-serving endpoint for the plain-English explainers (a cheap tier is plenty). The scan prices its AI cost from the app's published rate card."
-    default: "databricks-gpt-5-4-mini"
+    default: "databricks-gpt-6-luna"
   anomaly_high_x:
     description: "An alert is high when a row is at least this many times its own usual (trailing 28 days)."
     default: "3"
