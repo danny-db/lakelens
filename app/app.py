@@ -164,7 +164,16 @@ def _run_sql(sql: str, client: WorkspaceClient, max_rows: Optional[int] = DEFAUL
     if not WAREHOUSE_ID:
         raise HTTPException(503, "No warehouse configured. Redeploy with --var=\"warehouse_id=...\".")
     try:
-        return _execute_sql(sql, client, max_rows, params)
+        try:
+            return _execute_sql(sql, client, max_rows, params)
+        except HTTPException as e:
+            # System tables are shared to the account, and a read can race the provider
+            # replacing files (FAILED_READ_FILE). Running the statement again reads the
+            # new snapshot; the failed run wrote nothing.
+            if "FAILED_READ_FILE" not in str(e.detail):
+                raise
+            logger.warning(f"system table changed during the read, running it again: {str(e.detail)[:160]}")
+            return _execute_sql(sql, client, max_rows, params)
     except Unauthenticated:
         raise HTTPException(401, "Databricks rejected your sign-in token. Reload the app to sign in again.")
     except PermissionDenied as e:
