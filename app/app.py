@@ -43,6 +43,8 @@ import store_delta
 import tagging as tagging_content
 import boards as boards_content
 import genie_cost
+import models as chat_catalogue
+import pricing
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -51,12 +53,8 @@ logger = logging.getLogger("uvicorn.error")
 # REQUIRED: the SQL warehouse the app runs every query against (set by the bundle).
 WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
 # The model-serving endpoint for the plain-English explainers. A cheap tier is plenty.
-AI_ENDPOINT = os.getenv("AI_ENDPOINT", "databricks-gpt-5-4-mini")
-# Published DBU-per-1M-token rate (input, output) for the explainer endpoint,
-# used to price the scan's own ai_query cost from the rate card rather than from
-# this shared workspace's noisy billing. Default = a conservative small-model
-# ("mini") rate; override via env if you point AI_ENDPOINT at a pricier model.
-AI_ENDPOINT_DBU = tuple(float(x) for x in os.getenv("AI_ENDPOINT_DBU", "7.5,30").split(","))
+# A scan's AI cost is priced from the rate card for whichever model it used (pricing.py).
+AI_ENDPOINT = os.getenv("AI_ENDPOINT", "databricks-gpt-6-luna")
 # Where scan results are persisted (shared, durable). The app
 # writes here AS THE LOGGED-IN USER, so they need CREATE on this catalog/schema.
 # REQUIRED: set RESULTS_CATALOG to a catalog the app's users can write to (e.g. a
@@ -78,6 +76,8 @@ HOST = os.getenv("DATABRICKS_HOST", "")
 # The Databricks Apps runtime sets DATABRICKS_APP_NAME. There, a request without a
 # user token must not fall back to the app's own service principal.
 IN_APPS_RUNTIME = bool(os.getenv("DATABRICKS_APP_NAME"))
+# The Apps runtime sets the workspace id; locally it is read once from the ambient client.
+WORKSPACE_ID = os.getenv("DATABRICKS_WORKSPACE_ID", "")
 
 
 def _normalize_host(h: Optional[str]) -> str:
@@ -285,7 +285,7 @@ def _explainer_model(model: Optional[str]) -> str:
     """Resolve the explainer endpoint: a caller override if it's a known FMAPI
     endpoint (guards against injection into the ai_query() literal), else the
     configured default. Only 'databricks-*' names are accepted."""
-    if model and re.fullmatch(r"databricks-[a-z0-9.\-]+", model):
+    if model and chat_catalogue.ENDPOINT_NAME.fullmatch(model):
         return model
     return AI_ENDPOINT
 
@@ -330,33 +330,31 @@ FROM ( {rows_sql} ) t
 
 # ── API: metadata (drives the UI, no warehouse needed) ───────────────────────
 
+def _failure_reason(e: Exception) -> str:
+    """A short reason for the UI. An error body the SDK can't parse carries its request log,
+    whose '< 502 Bad Gateway' line names the HTTP status."""
+    if isinstance(e, HTTPException):
+        return str(e.detail)
+    status = re.search(r"^< (\d{3}\b.*)$", str(e), re.M)
+    return f"HTTP {status.group(1).strip()}" if status else _sdk_message(e)[:200]
+
+
 @app.get("/api/models")
 def list_models(request: Request):
-    """Chat-capable FMAPI endpoints the customer can pick as the explainer model
-    (e.g. Haiku 4.5 for cheap, Sonnet for richer). Read live from the workspace so
-    the list reflects what's actually available; falls back to a sensible set."""
-    fallback = ["databricks-gpt-5-4-mini", "databricks-claude-haiku-4-5",
-                "databricks-gemini-3-5-flash", "databricks-claude-sonnet-4-5"]
+    """The chat models this workspace serves, for the explainer picker, by display name and
+    group. Read straight from the REST API and parsed for the few fields used, so a change in
+    the SDK's endpoint model can't break it. If listing fails, only the configured default is
+    offered, with the reason."""
     try:
-        client = _client_for(request)
-        names = []
-        for e in client.serving_endpoints.list():
-            n = getattr(e, "name", "")
-            if n.startswith("databricks-") and not any(k in n for k in ("embedding", "bge", "gte")):
-                names.append(n)
-        # keep chat-ish families, cheapest-first-ish ordering by a small priority map
-        pref = ["haiku", "mini", "nano", "flash-lite", "flash", "gpt-oss-20b", "gpt-5-4",
-                "sonnet", "gpt-5-5", "opus", "gpt-oss-120b", "qwen", "llama", "glm", "gemini"]
-        def rank(n):
-            for i, k in enumerate(pref):
-                if k in n:
-                    return i
-            return len(pref)
-        names = sorted(set(names), key=lambda n: (rank(n), n))
-        return {"models": names or fallback, "default": AI_ENDPOINT}
+        raw = _client_for(request).api_client.do("GET", "/api/2.0/serving-endpoints")
+        listed = [m._asdict() for m in chat_catalogue.chat_models(raw)]
+        return {"models": listed, "groups": chat_catalogue.GROUPS, "default": AI_ENDPOINT, "error": None}
     except Exception as e:  # noqa: BLE001
         logger.warning(f"list_models failed: {e}")
-        return {"models": fallback, "default": AI_ENDPOINT}
+        return {"models": [{"id": AI_ENDPOINT, "name": AI_ENDPOINT, "group": chat_catalogue.group_of(AI_ENDPOINT)}],
+                "groups": chat_catalogue.GROUPS, "default": AI_ENDPOINT,
+                "error": f"Couldn't list this workspace's models ({_failure_reason(e)}). "
+                         "Showing the configured default only."}
 
 
 @app.get("/api/whoami")
@@ -719,34 +717,37 @@ def scan_start(request: Request, model: Optional[str] = None):
     to the worker, so the background queries still run as the logged-in user."""
     client = _client_for(request)
     who = request.headers.get("x-forwarded-email") or request.headers.get("x-forwarded-user") or ""
-    # explainer bound to the chosen model (falls back to default inside _ai_explain)
+    # The model the explanations will use, recorded so the self-cost prices that model.
+    explainer = _explainer_model(model)
     def _explain_bound(rubric, desc, rows_sql, cli):
-        return _ai_explain(rubric, desc, rows_sql, cli, model)
+        return _ai_explain(rubric, desc, rows_sql, cli, explainer)
     scan_id, created = scan_engine.STORE.start_scan({
         "status": "starting", "total": 0, "done": 0, "clean": 0,
-        "findings": [], "started_by": who,
+        "findings": [], "started_by": who, "model": explainer,
     })
     if not created:
         return {"scan_id": scan_id, "status": "running"}
 
-    def _persist(sid: str, cli: WorkspaceClient) -> Optional[str]:
-        """Called on the scan thread when it finishes: compute self-cost, then
-        write the run + findings to the shared Delta store (best-effort).
-        Returns None once saved, else why it wasn't."""
+    def _save(sid: str, cli: WorkspaceClient) -> Optional[str]:
+        """Called on the scan thread when it finishes: write the run + findings to the
+        shared Delta store (best-effort). Returns None once saved, else why it wasn't."""
         view = scan_engine.scan_view(sid)
         if not view:
             return "scan not found"
-        try:
-            cost = _compute_scan_cost(view, cli)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"persist: cost compute failed: {e}")
-            cost = None
-        return None if DELTA.save_scan(cli, view, cost) else DELTA.last_error
+        return None if DELTA.save_scan(cli, view) else DELTA.last_error
+
+    def _price(sid: str, cli: WorkspaceClient, saved: bool) -> dict[str, Any]:
+        """Called after the save settles: the scan's self-cost, attached to its saved run."""
+        cost = _compute_scan_cost(scan_engine.scan_view(sid), cli)
+        if saved and not DELTA.save_cost(cli, sid, cost):
+            logger.warning(f"scan {sid}: self-cost not saved: {DELTA.last_error}")
+        logger.info(f"scan {sid}: self-cost {cost.get('total_usd')} USD ({'attached' if saved else 'not saved'})")
+        return cost
 
     t = threading.Thread(
         target=scan_engine.run_scan,
         args=(scan_id, client, _run_sql, _explain_bound, _bounded, logger),
-        kwargs={"on_complete": _persist},
+        kwargs={"on_complete": _save, "price": _price},
         daemon=True,
     )
     t.start()
@@ -808,7 +809,8 @@ def scan_cost(scan_id: str, request: Request):
 
 def _compute_scan_cost(view: dict, client: WorkspaceClient) -> dict[str, Any]:
     """Attribute what a scan cost to run (DBSQL wall-time estimate + ai_query
-    published-rate estimate). Shared by the /cost endpoint and the Delta persist."""
+    published-rate estimate). Shared by the /cost endpoint and the scan thread, which
+    attaches it to the saved run."""
     scan_id = view["scan_id"]
     started, ended = view.get("started_at"), view.get("ended_at")
     end_expr = f"TIMESTAMP '{ended}'" if ended else "now()"
@@ -879,43 +881,37 @@ def _compute_scan_cost(view: dict, client: WorkspaceClient) -> dict[str, Any]:
     except Exception as e:
         logger.warning(f"scan cost M1 precise failed: {e}")
 
-    # ── (2) ai_query() explanations. INSTANT estimate: n_explains × a small
-    #   assumed token profile, priced at this endpoint's rate. Refined with real
-    #   tokens from ai_gateway.usage when it has caught up. ──
-    # Price the explainer tokens against the PUBLISHED rate card (the honest,
-    # workspace-independent way — deriving a $/token from this shared demo
-    # workspace's messy billing↔gateway ratio produces nonsense unit rates).
-    # We use a conservative proprietary anchor: $0.070/DBU × published DBU/1M,
-    # input & output separately. AI_ENDPOINT_DBU below is the explainer model's
-    # published rate; default to a small-model rate and cap the estimate as "≤".
+    # ── (2) ai_query() explanations, priced at the published rate of the model THIS scan
+    #   used and the list $/DBU of that model's SKU here (pricing.py). An unpriced model says
+    #   why instead of borrowing another model's rate. Tokens are this user's calls to that
+    #   endpoint on this workspace in the scan window, once system.ai_gateway.usage has
+    #   caught up (it lags minutes); until then an input-heavy profile per explanation. ──
+    model = view.get("model") or AI_ENDPOINT
     try:
-        scan_mix = _run_sql(f"""
-          SELECT coalesce(sum(input_tokens),0) AS in_s, coalesce(sum(output_tokens),0) AS out_s,
-                 count(*) AS calls
+        scan_mix = _run_sql("""
+          SELECT coalesce(sum(input_tokens),0) AS in_s, coalesce(sum(output_tokens),0) AS out_s
           FROM system.ai_gateway.usage
-          WHERE endpoint_name='{AI_ENDPOINT}' AND invocation_metadata.source='AI_QUERY'
-            AND event_time >= TIMESTAMP '{started}' AND event_time < {end_expr}
-        """, client)
-        r = scan_mix["rows"][0] if scan_mix["rows"] else [0, 0, 0]
+          WHERE workspace_id = :ws AND endpoint_name = :model AND requester = current_user()
+            AND invocation_metadata.source = 'AI_QUERY'
+            AND event_time >= :started::timestamp AND event_time < coalesce(:ended::timestamp, now())
+        """, client, params=[{"name": "ws", "value": _workspace_id()}, {"name": "model", "value": model},
+                             {"name": "started", "value": started}, {"name": "ended", "value": ended}])
+        r = scan_mix["rows"][0] if scan_mix["rows"] else [0, 0]
         in_s = int(scan_engine._num(r[0]) or 0); out_s = int(scan_engine._num(r[1]) or 0)
         measured = (in_s + out_s) > 0
-        # published rate for the explainer endpoint (DBU/1M in, out) × $/DBU.
-        dbu_in, dbu_out = AI_ENDPOINT_DBU
-        usd_dbu = 0.070
-        if measured:
-            ai_usd = round((in_s/1e6*dbu_in + out_s/1e6*dbu_out) * usd_dbu, 4)
-            out["ai_query"] = {"basis": "measured", "ai_calls": n_explains,
-                               "tokens": in_s + out_s, "usd": ai_usd}
-        else:  # pre-gateway estimate: input-heavy profile per explainer (~1200 in / 120 out)
-            e_in, e_out = n_explains * 1200, n_explains * 120
-            ai_usd = round((e_in/1e6*dbu_in + e_out/1e6*dbu_out) * usd_dbu, 4)
-            out["ai_query"] = {"basis": "estimate", "ai_calls": n_explains, "tokens": e_in + e_out, "usd": ai_usd}
+        if not measured:
+            in_s, out_s = n_explains * 1200, n_explains * 120
+        out["ai_query"] = {"basis": "measured" if measured else "estimate", "ai_calls": n_explains,
+                           "tokens": in_s + out_s, **pricing.model_cost(model, _workspace_prices(client), in_s, out_s)}
     except Exception as e:
         logger.warning(f"scan cost ai_query failed: {e}")
-        out["ai_query"] = {"error": str(e)[:200]}
+        out["ai_query"] = {"model": model, "usd": None, "error": str(e)[:200]}
 
-    parts = [out.get("dbsql", {}).get("usd"), out.get("ai_query", {}).get("usd")]
-    out["total_usd"] = round(sum(p for p in parts if isinstance(p, (int, float))), 4)
+    # The same columns a saved run carries, so the page shows a live and a saved cost alike.
+    out["dbsql_usd"] = out.get("dbsql", {}).get("usd")
+    out["ai_usd"] = out.get("ai_query", {}).get("usd")
+    parts = [p for p in (out["dbsql_usd"], out["ai_usd"]) if isinstance(p, (int, float))]
+    out["total_usd"] = round(sum(parts), 4) if parts else None
     return out
 
 
@@ -945,29 +941,31 @@ def finding_triage(hunt_id: str, body: TriageUpdate, request: Request):
             "store_error": None if persisted else DELTA.last_error}
 
 
-# ── API: Tokenomics live SQL (verify rates + tie to actual spend) ────────────
+# ── API: Tokenomics live SQL (this workspace's prices + actual spend) ────────
 
-@app.get("/api/token/verify-rates")
-def token_verify_rates(request: Request):
-    """Read the model-serving $/DBU rates actually in effect on this workspace,
-    so the rate card can be confirmed against system.billing.list_prices."""
-    sql = """
-        SELECT sku_name,
-               round(pricing.default, 4)                AS usd_per_dbu_list,
-               round(pricing.effective_list.default, 4) AS usd_per_dbu_effective
-        FROM system.billing.list_prices
-        WHERE (sku_name ILIKE '%MODEL_SERVING%' OR sku_name ILIKE '%REAL_TIME_INFERENCE%')
-          AND price_end_time IS NULL
-        ORDER BY sku_name
-    """
-    try:
-        out = _run_sql(sql, _client_for(request))
-        return {"columns": out["columns"], "rows": out["rows"], "total_rows": out["total_rows"]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"verify-rates failed: {e}")
-        raise HTTPException(500, f"verify-rates failed: {e}")
+def _workspace_id() -> str:
+    global WORKSPACE_ID
+    if not WORKSPACE_ID:
+        try:
+            WORKSPACE_ID = str(sp_client.get_workspace_id())
+        except DatabricksError as e:
+            raise HTTPException(502, f"Couldn't read this workspace's id: {_sdk_message(e)}")
+    return WORKSPACE_ID
+
+
+def _workspace_prices(client: WorkspaceClient) -> pricing.Prices:
+    """What each model's SKU costs per DBU on this workspace, from its own billing."""
+    out = _run_sql(pricing.PRICES_SQL, client, max_rows=None,
+                   params=[{"name": "workspace_id", "value": _workspace_id()}])
+    return pricing.workspace_prices(out["rows"])
+
+
+@app.get("/api/token/prices")
+def token_prices(request: Request):
+    """The cloud, tier and region this workspace bills in, and the $ per DBU of each model SKU,
+    for the Tokenomics calculator and rate card."""
+    prices = _workspace_prices(_client_for(request))
+    return {"workspace_id": _workspace_id(), **pricing.as_json(prices)}
 
 
 @app.get("/api/token/actuals")

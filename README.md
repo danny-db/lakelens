@@ -59,7 +59,7 @@ flowchart LR
 | ② **Tune** | 12 best-practice cards: job vs all-purpose compute, serverless, Photon, liquid clustering / PO / zstd, timeouts, policies, spot, AI guardrails, tagging, budgets. [Details](docs/CATALOGUE.md#tune-practices). |
 | ③ **Prove** | 7 measures that show the saving (see below). [Details](docs/CATALOGUE.md#measures). |
 | 🏷️ **Tagging** | Finds untagged warehouses, clusters and spend. You can set a tag in place (confirmed, runs as you). |
-| 💠 **Tokenomics** | Estimates AI cost before the bill: tokens → DBU → $, model comparison, live `list_prices` check, actual 30-day serving spend. |
+| 💠 **Tokenomics** | Estimates AI cost before the bill: tokens → DBU → $ for every model this workspace serves, at Databricks' published rates and the list $/DBU of the SKUs this workspace bills on its own cloud, tier and region. Also the actual 30-day serving spend. |
 | 💬 **Ask** | Natural-language cost questions through Genie One. No setup. Each answer shows its SQL, a result table and a link to open it in Genie One. |
 
 ### The 23 hunts
@@ -118,8 +118,7 @@ Tip: pin `host`, `warehouse_id` and `results_catalog` in the `prod` target of `d
 | `warehouse_id` | yes | none | SQL warehouse every query runs on |
 | `results_catalog` | recommended | none | Where scans and triage are saved |
 | `results_schema` | no | `lakelens` | Schema inside that catalog |
-| `ai_endpoint` | no | `databricks-gpt-5-4-mini` | Model for the plain-English explanations |
-| `ai_endpoint_dbu` | no | `7.5,30` | That model's DBU per 1M tokens (in,out), used to price the scan |
+| `ai_endpoint` | no | `databricks-gpt-6-luna` | Model for the plain-English explanations. A scan prices its AI cost at the published rate of the model it used, from `app/rate_card.json` |
 | `anomaly_high_x` | no | `3` | An alert is high when it is at least this many times its own usual |
 | `anomaly_medium_x` | no | `2` | An alert is medium when it is at least this many times its own usual |
 

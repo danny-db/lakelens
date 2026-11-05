@@ -14,7 +14,7 @@ import hunts as cat  # noqa
 
 PROFILE = "DEFAULT"
 WAREHOUSE = "<your-sql-warehouse-id>"
-AI_ENDPOINT = "databricks-gpt-5-4-mini"
+AI_ENDPOINT = "databricks-gpt-6-luna"
 
 
 def run_sql(sql: str, timeout=170):

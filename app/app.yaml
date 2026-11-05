@@ -25,14 +25,10 @@ env:
   - name: RESULTS_SCHEMA
     value: "lakelens"
   # Model-serving endpoint for the plain-English explainers (a cheap tier is plenty).
+  # The scan prices its own AI cost from the app's published rate card (rate_card.json).
   #   databricks serving-endpoints list
   - name: AI_ENDPOINT
-    value: "databricks-gpt-5-4-mini"
-  # Published DBU/1M-token rate (input,output) for that endpoint — used to price the
-  # scan's own ai_query cost from the rate card. Override if you point AI_ENDPOINT
-  # at a pricier model.
-  - name: AI_ENDPOINT_DBU
-    value: "7.5,30"
+    value: "databricks-gpt-6-luna"
   # Alert severity: a row is high at ANOMALY_HIGH_X times its own usual (trailing
   # 28 days) and medium at ANOMALY_MEDIUM_X. An entity with no history is medium.
   - name: ANOMALY_HIGH_X

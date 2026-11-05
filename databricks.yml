@@ -24,11 +24,8 @@ variables:
     description: "Schema inside results_catalog for LakeLens tables."
     default: "lakelens"
   ai_endpoint:
-    description: "Model-serving endpoint for the plain-English explainers (a cheap tier is plenty)."
-    default: "databricks-gpt-5-4-mini"
-  ai_endpoint_dbu:
-    description: "Published DBU/1M-token rate (input,output) for ai_endpoint — used to price the scan's own AI cost."
-    default: "7.5,30"
+    description: "Model-serving endpoint for the plain-English explainers (a cheap tier is plenty). The scan prices its AI cost from the app's published rate card."
+    default: "databricks-gpt-6-luna"
   anomaly_high_x:
     description: "An alert is high when a row is at least this many times its own usual (trailing 28 days)."
     default: "3"
@@ -73,8 +70,6 @@ resources:
             value: ${var.results_schema}
           - name: AI_ENDPOINT
             value: ${var.ai_endpoint}
-          - name: AI_ENDPOINT_DBU
-            value: ${var.ai_endpoint_dbu}
           - name: ANOMALY_HIGH_X
             value: ${var.anomaly_high_x}
           - name: ANOMALY_MEDIUM_X

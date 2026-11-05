@@ -266,7 +266,7 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
 
 
 def run_scan(scan_id: str, client, run_sql: Callable, ai_explain: Callable, bounded: Callable,
-             logger, on_complete: Optional[Callable] = None) -> None:
+             logger, on_complete: Optional[Callable] = None, price: Optional[Callable] = None) -> None:
     """Execute every alerting hunt, build findings, attach AI explanations.
     Runs on a background thread. Streams results into STORE as it goes so the
     frontend can render the queue progressively.
@@ -276,6 +276,7 @@ def run_scan(scan_id: str, client, run_sql: Callable, ai_explain: Callable, boun
       bounded(sql, n) -> sql capped to top-n
       on_complete(scan_id, client) -> called after the scan finishes (persist to Delta);
                                       returns None once saved, else why it wasn't
+      price(scan_id, client, saved) -> the scan's self-cost, called once the save settles
     """
     alert_hunts = [h for h in catalogue.HUNTS if h["id"] in catalogue.ALERT_SPECS]
     # Record the scan's own start time (UTC) so we can attribute what THIS scan
@@ -326,6 +327,14 @@ def run_scan(scan_id: str, client, run_sql: Callable, ai_explain: Callable, boun
             save_error = str(e)
             logger.warning(f"scan {scan_id}: on_complete (persist) failed: {e}")
     STORE.update_scan(scan_id, saved=save_error is None, save_error=save_error)
+    # The self-cost reads billing and query history, which takes longer than the save, so it
+    # comes second: the page shows the saved scan meanwhile, then the cost when it lands.
+    if price:
+        try:
+            STORE.update_scan(scan_id, cost=price(scan_id, client, save_error is None))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"scan {scan_id}: self-cost failed: {e}")
+            STORE.update_scan(scan_id, cost_error=str(e)[:300])
 
 
 def scan_view(scan_id: str) -> Optional[dict]:
@@ -355,7 +364,10 @@ def scan_view(scan_id: str) -> Optional[dict]:
         "started_at": rec.get("started_at"),
         "ended_at": rec.get("ended_at"),
         "n_explains": rec.get("n_explains", 0),
+        "model": rec.get("model"),            # the explainer model, which prices the AI self-cost
         "wall_ms": rec.get("wall_ms", 0.0),
         "saved": rec.get("saved"),            # None until the save settles after "complete"
         "save_error": rec.get("save_error"),
+        "cost": rec.get("cost"),              # None until the self-cost settles after the save
+        "cost_error": rec.get("cost_error"),
     }
