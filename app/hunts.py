@@ -512,8 +512,8 @@ LIMIT 20
                 "statements in Query History to confirm the shape.",
         "action": "Give investigators a two-line template: first, time-bound the opening scan "
                   "on the table's date column; second, stage that first pass into a temp table "
-                  "and run every refinement against the small staged copy — five scans become "
-                  "one. Longer term, promote the searched fields to real clustered columns, or "
+                  "and run every refinement against the small staged copy, so the repeated scans "
+                  "become one. Longer term, promote the searched fields to real clustered columns, or "
                   "evaluate a full-text search index.",
         "measure": "M1",
         "explain_hunt_desc": "the account's heaviest scan hour this week versus its usual heaviest "
@@ -879,9 +879,9 @@ ORDER BY runs DESC
         "eli5": "Shows weekly usage per Lakeflow (DLT) pipeline, so pipelines of similar "
                 "size can be compared and the expensive outlier found.",
         "what": "Rank by usage; for the expensive ones, divide by table count for a rough "
-                "cost-per-table comparison. In our review one pipeline cost 3.3× its peer "
-                "— mostly because of machine type and on-demand vs spot, while running at "
-                "about 25% CPU. Check the pipeline's event log for WARN/ERROR messages too.",
+                "cost-per-table comparison. A pipeline that costs far more per table than its "
+                "peers is usually explained by machine type, on-demand vs spot, or low CPU "
+                "use (see Idle Cores). Check the pipeline's event log for WARN/ERROR messages too.",
         "action": "Prefer fewer, larger workers (less shuffle) and a bigger driver when one "
                   "pipeline drives many tables; start small and step up on evidence; avoid spot "
                   "for continuous change-data pipelines; and consider splitting a mega-pipeline. "
@@ -914,18 +914,18 @@ ORDER BY dbus DESC
         "eli5": "Shows the busiest clusters and their average CPU — sustained low CPU "
                 "on big machines means you are paying for cores that sit idle.",
         "what": "This lists the busiest clusters over the last 7 days with their average CPU. "
-                "Sustained CPU around 20–30% on large nodes means idle cores you are paying "
-                "for. Pick a cluster to drill into (in the notebook, query its hour-by-hour CPU "
-                "and memory); low steady CPU with low memory = downsize, memory near 100% = "
+                "Sustained CPU well below your other busy clusters on large nodes means idle "
+                "cores you are paying for. Pick a cluster to drill into (in the notebook, query its hour-by-hour CPU "
+                "and memory); low steady CPU with low memory = downsize, memory near full = "
                 "memory-bound.",
-        "action": "Right-size on this evidence — start small (2–3 nodes) and step up "
+        "action": "Right-size on this evidence: start with a small cluster and step up "
                   "only when the metrics say so. Use fewer, larger nodes for shuffle-heavy work "
                   "rather than many small ones.",
         "measure": "M2",
         "explain_hunt_desc": "busiest clusters over 7 days with average CPU (idle-core discovery)",
         "explain_rubric": (
             "each row is a cluster with node_minutes (how much it ran) and avg_cpu_pct. Sustained low "
-            "avg_cpu_pct (around 20-30%) on a cluster with high node_minutes = idle cores you are paying "
+            "avg_cpu_pct (well below the other listed clusters) on a cluster with high node_minutes = idle cores you are paying "
             "for - a downsize candidate. High CPU means it's well-used. Name the low-CPU, high-runtime "
             "clusters as the ones to drill into (per-node utilisation) and right-size. This is a "
             "discovery list; recommend confirming a cluster's hour-by-hour utilisation before resizing."
@@ -1053,15 +1053,15 @@ LIMIT 50
         "what": "A classic warehouse with auto_stop_minutes = 0 never suspends, so it bills around the "
                 "clock regardless of use. min_clusters > 1 multiplies that. This is the cube_serving "
                 "pattern — clusters held warm continuously. Each row is such a warehouse and its size.",
-        "action": "Set auto_stop_minutes to a sensible value (10–60 min depending on the workload) so "
+        "action": "Set auto_stop_minutes to a short value that fits the workload's idle gaps so "
                   "it suspends when idle, and drop min_clusters to 1 unless sustained concurrency needs "
                   "more. For genuinely bursty BI, a serverless warehouse auto-stops in minutes.",
         "measure": "M3",
         "explain_hunt_desc": "classic SQL warehouses with auto-stop disabled (billing 24/7)",
         "explain_rubric": (
             "each row is a classic warehouse with auto_stop_minutes=0 — it never suspends, so it bills "
-            "continuously. warehouse_size and min_clusters set how expensive that is (a MEDIUM with "
-            "min_clusters=3 held 24/7 is a lot). Flag the largest / highest-min_clusters ones first; "
+            "continuously. warehouse_size and min_clusters set how expensive that is (a large size "
+            "with several min_clusters held 24/7 is a lot). Flag the largest / highest-min_clusters ones first; "
             "the fix is to set an auto-stop. This is a config signal — confirm the warehouse isn't "
             "deliberately kept warm for a real 24/7 SLA before acting."
         ),
@@ -1279,7 +1279,7 @@ LIMIT 50
         "category": "reads",
         "title": "Tables likely still on snappy (not zstd)",
         "eli5": "Finds Delta tables created before Databricks switched the default compression from "
-                "snappy to zstd — zstd typically stores the same data in ~10–40% less space.",
+                "snappy to zstd; zstd typically stores the same data in less space.",
         "what": "The compression codec isn't in any system table, so this can't read it directly. Instead "
                 "it lists Delta tables created BEFORE the Oct-2025 default flip (snappy → zstd) per schema "
                 "— these are the likely-snappy CANDIDATES. A table created after that, or one whose codec was "
@@ -1295,7 +1295,7 @@ LIMIT 50
             "each row is a schema (catalog.schema) with a count of Delta tables created before 2025-10-15 — "
             "the date Databricks flipped the default parquet codec from snappy to zstd. These are CANDIDATES "
             "likely still on snappy, NOT confirmed (the codec isn't in system tables). More tables in a schema "
-            "= more potential storage saving from recompressing to zstd (~10-40% smaller). Recommend confirming "
+            "= more potential storage saving from recompressing to zstd (zstd files are typically smaller). Recommend confirming "
             "with SHOW TBLPROPERTIES before acting, and prioritising the largest / most-scanned tables. Do not "
             "assert waste — frame as 'worth checking'."
         ),
