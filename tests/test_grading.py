@@ -90,6 +90,11 @@ class SpecCatalogue(unittest.TestCase):
         for hid, spec in hunts.ALERT_SPECS.items():
             self.assertIn(spec["kind"], scan.GRADERS, hid)
 
+    def test_every_anomaly_spec_names_its_aggregate(self):
+        for hid, spec in hunts.ALERT_SPECS.items():
+            if spec["kind"] == "anomaly":
+                self.assertIn(spec.get("aggregate"), ("additive", "peak"), hid)
+
 
 if __name__ == "__main__":
     unittest.main()

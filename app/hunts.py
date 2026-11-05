@@ -81,31 +81,6 @@ CATEGORIES = [
 #   explain_hunt_desc    — short description of the hunt for the AI prompt
 #   caution              — optional warning banner (e.g. H15 reads customer data)
 
-# ── The "versus its own normal" columns every anomaly hunt returns ───────────
-# Each anomaly hunt computes, per row, `own_normal` (the entity's statistic over
-# the prior 28 days, NULL when it has none) and `ws_normal` (the same statistic
-# across every entity: the workspace's own floor, so a tiny normal can't turn
-# noise into a huge multiple). These two helpers turn that into the contract
-# ALERT_SPECS grades on. An entity with no history is NEW (vs_normal NULL) only
-# when it is at least the workspace normal; a smaller newcomer is scored against
-# the workspace normal instead, so it can't raise an alert on its own.
-def _vs_normal(metric: str) -> str:
-    new = f"(own_normal IS NULL AND {metric} > 0 AND {metric} >= coalesce(ws_normal, 0))"
-    base = "CASE WHEN own_normal IS NOT NULL THEN greatest(own_normal, ws_normal) ELSE ws_normal END"
-    return (f"CASE WHEN {new} THEN NULL ELSE {base} END AS baseline,\n"
-            f"       CASE WHEN {new} THEN NULL\n"
-            f"            ELSE coalesce(round(try_divide({metric}, {base}), 2), 0) END AS vs_normal,\n"
-            f"       CASE WHEN {new} THEN 'none (new)'\n"
-            f"            WHEN own_normal IS NULL THEN 'workspace (no own history)'\n"
-            f"            WHEN own_normal >= ws_normal THEN 'own' ELSE 'workspace floor' END AS baseline_from")
-
-
-def _most_unusual(metric: str) -> str:
-    """ORDER BY key: most times its normal first; a NEW row ranks by its multiple of
-    the workspace normal."""
-    return f"coalesce(vs_normal, try_divide({metric}, ws_normal)) DESC NULLS LAST"
-
-
 # ── The account-versus-its-own-normal columns every anomaly hunt returns ──────
 # Windows are trailing 7-day periods counted back from now, so the current window
 # (wk 0) and the four before it (wk 1-4, the prior 28 days) are the same length
@@ -1344,18 +1319,19 @@ LIMIT 50
         "id": "H22",
         "category": "config",
         "title": "Serverless jobs in Performance-optimized mode",
-        "eli5": "Finds serverless jobs running in Performance-optimized mode. That mode starts and "
-                "runs faster but burns more DBUs — worth it for time-critical pipelines, but "
-                "non-urgent jobs can switch to Standard mode and pay for fewer DBUs.",
-        "what": "Serverless jobs have two performance modes. Both bill at the SAME $/DBU rate — the "
-                "difference is DBU consumption: Performance-optimized (the default) prioritises fast "
+        "eli5": "Checks how much the account spent on serverless jobs in Performance-optimized mode this "
+                "week against its usual week. That mode starts and runs faster but burns more DBUs; "
+                "worth it for time-critical pipelines, but non-urgent jobs can switch to Standard mode "
+                "and pay for fewer DBUs.",
+        "what": "Serverless jobs have two performance modes. Both bill at the SAME $/DBU rate; the "
+                "difference is DBU consumption. Performance-optimized (the default) prioritises fast "
                 "startup and runs on quicker capacity, so it consumes more DBUs; Standard tolerates a "
-                "slower cold start (Databricks quotes ~4–6 minutes) and uses fewer DBUs for the same "
-                "work. Each row is a serverless job currently billing in Performance-optimized mode, "
-                "with its list-price cost and DBUs over the last 30 days, plus its spend this week set "
-                "against its usual week (the median of its prior four). vs_normal is how many times that "
-                "usual it spent, and that sets the alert. perf_optimized_usd is the "
-                "spend exposed to a Standard-mode switch — not a guaranteed saving.",
+                "slower cold start and uses fewer DBUs for the same work. The account's list-price "
+                "spend in Performance-optimized mode this week (complete days) is set against its "
+                "usual week (the median of the prior four weeks). vs_normal is how many times that "
+                "normal this week is, and that sets the alert. Each row is one job with its spend, "
+                "DBUs and share of the account's spend in this mode. usd_7d is the spend exposed to a "
+                "Standard-mode switch, not a guaranteed saving.",
         "action": "For latency-tolerant jobs — scheduled batch, backfills, overnight ETL, anything with "
                   "no downstream deadline — turn OFF ‘Performance optimization’ on the job's serverless "
                   "compute (Job → task → Compute → Serverless → Performance optimized). That accepts a "
@@ -1363,21 +1339,22 @@ LIMIT 50
                   "run has a real SLA or a waiting consumer. Prove the change with M6 (the job's "
                   "Performance-optimized line should fall, replaced by a smaller Standard line).",
         "measure": "M6",
-        "explain_hunt_desc": "serverless jobs running in Performance-optimized mode (faster start, more DBUs) that may not need it",
+        "explain_hunt_desc": "the account's serverless-job spend in Performance-optimized mode this week "
+                             "versus its usual week, and the jobs behind it (faster start, more DBUs)",
         "explain_rubric": (
-            "each row is a serverless job billing in PERFORMANCE_OPTIMIZED mode over the last 30 days. "
-            "Ground the read on the real mechanic: BOTH modes bill at the same $/DBU rate — "
-            "performance-optimized just consumes MORE DBUs to start and run faster (Standard tolerates a "
-            "~4–6 min slower cold start for fewer DBUs). perf_optimized_usd is the 30-day list-price spend "
-            "in this mode; dbus is the volume; active_days shows how regularly it runs. vs_normal = usd_7d / "
-            "baseline, where baseline is the job's median week of this spend over the prior four (floored "
-            "at the workspace's 95th-percentile job-week; baseline_from says which); NULL vs_normal = a job first "
-            "seen in this mode this week. Name the jobs furthest above their own normal and the biggest-$ "
-            "jobs as the candidates to move to Standard, and note that a frequently-run job (high active_days) "
-            "compounds the saving. DO NOT quote a fixed % saving — the realised saving depends on the "
-            "workload, and the tradeoff is a slower start; flag that genuinely time-critical / SLA jobs "
-            "should stay Performance-optimized. The job name often hints at urgency (e.g. ‘15min Refresh’ "
-            "may be deliberately fast; a nightly ‘datagen’ or ‘backfill’ usually is not)."
+            "account_value is the account's list-price $ on serverless jobs in PERFORMANCE_OPTIMIZED "
+            "mode this week (complete days); baseline is the median of the prior four weekly totals; "
+            "vs_normal = account_value / baseline (NULL = no prior spend in this mode). Say first "
+            "whether the account is above its normal. Ground the read on the real mechanic: BOTH modes "
+            "bill at the same $/DBU rate - performance-optimized just consumes MORE DBUs to start and "
+            "run faster (Standard tolerates a slower cold start for fewer DBUs). Each row is one job; "
+            "usd_7d is its spend this week, share_pct its share, dbus_7d the volume and active_days how "
+            "regularly it ran. Name the jobs with the largest share as the candidates to move to "
+            "Standard, and note that a frequently-run job compounds the saving. DO NOT quote a fixed % "
+            "saving - the realised saving depends on the workload, and the tradeoff is a slower start; "
+            "flag that genuinely time-critical / SLA jobs should stay Performance-optimized. The job "
+            "name often hints at urgency (a frequent ‘Refresh’ may be deliberately fast; a nightly "
+            "‘datagen’ or ‘backfill’ usually is not)."
         ),
         "sql": f"""
 WITH price AS (
@@ -1387,6 +1364,7 @@ WITH price AS (
 job_name AS (SELECT workspace_id, job_id, max(name) AS name FROM system.lakeflow.jobs GROUP BY 1, 2),
 daily AS (
   SELECT u.workspace_id, u.usage_metadata.job_id AS job_id, u.usage_date,
+         {_wk_day("u.usage_date")}           AS wk,
          sum(u.usage_quantity * pr.unit_usd) AS usd,
          sum(u.usage_quantity)               AS dbus
   FROM system.billing.usage u
@@ -1395,37 +1373,28 @@ daily AS (
     AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
   WHERE u.billing_origin_product = 'JOBS'
     AND u.product_features.performance_target = 'PERFORMANCE_OPTIMIZED'
-    AND u.usage_metadata.job_id IS NOT NULL
-    AND u.usage_date >= current_date() - INTERVAL 34 DAYS
+    AND u.usage_date >= current_date() - INTERVAL 35 DAYS
+    AND u.usage_date < current_date()
   GROUP BY 1, 2, 3
 ),
-weekly AS (
-  SELECT workspace_id, job_id, floor(datediff(current_date(), usage_date) / 7) AS wk, sum(usd) AS usd
-  FROM daily GROUP BY 1, 2, 3
-),
-own AS (SELECT workspace_id, job_id, percentile_approx(usd, 0.5) AS own_normal
-        FROM weekly WHERE wk BETWEEN 1 AND 4 AND usd > 0 GROUP BY 1, 2),
-ws AS (SELECT percentile_approx(usd, 0.95) AS ws_normal FROM weekly WHERE wk BETWEEN 1 AND 4 AND usd > 0),
-jobs AS (
+weekly AS (SELECT wk, sum(usd) AS v FROM daily WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
   SELECT workspace_id, job_id,
-         round(sum(CASE WHEN usage_date >= current_date() - INTERVAL 30 DAYS THEN usd END), 2) AS perf_optimized_usd,
-         round(sum(CASE WHEN usage_date >= current_date() - INTERVAL 30 DAYS THEN dbus END), 1) AS dbus,
-         count(DISTINCT CASE WHEN usage_date >= current_date() - INTERVAL 30 DAYS THEN usage_date END) AS active_days,
-         round(sum(CASE WHEN usage_date > current_date() - INTERVAL 7 DAYS THEN usd ELSE 0 END), 2) AS usd_7d
-  FROM daily GROUP BY 1, 2
-  HAVING perf_optimized_usd > 0
-),
-graded AS (
-  SELECT j.*, o.own_normal, w.ws_normal
-  FROM jobs j LEFT JOIN own o USING (workspace_id, job_id) CROSS JOIN ws w
+         sum(usd)                    AS usd_7d,
+         sum(dbus)                   AS dbus_7d,
+         count(DISTINCT usage_date)  AS active_days
+  FROM daily WHERE wk = 0
+  GROUP BY 1, 2
 )
-SELECT g.workspace_id,
-       coalesce(jn.name, CAST(g.job_id AS STRING)) AS job_name,
-       g.job_id, g.perf_optimized_usd, g.dbus, g.active_days, g.usd_7d,
-       {_vs_normal("g.usd_7d")}
-FROM graded g
-LEFT JOIN job_name jn ON g.workspace_id = jn.workspace_id AND g.job_id = jn.job_id
-ORDER BY {_most_unusual("g.usd_7d")}, g.perf_optimized_usd DESC
+SELECT c.workspace_id,
+       coalesce(jn.name, CAST(c.job_id AS STRING), 'unknown job') AS job_name,
+       c.job_id, round(c.usd_7d, 2) AS usd_7d, round(c.dbus_7d, 1) AS dbus_7d, c.active_days,
+       {_vs_account("c.usd_7d")}
+FROM contrib c
+LEFT JOIN job_name jn ON c.workspace_id = jn.workspace_id AND c.job_id = jn.job_id
+CROSS JOIN acct
+ORDER BY c.usd_7d DESC
 LIMIT 50
 """,
     },
@@ -1435,18 +1404,19 @@ LIMIT 50
         "id": "H23",
         "category": "spend",
         "title": "Predictive Optimization cost drivers",
-        "eli5": "Finds the tables driving your Predictive Optimization bill up — the ones whose "
-                "auto-maintenance (compaction, clustering, vacuum) burned far more DBUs in the last 7 "
-                "days than they usually do in a week.",
+        "eli5": "Checks the account's Predictive Optimization DBUs over the last 7 complete days against "
+                "its usual week, then names the tables whose auto-maintenance (compaction, clustering, "
+                "vacuum) drove it.",
         "what": "Predictive Optimization is the automatic maintenance Databricks runs on your Unity "
-                "Catalog managed tables — OPTIMIZE/compaction, liquid clustering, VACUUM and stats. You "
+                "Catalog managed tables: OPTIMIZE/compaction, liquid clustering, VACUUM and stats. You "
                 "pay per DBU of that work, so the bill tracks how much data is being written and "
-                "reorganised. Each row is one table + operation type, with its PO DBUs in the last 7 "
-                "complete days, the prior 7, and the change. vs_normal sets this week against the "
-                "table's usual week (the median of its prior four), and that sets the alert; rows are "
-                "sorted by it, so the tables furthest above their own normal sit at the top. dbu_increase is in DBUs, not dollars — multiply by "
-                "your PO SKU rate for an approximate cost. (The two windows are trailing complete 7-day "
-                "periods, not calendar weeks, so today's partial day never distorts the comparison.)",
+                "reorganised. The account's PO DBUs in the last 7 complete days are set against its "
+                "usual week (the median of the four 7-day periods before). vs_normal is how many times "
+                "that normal this week is, and that sets the alert. Each row is one table + operation "
+                "type with its PO DBUs this period and the one before, the change, and its share of "
+                "the account's PO DBUs. dbu_increase is in DBUs, not dollars; multiply by your PO SKU "
+                "rate for an approximate cost. (The windows are trailing complete 7-day periods, not "
+                "calendar weeks, so today's partial day never distorts the comparison.)",
         "action": "Trace the top risers to a cause: (1) more ingestion / writes into that table → "
                   "expected if it is genuine new data; (2) a table or whole schema newly brought under "
                   "PO → confirm you actually want PO managing it; (3) a move to liquid clustering or a "
@@ -1456,66 +1426,49 @@ LIMIT 50
                   "instead run table maintenance (OPTIMIZE/VACUUM) on a schedule, less often. Re-run this "
                   "check next week; a one-off re-cluster or a narrowed PO scope should pull the top "
                   "table's dbu_increase back down.",
-        "explain_hunt_desc": "tables whose Predictive Optimization DBU consumption rose most over the "
-                             "last 7 days vs the prior 7 — the driver of a PO cost increase",
+        "explain_hunt_desc": "the account's Predictive Optimization DBUs over the last 7 complete days "
+                             "versus its usual week, and the tables and operations that drove them",
         "explain_rubric": (
-            "each row is a (table, operation_type) whose Predictive Optimization work changed "
-            "week-over-week; dbu_increase = last-7-days minus prior-7-days in ESTIMATED_DBUs (the unit "
-            "PO bills in). vs_normal = dbus_last_7d / baseline, where baseline is the table's median week "
-            "over the prior four (floored at the workspace's 95th-percentile table-week; baseline_from says which); "
-            "NULL vs_normal = a table first seen under PO this week. operation_type tells you WHICH maintenance grew: COMPACTION = many small "
-            "files being written, so more bin-packing; CLUSTERING / AUTO_CLUSTERING_COLUMN_SELECTION = "
-            "liquid-clustering re-organisation, often a one-off after clustering is enabled or keys "
-            "change; VACUUM = garbage-collecting deleted files; ANALYZE = statistics. A large rise "
-            "usually means one of: higher ingestion volume into that table, a table/schema newly brought "
-            "under PO, or a clustering-key change forcing a re-cluster. Name the top tables and their "
-            "operation types as the drivers. Values are DBUs, NOT dollars — do not fabricate a cost; the "
-            "bill is DBUs x the PO SKU rate. If the top operation is CLUSTERING right after enablement, "
-            "call it a likely one-off that settles."
+            "account_value is the account's Predictive Optimization DBUs (ESTIMATED_DBU, the unit PO "
+            "bills in) over the last 7 complete days; baseline is the median of the four 7-day periods "
+            "before; vs_normal = account_value / baseline (NULL = no prior PO usage). Say first whether "
+            "the account is above its normal. Each row is one (table, operation_type); share_pct is its "
+            "share, and dbu_increase = last-7-days minus the 7 days before. operation_type tells you "
+            "WHICH maintenance grew: COMPACTION = many small files being written, so more bin-packing; "
+            "CLUSTERING / AUTO_CLUSTERING_COLUMN_SELECTION = liquid-clustering re-organisation, often a "
+            "one-off after clustering is enabled or keys change; VACUUM = garbage-collecting deleted "
+            "files; ANALYZE = statistics. A large rise usually means one of: higher ingestion volume "
+            "into that table, a table/schema newly brought under PO, or a clustering-key change forcing "
+            "a re-cluster. Name the top tables and their operation types as the drivers. Values are "
+            "DBUs, NOT dollars - do not fabricate a cost; the bill is DBUs x the PO SKU rate. If the "
+            "top operation is CLUSTERING right after enablement, call it a likely one-off that settles."
         ),
         "sql": f"""
 WITH ops AS (
   SELECT catalog_name, schema_name, table_name, operation_type, usage_quantity,
-         floor((datediff(current_date(), start_time) - 1) / 7) AS wk
+         {_wk_day("start_time")} AS wk
   FROM system.storage.predictive_optimization_operations_history
   WHERE usage_unit = 'ESTIMATED_DBU'
     AND start_time >= current_date() - INTERVAL 35 DAYS
     AND start_time <  current_date()
 ),
-weekly AS (
-  SELECT catalog_name, schema_name, table_name, operation_type, wk, sum(usage_quantity) AS dbus
-  FROM ops GROUP BY 1, 2, 3, 4, 5
-),
-own AS (
-  SELECT catalog_name, schema_name, table_name, operation_type, percentile_approx(dbus, 0.5) AS own_normal
-  FROM weekly WHERE wk BETWEEN 1 AND 4 AND dbus > 0 GROUP BY 1, 2, 3, 4
-),
-ws AS (SELECT percentile_approx(dbus, 0.95) AS ws_normal FROM weekly WHERE wk BETWEEN 1 AND 4 AND dbus > 0),
-agg AS (
+weekly AS (SELECT wk, sum(usage_quantity) AS v FROM ops WHERE wk BETWEEN 0 AND 4 GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (
   SELECT catalog_name, schema_name, table_name, operation_type,
-         round(sum(CASE WHEN wk = 1 THEN dbus END), 1) AS dbus_prev_7d,
-         round(sum(CASE WHEN wk = 0 THEN dbus END), 1) AS dbus_last_7d
-  FROM weekly WHERE wk <= 1
+         coalesce(sum(CASE WHEN wk = 1 THEN usage_quantity END), 0) AS dbus_prev_7d,
+         coalesce(sum(CASE WHEN wk = 0 THEN usage_quantity END), 0) AS dbus_last_7d
+  FROM ops WHERE wk <= 1
   GROUP BY 1, 2, 3, 4
-),
-graded AS (
-  SELECT a.catalog_name, a.schema_name, a.table_name, a.operation_type,
-         coalesce(a.dbus_prev_7d, 0) AS dbus_prev_7d,
-         coalesce(a.dbus_last_7d, 0) AS dbus_last_7d,
-         o.own_normal, w.ws_normal
-  FROM agg a
-  LEFT JOIN own o ON a.catalog_name <=> o.catalog_name AND a.schema_name <=> o.schema_name
-                 AND a.table_name <=> o.table_name AND a.operation_type <=> o.operation_type
-  CROSS JOIN ws w
-  WHERE coalesce(a.dbus_last_7d, 0) + coalesce(a.dbus_prev_7d, 0) > 0
+  HAVING sum(CASE WHEN wk = 0 THEN usage_quantity END) > 0
 )
 SELECT catalog_name, schema_name, table_name, operation_type,
-       dbus_prev_7d, dbus_last_7d,
+       round(dbus_prev_7d, 1) AS dbus_prev_7d, round(dbus_last_7d, 1) AS dbus_last_7d,
        round(dbus_last_7d - dbus_prev_7d, 1) AS dbu_increase,
        concat_ws('.', catalog_name, schema_name, table_name) || ' (' || operation_type || ')' AS po_target,
-       {_vs_normal("dbus_last_7d")}
-FROM graded
-ORDER BY {_most_unusual("dbus_last_7d")}, dbu_increase DESC
+       {_vs_account("dbus_last_7d")}
+FROM contrib CROSS JOIN acct
+ORDER BY dbus_last_7d DESC
 LIMIT 50
 """,
     },
@@ -1971,19 +1924,17 @@ ALERT_SPECS: dict[str, AlertSpec] = {
     "H21": {"kind": "presence", "entity_col": "schema_name",
             "metric_label": "Schemas with likely-snappy Delta tables", "usd_col": None,
             "summary": "{n} schema(s) hold Delta tables that predate the zstd default, including {entity}."},
-    "H22": {"kind": "anomaly", "entity_col": "job_name", "metric_col": "usd_7d",
-            "metric_label": "Performance-optimized spend this week", "unit": "usd",
-            "baseline": "median of the job's prior four weeks in this mode, floored at the "
-                        "workspace's 95th-percentile job-week",
-            "summary": "{entity}: {x} its usual Performance-optimized spend ({metric} this week, normal ~{baseline}/week).",
-            "new_summary": "NEW: {entity} first seen in Performance-optimized mode this window ({metric} this week).",
-            "usd_col": "usd_7d"},
-    "H23": {"kind": "anomaly", "entity_col": "po_target", "metric_col": "dbus_last_7d",
-            "metric_label": "PO DBUs, last 7 complete days", "unit": "count",
-            "baseline": "median of the table and operation's prior four weeks, floored at the "
-                        "workspace's 95th-percentile table-week",
-            "summary": "{entity}: {x} its usual Predictive Optimization DBUs ({metric} in the last 7 days, normal ~{baseline}/week).",
-            "new_summary": "NEW: {entity} first seen under Predictive Optimization this window ({metric} DBUs).",
+    "H22": {"kind": "anomaly", "aggregate": "additive", "entity_col": "job_name", "metric_col": "usd_7d",
+            "metric_label": "Account Performance-optimized serverless job spend this week", "unit": "usd",
+            "baseline": "median of the account's prior four weekly totals (complete days)",
+            "summary": "Account spent {account} on Performance-optimized serverless jobs this week, {x} its usual (normal ~{baseline}).",
+            "new_summary": "Account has no prior history of Performance-optimized serverless jobs yet ({account} this week).",
+            "usd_col": "account_value"},
+    "H23": {"kind": "anomaly", "aggregate": "additive", "entity_col": "po_target", "metric_col": "dbus_last_7d",
+            "metric_label": "Account Predictive Optimization DBUs, last 7 complete days", "unit": "count",
+            "baseline": "median of the account's four prior 7-day totals",
+            "summary": "Account's Predictive Optimization used {account} DBUs in the last 7 days, {x} its usual (normal ~{baseline}).",
+            "new_summary": "Account has no prior history of Predictive Optimization yet ({account} DBUs in the last 7 days).",
             "usd_col": None},
 }
 
