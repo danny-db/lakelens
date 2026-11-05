@@ -2245,8 +2245,9 @@ function _boardChartDraw(panel, cols, rows, host, cid) {
   const chart = panel.chart;
   let cfg;
 
-  if (chart === "line" && cols.length > 2) {
-    // rows = [period, group, value]: one line per group, the top 8 by total and the rest summed into "Other"
+  if (chart === "line" && cols.length > 2 && rows.some(r => r[1] != null && isNaN(Number(r[1])))) {
+    // rows = [period, group, value] with a categorical group: one line per group, the top 8 by total
+    // and the rest summed into "Other"
     const {periods, idx, named, rest} = groupRows(rows, 8);
     const line = (label, data, color, dash) => ({ label, data, borderColor:color, borderDash:dash,
       backgroundColor:"transparent", borderWidth:2, tension:.3, pointRadius:2 });
