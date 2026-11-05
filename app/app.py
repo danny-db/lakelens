@@ -728,24 +728,26 @@ def scan_start(request: Request, model: Optional[str] = None):
     if not created:
         return {"scan_id": scan_id, "status": "running"}
 
-    def _persist(sid: str, cli: WorkspaceClient) -> Optional[str]:
-        """Called on the scan thread when it finishes: compute self-cost, then
-        write the run + findings to the shared Delta store (best-effort).
-        Returns None once saved, else why it wasn't."""
+    def _save(sid: str, cli: WorkspaceClient) -> Optional[str]:
+        """Called on the scan thread when it finishes: write the run + findings to the
+        shared Delta store (best-effort). Returns None once saved, else why it wasn't."""
         view = scan_engine.scan_view(sid)
         if not view:
             return "scan not found"
-        try:
-            cost = _compute_scan_cost(view, cli)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"persist: cost compute failed: {e}")
-            cost = None
-        return None if DELTA.save_scan(cli, view, cost) else DELTA.last_error
+        return None if DELTA.save_scan(cli, view) else DELTA.last_error
+
+    def _price(sid: str, cli: WorkspaceClient, saved: bool) -> dict[str, Any]:
+        """Called after the save settles: the scan's self-cost, attached to its saved run."""
+        cost = _compute_scan_cost(scan_engine.scan_view(sid), cli)
+        if saved and not DELTA.save_cost(cli, sid, cost):
+            logger.warning(f"scan {sid}: self-cost not saved: {DELTA.last_error}")
+        logger.info(f"scan {sid}: self-cost {cost.get('total_usd')} USD ({'attached' if saved else 'not saved'})")
+        return cost
 
     t = threading.Thread(
         target=scan_engine.run_scan,
         args=(scan_id, client, _run_sql, _explain_bound, _bounded, logger),
-        kwargs={"on_complete": _persist},
+        kwargs={"on_complete": _save, "price": _price},
         daemon=True,
     )
     t.start()
@@ -807,7 +809,8 @@ def scan_cost(scan_id: str, request: Request):
 
 def _compute_scan_cost(view: dict, client: WorkspaceClient) -> dict[str, Any]:
     """Attribute what a scan cost to run (DBSQL wall-time estimate + ai_query
-    published-rate estimate). Shared by the /cost endpoint and the Delta persist."""
+    published-rate estimate). Shared by the /cost endpoint and the scan thread, which
+    attaches it to the saved run."""
     scan_id = view["scan_id"]
     started, ended = view.get("started_at"), view.get("ended_at")
     end_expr = f"TIMESTAMP '{ended}'" if ended else "now()"
@@ -904,8 +907,11 @@ def _compute_scan_cost(view: dict, client: WorkspaceClient) -> dict[str, Any]:
         logger.warning(f"scan cost ai_query failed: {e}")
         out["ai_query"] = {"model": model, "usd": None, "error": str(e)[:200]}
 
-    parts = [out.get("dbsql", {}).get("usd"), out.get("ai_query", {}).get("usd")]
-    out["total_usd"] = round(sum(p for p in parts if isinstance(p, (int, float))), 4)
+    # The same columns a saved run carries, so the page shows a live and a saved cost alike.
+    out["dbsql_usd"] = out.get("dbsql", {}).get("usd")
+    out["ai_usd"] = out.get("ai_query", {}).get("usd")
+    parts = [p for p in (out["dbsql_usd"], out["ai_usd"]) if isinstance(p, (int, float))]
+    out["total_usd"] = round(sum(parts), 4) if parts else None
     return out
 
 

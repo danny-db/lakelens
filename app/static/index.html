@@ -1623,10 +1623,38 @@ function finishScan(d, fromMemory) {
     $("#scanExportBtn").style.display = "";   // a scan exists → offer the PDF export
     $("#scanStatus").innerHTML = `Scan complete · <b>${d.findings.length}</b> in queue (${d.counts.high||0} high, ${d.counts.medium||0} medium). `
       + `Not saved (${escapeHtml(d.save_error || "no results store")}), so it isn't shared or compared with the next scan.`;
+    pollScanCost(d.scan_id);
     return;
   }
   $("#scanStatus").innerHTML = FINALISING;
-  loadLatestScan();
+  const id = SCAN.id;
+  loadLatestScan().then(() => { if (fromMemory) pollScanCost(id); });
+}
+
+// The self-cost is computed after the save (its billing queries take longer), so the saved
+// scan shows first and its cost is filled in when this scan reports it.
+function pollScanCost(scanId) {
+  let tries = 0;
+  const timer = setInterval(async () => {
+    if (SCAN.id !== scanId || ++tries > 100) { clearInterval(timer); return; }
+    try {
+      const d = await (await fetch(`/api/scan/${scanId}`)).json();
+      if (!d.cost && !d.cost_error) return;
+      clearInterval(timer);
+      showScanCost(d);
+    } catch(e) { clearInterval(timer); }
+  }, 3000);
+}
+
+function showScanCost(d) {
+  if (d.cost && d.cost.total_usd != null) {
+    renderScanCost(d.cost, d);
+    $("#selfCostCard").style.display = "block";
+    renderSelfCostBreakdown(d.cost, d.n_explains || (d.findings || []).length);
+  } else {
+    $("#scanCostInline").innerHTML = `<div class="rowcount">This scan's own cost couldn't be priced`
+      + `${d.cost_error ? ": " + escapeHtml(d.cost_error) : ""}.</div>`;
+  }
 }
 
 function renderSummary(d) {
@@ -1793,45 +1821,6 @@ function renderSelfCostBreakdown(cost, nExplains) {
       This entire scan cost about <b>${usd(cost.total_usd)}</b> at list price.
       It only <b>reads</b> system tables and never changes a setting, so there's no runaway risk in re-running it.
     </div>`;
-}
-
-async function loadSelfCost() {
-  if (!SCAN.id) return;
-  const btn = $("#selfCostBtn"), body = $("#selfCostBody");
-  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Attributing…';
-  body.innerHTML = '<div class="loader"><span class="spin"></span> Reading query history + gateway usage for this scan…</div>';
-  try {
-    const d = await (await fetch(`/api/scan/${SCAN.id}/cost`)).json();
-    if (d.detail) throw new Error(d.detail);
-    const db = d.dbsql || {}, ai = d.ai_query || {};
-    const dbUsd = typeof db.usd === "number" ? db.usd : null;
-    const aiUsd = typeof ai.usd === "number" ? ai.usd : null;
-    const scCard = (lbl, val, sub) => `<div class="sc-stat"><div class="lbl">${lbl}</div><div class="val">${val}</div><div class="sub">${sub}</div></div>`;
-    const usd = x => x==null ? "—" : (x < 0.01 ? "$"+x.toFixed(4) : "$"+x.toFixed(2));
-    // DBSQL: show the instant estimate; if the precise M1 figure is in, show that too.
-    const dbSub = db.error ? "warehouse rate unavailable"
-      : `${d.scan_seconds||0}s of compute × ${usd(db.warehouse_usd_per_hour)}/hr`
-        + (d.dbsql_precise ? ` · precise (M1): ${usd(d.dbsql_precise.usd)}` : "");
-    const aiSub = ai.error ? "endpoint rate unavailable"
-      : `${ai.ai_calls||d.n_explains||0} calls · ${(ai.tokens||0).toLocaleString()} tokens ${ai.basis==='measured'?'(measured)':'(est.)'} × published rate`;
-    body.innerHTML = `
-      <div class="selfcost-grid">
-        <div class="sc-stat hero"><div class="lbl">Total scan cost ${d.dbsql_precise ? '' : '(estimate)'}</div><div class="val">${usd(d.total_usd)}</div>
-          <div class="sub">list-price DBU · read-only · changed nothing</div></div>
-        ${scCard("DBSQL compute", usd(dbUsd), dbSub)}
-        ${scCard("AI explanations (ai_query)", usd(aiUsd), aiSub)}
-      </div>
-      <div class="sc-reassure">
-        This entire scan — ${d.scan_seconds||0}s of query time plus
-        ${d.n_explains||0} AI explanations — cost about <b>${usd(d.total_usd)}</b> at list price
-        (DBSQL is a conservative upper bound: warehouse-hours × its list rate). It only <b>reads</b>
-        system tables and never changes a setting, so there's no runaway risk in re-running it.
-        ${d.dbsql_precise ? "" : "<br><span style='color:var(--muted-2)'>The precise per-query (M1) figure appears here once query history catches up (~1–2 min) — click Recalculate.</span>"}
-      </div>`;
-  } catch(e) {
-    body.innerHTML = `<div class="result-status err" style="padding:8px 0;">✕ ${e.message}</div>`;
-  }
-  btn.disabled = false; btn.textContent = "Recalculate";
 }
 
 // ── Tokenomics ─────────────────────────────────────────────────────────────

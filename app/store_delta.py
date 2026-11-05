@@ -77,15 +77,12 @@ class DeltaStore:
             return False
 
     # ── persist a completed scan ──────────────────────────────────────────────
-    def save_scan(self, client, view: dict, cost: Optional[dict]) -> bool:
-        """Write one scan's run row + all its finding rows. `view` = scan_view();
-        `cost` = the self-cost dict (may be None)."""
+    def save_scan(self, client, view: dict) -> bool:
+        """Write one scan's run row + all its finding rows. `view` = scan_view(). The run's
+        self-cost columns stay NULL until save_cost attaches the cost."""
         if not self.ensure_tables(client):
             return False
         try:
-            c = cost or {}
-            dbsql = (c.get("dbsql") or {}).get("usd")
-            aiu = (c.get("ai_query") or {}).get("usd")
             counts = view.get("counts", {})
             # Write the FINDINGS first, then the run row LAST. The run row is the
             # commit marker: latest_two_run_ids() only sees runs whose scan_runs row
@@ -131,16 +128,32 @@ class DeltaStore:
                 {"name": "high", "value": str(counts.get("high", 0))},
                 {"name": "medium", "value": str(counts.get("medium", 0))},
                 {"name": "clean", "value": str(view.get("clean", 0))},
-                {"name": "scan_seconds", "value": str(c.get("scan_seconds") or 0)},
-                {"name": "dbsql_usd", "value": str(dbsql) if dbsql is not None else None},
-                {"name": "ai_usd", "value": str(aiu) if aiu is not None else None},
-                {"name": "total_usd", "value": str(c.get("total_usd") or 0)},
+                {"name": "scan_seconds", "value": str(round(float(view.get("wall_ms") or 0) / 1000.0, 1))},
+                {"name": "dbsql_usd", "value": None},
+                {"name": "ai_usd", "value": None},
+                {"name": "total_usd", "value": None},
             ])
             logger.info(f"DeltaStore: persisted scan {view['scan_id']} ({len(view.get('findings',[]))} findings)")
             return True
         except Exception as e:  # noqa: BLE001
             self.last_error = str(e)[:300]
             logger.error(f"DeltaStore.save_scan failed: {e}")
+            return False
+
+    def save_cost(self, client, scan_id: str, cost: dict) -> bool:
+        """Attach a saved scan's self-cost (dbsql_usd, ai_usd, total_usd) to its run row."""
+        try:
+            self._run_write(f"""
+                UPDATE {self.fq}.scan_runs
+                SET dbsql_usd = :dbsql_usd::double, ai_usd = :ai_usd::double, total_usd = :total_usd::double
+                WHERE scan_id = :scan_id""", client,
+                [{"name": "scan_id", "value": scan_id}] +
+                [{"name": k, "value": None if cost.get(k) is None else str(cost[k])}
+                 for k in ("dbsql_usd", "ai_usd", "total_usd")])
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.last_error = str(e)[:300]
+            logger.warning(f"DeltaStore.save_cost failed: {e}")
             return False
 
     # ── read the latest persisted scan (+ the one before, for comparison) ──────
