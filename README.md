@@ -118,8 +118,7 @@ Tip: pin `host`, `warehouse_id` and `results_catalog` in the `prod` target of `d
 | `warehouse_id` | yes | none | SQL warehouse every query runs on |
 | `results_catalog` | recommended | none | Where scans and triage are saved |
 | `results_schema` | no | `lakelens` | Schema inside that catalog |
-| `ai_endpoint` | no | `databricks-gpt-5-4-mini` | Model for the plain-English explanations |
-| `ai_endpoint_dbu` | no | `7.5,30` | That model's DBU per 1M tokens (in,out), used to price the scan |
+| `ai_endpoint` | no | `databricks-gpt-5-4-mini` | Model for the plain-English explanations. A scan prices its AI cost at the published rate of the model it used, from `app/rate_card.json` |
 | `anomaly_high_x` | no | `3` | An alert is high when it is at least this many times its own usual |
 | `anomaly_medium_x` | no | `2` | An alert is medium when it is at least this many times its own usual |
 

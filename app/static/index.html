@@ -700,7 +700,7 @@
           <h3>💸 What did this scan cost?</h3>
           <p>A cost tool is itself a cost — so here's the honest attribution for the scan you just ran.
              DBSQL compute is warehouse-time at list rate; the AI explanations are priced at the
-             published token rate. All list-price, read-only.</p>
+             published rate of the model the scan used. All list-price, read-only.</p>
         </div>
       </div>
       <div class="selfcost-body" id="selfCostBody"></div>
@@ -1777,12 +1777,17 @@ function renderSelfCostBreakdown(cost, nExplains) {
   const body = $("#selfCostBody"); if (!body) return;
   const usd = x => x==null ? "—" : (x < 0.01 ? "$"+Number(x).toFixed(4) : "$"+Number(x).toFixed(2));
   const scCard = (lbl,val,sub) => `<div class="sc-stat"><div class="lbl">${lbl}</div><div class="val">${val}</div><div class="sub">${sub}</div></div>`;
+  const ai = cost.ai_query || {};   // a just-finished scan's cost names its model; a saved one doesn't
+  const why = ai.unpriced || ai.error;
+  const aiSub = cost.ai_usd == null
+    ? `${nExplains||0} calls · not priced${why ? ": " + escapeHtml(why) : ""}`
+    : `${nExplains||0} calls${ai.model_name ? " on " + escapeHtml(ai.model_name) : ""} · its published rate`;
   body.innerHTML = `
     <div class="selfcost-grid">
       <div class="sc-stat hero"><div class="lbl">Total scan cost</div><div class="val">${usd(cost.total_usd)}</div>
         <div class="sub">list-price DBU · read-only · changed nothing</div></div>
       ${scCard("DBSQL compute", usd(cost.dbsql_usd), "warehouse-time × its list rate (upper bound)")}
-      ${scCard("AI explanations (ai_query)", usd(cost.ai_usd), `${nExplains||0} calls · published rate`)}
+      ${scCard("AI explanations (ai_query)", usd(cost.ai_usd), aiSub)}
     </div>
     <div class="sc-reassure">
       This entire scan cost about <b>${usd(cost.total_usd)}</b> at list price.

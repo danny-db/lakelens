@@ -355,6 +355,7 @@ def scan_view(scan_id: str) -> Optional[dict]:
         "started_at": rec.get("started_at"),
         "ended_at": rec.get("ended_at"),
         "n_explains": rec.get("n_explains", 0),
+        "model": rec.get("model"),            # the explainer model, which prices the AI self-cost
         "wall_ms": rec.get("wall_ms", 0.0),
         "saved": rec.get("saved"),            # None until the save settles after "complete"
         "save_error": rec.get("save_error"),
