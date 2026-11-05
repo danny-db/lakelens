@@ -5,6 +5,7 @@
   end is a cut-short week that looks like a drop. A board's "N days" window stops before today.
 - A unit cost never divides by a bare count: on a quiet account the count can be 0, and the warehouse's ANSI
   mode then fails the whole query instead of showing a dash.
+- The generated catalogue is current and shows lists as bullets, not as Python lists.
 """
 import os
 import re
@@ -59,6 +60,15 @@ class ZeroDenominators(unittest.TestCase):
                         continue
                     self.assertTrue(den.strip().startswith("nullif(") or "CASE WHEN" in expr,
                                     f"{k.metric}: / {den.strip()}")
+
+
+class Catalogue(unittest.TestCase):
+    def test_generated_catalogue_is_current_and_has_no_raw_lists(self):
+        import gen_catalogue
+        with open(gen_catalogue.OUT) as f:
+            current = f.read()
+        self.assertEqual(current, gen_catalogue.build(), "run tools/gen_catalogue.py")
+        self.assertNotRegex(current, r"\['", "a list rendered as Python")
 
 
 if __name__ == "__main__":

@@ -85,10 +85,11 @@ def build() -> str:
     for step in tune.MATURITY:
         out += [f"### Step {step['step']}: {clean(step['name'])}", "", clean(step["blurb"]), ""]
         for p in [p for p in tune.PRACTICES if p["step"] == step["step"]]:
+            how = p["detail"] if isinstance(p["detail"], (list, tuple)) else [p["detail"]]
             out += [f"#### {clean(p['title'])}", "",
                     f"- **Why it matters:** {clean(p['eli5'])}",
                     f"- **Typical impact:** {clean(p['metric'])}",
-                    f"- **How:** {clean(p['detail'])}", ""]
+                    "- **How:**", *[f"  - {clean(step)}" for step in how], ""]
     out += ["## Measures", "",
             "| ID | Measure | Use when |", "|---|---|---|"]
     for m in hunts.MEASURES:

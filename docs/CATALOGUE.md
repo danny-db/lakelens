@@ -237,7 +237,7 @@ Where the money goes and which way it is trending - by product, by job, by pipel
 #### H11 Jobs - weekly movers
 
 - **What it finds:** Shows week-over-week usage per job, so you can tell a genuinely new workload apart from a cost that crept up with no story.
-- **How to read it:** Rank the current week, then compare each mover's trajectory. A brand-new job appearing is expected growth - forecast it. An existing job trending up with no new work behind it is the optimisation target. A doubling bill is only a problem if it isn't new work.
+- **How to read it:** Rank the latest complete week, then compare each mover's trajectory. A brand-new job appearing is expected growth - forecast it. An existing job trending up with no new work behind it is the optimisation target. A doubling bill is only a problem if it isn't new work.
 - **What to do:** Tag jobs consistently (team / domain / environment) so cost has an owner; turn the daily thresholds you already watch into budget alerts; and review the top movers monthly, applying read-amplification and spill analysis inside them.
 - **Alerts:** Informational (no alert)
 - **Prove the fix with:** M2 Exact $ per job and per pipeline
@@ -291,13 +291,20 @@ Know whose cost is whose. Tag every resource and give finance a billing-admin vi
 
 - **Why it matters:** Tags are labels on your compute - team, project, environment. They are the foundation of everything else: without them, spend is one big anonymous number you can't split, attribute, or budget by.
 - **Typical impact:** the foundation
-- **How:** ['Three tiers of tag: general (team/owner), contextual (project), operational (environment).', 'Classic compute is tagged in the cluster/job/warehouse definition; serverless is tagged through Budget Policies (which auto-apply on creation).', 'A Budget Policy is different from a Budget - the policy applies tags; the budget alerts on spend.', 'Enforce tags through compute policy so nothing untagged can be created, and run a compliance job to catch gaps.']
+- **How:**
+  - Three tiers of tag: general (team/owner), contextual (project), operational (environment).
+  - Classic compute is tagged in the cluster/job/warehouse definition; serverless is tagged through Budget Policies (which auto-apply on creation).
+  - A Budget Policy is different from a Budget - the policy applies tags; the budget alerts on spend.
+  - Enforce tags through compute policy so nothing untagged can be created, and run a compliance job to catch gaps.
 
 #### Give finance the billing-admin role
 
 - **Why it matters:** The billing-admin role gives finance a focused view of spend (the billing system tables and price list) without making them full platform admins. It separates ‘who watches the money’ from ‘who runs the platform’.
 - **Typical impact:** separation of duties
-- **How:** ['Billing admins can read system.billing.usage and system.billing.list_prices.', "It's a narrower role than account admin - right for a finance/FinOps function.", 'Workspace admins need the billing-admin role added to manage all cost policies.']
+- **How:**
+  - Billing admins can read system.billing.usage and system.billing.list_prices.
+  - It's a narrower role than account admin - right for a finance/FinOps function.
+  - Workspace admins need the billing-admin role added to manage all cost policies.
 
 ### Step 2: Report
 
@@ -307,13 +314,20 @@ See the spend. Use system tables and the built-in dashboards to watch usage, ran
 
 - **Why it matters:** Databricks ships ready-made dashboards for account usage, jobs, DBSQL, and model serving. They give you a top-N ranking, efficiency signals, and AI forecasts out of the box - no building required.
 - **Typical impact:** zero to build
-- **How:** ['Account Usage dashboard: usage overview, top-N spenders, tag analysis, AI forecast.', 'Jobs Monitoring dashboard: top jobs by potential saving, CPU/memory efficiency, outdated runtimes.', 'DBSQL Monitoring dashboard: cost by user and by source (notebook / job / SQL / Genie), query drill-down.', 'Model Serving dashboard: batch, pay-per-token, and provisioned-throughput cost attribution.']
+- **How:**
+  - Account Usage dashboard: usage overview, top-N spenders, tag analysis, AI forecast.
+  - Jobs Monitoring dashboard: top jobs by potential saving, CPU/memory efficiency, outdated runtimes.
+  - DBSQL Monitoring dashboard: cost by user and by source (notebook / job / SQL / Genie), query drill-down.
+  - Model Serving dashboard: batch, pay-per-token, and provisioned-throughput cost attribution.
 
 #### Budget alerts
 
 - **Why it matters:** A budget watches spend - account-wide or scoped by workspace or tag - and emails you when it crosses a threshold. It is an alert, not a hard block (except Genie, which can block).
 - **Typical impact:** up to 4 thresholds
-- **How:** ['Set account-wide or scoped by workspace/tag, with up to four alert thresholds each.', 'Budgets are based on list price, so read them relative to your contract.', 'Genie budgets add per-user thresholds and an optional block switch - the one place spend can actually be stopped, not just alerted.']
+- **How:**
+  - Set account-wide or scoped by workspace/tag, with up to four alert thresholds each.
+  - Budgets are based on list price, so read them relative to your contract.
+  - Genie budgets add per-user thresholds and an optional block switch - the one place spend can actually be stopped, not just alerted.
 
 ### Step 3: Control
 
@@ -323,25 +337,41 @@ Set the guardrails. Compute policies cap runaway sizing, statement timeouts stop
 
 - **Why it matters:** Left alone, a query can run for TWO DAYS before Databricks stops it. A runaway or hung statement can burn compute that whole time. Set a sane workspace timeout (say 2-4 hours) so it stops itself.
 - **Typical impact:** default is 2 DAYS
-- **How:** ['The platform default STATEMENT_TIMEOUT is 2 days - almost never what you want for ad-hoc.', 'Set it workspace-wide; long ETL can raise its own limit per session.', 'It caps EXECUTION time (time actually running), not queue or fetch time.', 'Changing the workspace value restarts running warehouses - schedule the change.', 'Baseline the offenders and confirm zero afterwards with the ‘Timeout scoreboard’ measure.']
+- **How:**
+  - The platform default STATEMENT_TIMEOUT is 2 days - almost never what you want for ad-hoc.
+  - Set it workspace-wide; long ETL can raise its own limit per session.
+  - It caps EXECUTION time (time actually running), not queue or fetch time.
+  - Changing the workspace value restarts running warehouses - schedule the change.
+  - Baseline the offenders and confirm zero afterwards with the ‘Timeout scoreboard’ measure.
 
 #### Compute policies to stop sprawl
 
 - **Why it matters:** A compute policy sets the rules for what users can create - a maximum DBU-per-hour, how many clusters, which machine types, and which runtime. It stops one person from spinning up something enormous by accident.
 - **Typical impact:** cap DBU/hr & clusters
-- **How:** ['Cap DBU/hr and max clusters per user to prevent runaway sizing.', 'Allowlist instance types (or use regex) to keep people on sensible machine families.', 'Enforce the latest long-term-support runtime for automatic security and performance updates.', "Enforce tagging through the policy so cost attribution can't be skipped."]
+- **How:**
+  - Cap DBU/hr and max clusters per user to prevent runaway sizing.
+  - Allowlist instance types (or use regex) to keep people on sensible machine families.
+  - Enforce the latest long-term-support runtime for automatic security and performance updates.
+  - Enforce tagging through the policy so cost attribution can't be skipped.
 
 #### Spot VMs for retryable batch
 
 - **Why it matters:** Spot (preemptible) VMs are much cheaper cloud machines that can be reclaimed at short notice. Perfect for batch jobs that can retry - but NOT for continuous pipelines, where a reclaim restarts work and can cost more than it saves.
 - **Typical impact:** big infra discount
-- **How:** ['Use PREEMPTIBLE_WITH_FALLBACK so the job falls back to on-demand if spot is unavailable.', 'On GCP there is no ‘first N on-demand’ control that some other clouds have - plan for the driver.', 'Great for retryable batch jobs; avoid for continuous change-data pipelines.']
+- **How:**
+  - Use PREEMPTIBLE_WITH_FALLBACK so the job falls back to on-demand if spot is unavailable.
+  - On GCP there is no ‘first N on-demand’ control that some other clouds have - plan for the driver.
+  - Great for retryable batch jobs; avoid for continuous change-data pipelines.
 
 #### Guardrails for AI spend
 
 - **Why it matters:** There is no self-serve, real-time dollar hard-cap for ai_query today. So the controls are: don't hand expensive models to everyone (permissions are the kill-switch), alert on the hourly token rate, and default pipelines to a cheap model.
 - **Typical impact:** no real-time $ cap exists
-- **How:** ["Governance gate: don't grant EXECUTE on Sonnet/Opus-class models to every pipeline by default - grant per team, on request, with a named owner.", 'Default classification/extraction pipelines to a cheap model (e.g. Haiku); require justification for expensive models at batch scale.', 'A rate limit of 0 will NOT cap a runaway batch job - use the token-rate alert (the ‘Runaway AI spend’ hunt) as the fast substitute.', 'For sustained workloads, Provisioned Throughput converts pay-per-token into a fixed, bounded cost.']
+- **How:**
+  - Governance gate: don't grant EXECUTE on Sonnet/Opus-class models to every pipeline by default - grant per team, on request, with a named owner.
+  - Default classification/extraction pipelines to a cheap model (e.g. Haiku); require justification for expensive models at batch scale.
+  - A rate limit of 0 will NOT cap a runaway batch job - use the token-rate alert (the ‘Runaway AI spend’ hunt) as the fast substitute.
+  - For sustained workloads, Provisioned Throughput converts pay-per-token into a fixed, bounded cost.
 
 ### Step 4: Optimise
 
@@ -351,25 +381,40 @@ Tune the platform. Pick the right compute for each workload, and use features li
 
 - **Why it matters:** All-Purpose clusters are for interactive notebook work. Running a scheduled job on one costs 2-3× more than running it on Job compute, which spins up for the job and shuts down after.
 - **Typical impact:** 2-3× cheaper
-- **How:** ['All-Purpose is billed at a higher DBU rate than Jobs compute for the same machine.', 'A job pinned to an always-on All-Purpose cluster also pays for all the idle time between runs.', 'Move scheduled work to Jobs Compute (ephemeral) or Serverless Jobs.', 'Spot the offenders with the ‘Idle Compute’ hunts, then confirm the DBU moves to the jobs product after you switch.']
+- **How:**
+  - All-Purpose is billed at a higher DBU rate than Jobs compute for the same machine.
+  - A job pinned to an always-on All-Purpose cluster also pays for all the idle time between runs.
+  - Move scheduled work to Jobs Compute (ephemeral) or Serverless Jobs.
+  - Spot the offenders with the ‘Idle Compute’ hunts, then confirm the DBU moves to the jobs product after you switch.
 
 #### Serverless for spiky and ad-hoc work
 
 - **Why it matters:** Serverless starts in under ten seconds and charges only while it is working - there is no idle cost. For bursty, unpredictable, or small workloads it is typically 25%+ cheaper than keeping a classic warehouse warm.
 - **Typical impact:** 25%+ savings
-- **How:** ["Sub-10-second startup means you don't keep compute running ‘just in case’.", 'Zero idle cost - it stops the moment work finishes.', 'Best fit: ad-hoc SQL, bursty BI, small or unpredictable jobs.', 'Steady, predictable, high-utilisation load can still be cheaper on right-sized classic with committed-use discounts - decide by load shape (see the ‘Queue Pressure’ hunt).']
+- **How:**
+  - Sub-10-second startup means you don't keep compute running ‘just in case’.
+  - Zero idle cost - it stops the moment work finishes.
+  - Best fit: ad-hoc SQL, bursty BI, small or unpredictable jobs.
+  - Steady, predictable, high-utilisation load can still be cheaper on right-sized classic with committed-use discounts - decide by load shape (see the ‘Queue Pressure’ hunt).
 
 #### Photon: know the break-even
 
 - **Why it matters:** Photon is a faster engine, but it bills more DBUs per hour - about 2.9× on job clusters and ~2× on All-Purpose. It only saves money if it cuts the runtime by MORE than that multiplier. Great for heavy SQL scans; wasteful on light work.
 - **Typical impact:** 2.9× DBU on jobs
-- **How:** ['Photon speeds up scans, joins, and aggregations - CPU-heavy SQL work.', 'It does NOT speed up UDFs, streaming state, or lightweight jobs - those pay the premium with no runtime win.', 'Rule of thumb: enable it where it cuts runtime by more than the DBU multiplier; measure before/after with the ‘Prove’ page.', 'On classic Jobs there is no Photon price premium (it bills the same) - there, Photon is a pure speed win.']
+- **How:**
+  - Photon speeds up scans, joins, and aggregations - CPU-heavy SQL work.
+  - It does NOT speed up UDFs, streaming state, or lightweight jobs - those pay the premium with no runtime win.
+  - Rule of thumb: enable it where it cuts runtime by more than the DBU multiplier; measure before/after with the ‘Prove’ page.
+  - On classic Jobs there is no Photon price premium (it bills the same) - there, Photon is a pure speed win.
 
 #### Liquid Clustering, Predictive Optimization & Zstd
 
 - **Why it matters:** Three low-effort storage wins: Liquid Clustering keeps data laid out so queries skip what they don't need; Predictive Optimization runs the housekeeping for you; and Zstd compression can cut storage up to 40% with no maintenance.
 - **Typical impact:** up to 40% storage
-- **How:** ['Liquid Clustering: turn on for all new Delta tables - ~2.5× faster than the old Z-order approach, up to a 150 TB table size (as of Aug 2026).', 'Predictive Optimization: hands-off compaction and clustering - but only on Unity Catalog MANAGED tables, and worth DISABLING on non-prod schemas that never get scanned.', 'Zstd compression: up to 40% storage savings on UC managed tables, zero maintenance.']
+- **How:**
+  - Liquid Clustering: turn on for all new Delta tables - ~2.5× faster than the old Z-order approach, up to a 150 TB table size (as of Aug 2026).
+  - Predictive Optimization: hands-off compaction and clustering - but only on Unity Catalog MANAGED tables, and worth DISABLING on non-prod schemas that never get scanned.
+  - Zstd compression: up to 40% storage savings on UC managed tables, zero maintenance.
 
 ## Measures
 
