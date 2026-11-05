@@ -689,6 +689,7 @@ SELECT coalesce(wh.warehouse_name, c.warehouse_id, 'no warehouse') AS warehouse,
        {_vs_account("c.queued_hours")}
 FROM contrib c LEFT JOIN wh ON c.warehouse_id = wh.warehouse_id CROSS JOIN acct
 ORDER BY c.queued_hours DESC
+LIMIT 50
 """,
     },
 
