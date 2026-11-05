@@ -24,10 +24,26 @@ de-parameterised (the dashboards are parameter-bound; the app is not).
 """
 from typing import Optional
 
+from scan import ANOMALY_HIGH_X, ANOMALY_MEDIUM_X
+
 # ── Anomaly detectors ─────────────────────────────────────────────────────────
 # Each is pure Python over the panel's returned rows. They return a list of
 # callout dicts: {severity, headline, detail}. No detector invents a number the
 # query didn't produce — it only compares values already in the result.
+# Every detector reduces a row to "how many times its normal" and grades that
+# multiple with the same cut-offs as the Alerts engine, so no detector carries
+# a dollar, count or percentage of its own and an account of any size reads
+# the same way.
+
+def _severity(x: Optional[float]) -> Optional[str]:
+    if x is None:
+        return None
+    if x >= ANOMALY_HIGH_X:
+        return "high"
+    if x >= ANOMALY_MEDIUM_X:
+        return "medium"
+    return None
+
 
 def _f(x) -> Optional[float]:
     try:
@@ -57,8 +73,8 @@ def _detect(spec: dict, cols: list, rows: list) -> list:
             return _rank_outlier(spec, ci, rows)
         if kind == "new_entity":
             return _new_entity(spec, ci, rows)
-        if kind == "threshold":
-            return _threshold(spec, ci, rows)
+        if kind == "vs_typical":
+            return _vs_typical(spec, ci, rows)
         if kind == "decomp_driver":
             return _decomp_driver(spec, ci, rows)
     except Exception:  # a detector must never break a panel
@@ -68,29 +84,33 @@ def _detect(spec: dict, cols: list, rows: list) -> list:
 
 def _decomp_driver(spec, ci, rows):
     """Read the ΔCost decomposition (one row) and lead with the DOMINANT driver of the
-    week-over-week change — so the callout says WHY, not just how much."""
+    week-over-week change — so the callout says WHY, not just how much. It speaks only
+    when the change is unusual for this account: its size against typical_change_usd,
+    the median absolute weekly change before it."""
     r = rows[0]
     def g(c): return _f(r[ci[c]]) if c in ci else None
-    delta = g("delta_usd")
-    if delta is None:
+    delta, typical = g("delta_usd"), g("typical_change_usd")
+    if delta is None or not typical:
         return []
     comps = [("new workloads", g("new_workloads_usd")),
              ("retired workloads", g("retired_workloads_usd")),
              ("volume growth (existing workloads doing more)", g("volume_growth_usd")),
              ("rate / mix (pricier compute or SKU mix)", g("rate_mix_usd"))]
     comps = [(n, v) for n, v in comps if v is not None]
-    if not comps or abs(delta) < 1000:   # a trivial weekly change isn't worth a callout
+    x = abs(delta) / typical
+    sev = _severity(x)
+    if not comps or not sev:
         return []
     # dominant driver = the component with the largest ABSOLUTE contribution
     name, val = max(comps, key=lambda c: abs(c[1]))
     up = delta >= 0
-    sev = "high" if abs(delta) >= 250000 else "medium"
     share = (abs(val) / abs(delta) * 100) if delta else 0
     breakdown = ", ".join(f"{n.split(' (')[0]} {_fmt(v, 'usd')}" for n, v in comps)
     return [{
         "severity": sev,
-        "headline": f"Cost {'rose' if up else 'fell'} {_fmt(abs(delta), 'usd')} week-over-week — "
-                    f"mostly {name} ({_fmt(val, 'usd')}, {share:.0f}% of the change)",
+        "headline": f"Cost {'rose' if up else 'fell'} {_fmt(abs(delta), 'usd')} week over week, "
+                    f"{x:.1f}× a typical weekly change of {_fmt(typical, 'usd')}. Mostly {name} "
+                    f"({_fmt(val, 'usd')}, {share:.0f}% of the change)",
         "detail": f"Breakdown: {breakdown}. These four sum to the total change exactly. "
                   f"{'A rise driven by NEW workloads is expected growth — attribute and budget it, not cut. ' if up and 'new' in name else ''}"
                   f"{'A rise from RATE/MIX means the same work got pricier — check compute type / SKU. ' if up and 'rate' in name else ''}"
@@ -99,69 +119,57 @@ def _decomp_driver(spec, ci, rows):
 
 
 def _ts_spike(spec, ci, rows):
-    """Latest period vs the mean+std of prior periods, per group. Flags a group
-    whose most recent value spikes above its own history.
-
-    ACCURACY over noise (Danny's #1 rule): a big % on a tiny base is not a cost
-    problem. So a spike must clear BOTH a statistical bar (z >= k) AND a material
-    dollar bar:
-      - min_abs      : the group's latest value must be at least this ($ floor to
-                       even consider it) — keeps sub-$k products out entirely.
-      - min_delta    : the increase (last - mean) must be at least this to fire.
-      - min_delta_high: 'high' severity requires the $ delta to also clear this;
-                       otherwise it's at most 'medium' no matter how large the %.
-    Callouts are ranked by ABSOLUTE $ DELTA (biggest mover first), not z-score, so
-    the finding a FinOps admin should chase leads."""
-    tcol, vcol = spec["time_col"], spec["value_col"]
-    gcol = spec.get("group_col")
-    k = spec.get("k", 2.5)
-    min_abs = spec.get("min_abs", 0)
-    # Default the $ materiality bars off min_abs when a panel doesn't set them,
-    # so every ts_spike panel is protected even without extra config.
-    min_delta = spec.get("min_delta", max(min_abs * 0.5, 1000))
-    min_delta_high = spec.get("min_delta_high", max(min_abs * 3, 20000))
-    unit = spec.get("unit", "usd")
-    if tcol not in ci or vcol not in ci:
+    """The latest period against each series' own normal: the median of its prior
+    periods. The row shape says what a series is:
+      - (period, group, value) with `group_col`: the groups are slices of one bill,
+        so a slice's normal is floored at the typical slice-period (the median over
+        every group's prior periods). A big multiple on a tiny line item is not a
+        cost problem (accuracy over noise), and the floor scales with the account.
+      - (period, value) with `value_col`, or (period, a, b, ...) with `value_cols`:
+        each column is its own account-level series, judged only against itself.
+    Callouts are ranked by absolute movement, so the biggest mover leads."""
+    tcol, gcol, unit = spec["time_col"], spec.get("group_col"), spec.get("unit", "usd")
+    vcols = spec.get("value_cols") or [spec["value_col"]]
+    if tcol not in ci or (gcol and gcol not in ci) or any(c not in ci for c in vcols):
         return []
     series = {}
     for r in rows:
-        g = r[ci[gcol]] if gcol and gcol in ci else "total"
-        t = r[ci[tcol]]
-        v = _f(r[ci[vcol]])
-        if v is None:
-            continue
-        series.setdefault(g, []).append((str(t), v))
+        for vc in vcols:
+            v = _f(r[ci[vc]])
+            if v is not None:
+                key = r[ci[gcol]] if gcol else (vc if len(vcols) > 1 else None)
+                series.setdefault(key, []).append((str(r[ci[tcol]]), v))
+    periods = sorted({t for pts in series.values() for t, _ in pts})
+    if len(periods) < 2:
+        return []
+    latest = periods[-1]
+    peer = _median([v for pts in series.values() for t, v in pts if t != latest]) if gcol else None
     outs = []
     for g, pts in series.items():
         pts.sort(key=lambda p: p[0])
-        if len(pts) < 4:
+        hist = [v for t, v in pts if t != latest]
+        # Three prior periods at least, so one partial first period can't be the median.
+        if pts[-1][0] != latest or len(hist) < 3:
             continue
-        hist = [v for _, v in pts[:-1]]
-        last_t, last_v = pts[-1]
-        mean = sum(hist) / len(hist)
-        var = sum((v - mean) ** 2 for v in hist) / len(hist)
-        std = var ** 0.5
-        delta = last_v - mean
-        # Gate on BOTH statistical and dollar materiality.
-        if last_v < min_abs or std == 0 or delta < min_delta:
+        own = _median(hist)
+        normal = max(own, peer) if peer is not None else own
+        last_v = pts[-1][1]
+        x = last_v / normal if normal > 0 else None
+        sev = _severity(x)
+        if not sev:
             continue
-        z = delta / std
-        if z < k or last_v <= mean:
-            continue
-        pct = (last_v / mean - 1) * 100 if mean else 0
-        gl = "" if g == "total" else f"“{g}” "
-        # 'high' needs a material dollar delta too — a huge % on a small base is 'medium'.
-        sev = "high" if (z >= k + 1.5 and delta >= min_delta_high) else "medium"
+        gl = "" if g is None else f"“{g}” "
+        basis = (f"floored at the typical {gcol}'s {tcol} ({_fmt(peer, unit)}) because its own "
+                 f"median is only {_fmt(own, unit)}" if normal != own else
+                 f"the median of its {len(hist)} prior {tcol}s")
         outs.append({
             "severity": sev,
-            "_delta": delta,   # sort key (dropped before returning)
-            "headline": f"{gl}spiked to {_fmt(last_v, unit)} — up {_fmt(delta, unit)} "
-                        f"({pct:.0f}%) on its recent average",
-            "detail": f"Latest period {last_t}: {_fmt(last_v, unit)} vs a prior mean of "
-                      f"{_fmt(mean, unit)} — a {_fmt(delta, unit)} increase (z={z:.1f}). "
-                      f"Worth checking what changed.",
+            "_delta": last_v - normal,   # sort key (dropped before returning)
+            "headline": f"{gl}spiked to {_fmt(last_v, unit)}, {x:.1f}× its normal "
+                        f"(up {_fmt(last_v - normal, unit)})",
+            "detail": f"Latest period {latest}: {_fmt(last_v, unit)} against a normal of "
+                      f"{_fmt(normal, unit)}, {basis}. Worth checking what changed.",
         })
-    # Rank by absolute $ movement — biggest dollar impact leads, not biggest %.
     outs.sort(key=lambda o: -o["_delta"])
     for o in outs:
         o.pop("_delta", None)
@@ -169,30 +177,30 @@ def _ts_spike(spec, ci, rows):
 
 
 def _rank_outlier(spec, ci, rows):
-    """Top-ranked row vs the median of the rest — flags a dominant outlier."""
+    """The largest row against the next-largest. Cost spreads are long-tailed, so the
+    top item always dwarfs the median of the rest; one item several times the
+    runner-up is the single dominant outlier worth a callout."""
     vcol, lcol = spec["value_col"], spec.get("label_col")
-    k = spec.get("k", 4.0)
     unit = spec.get("unit", "usd")
     if vcol not in ci:
         return []
     vals = [(_f(r[ci[vcol]]), (r[ci[lcol]] if lcol and lcol in ci else "top item")) for r in rows]
-    vals = [(v, l) for v, l in vals if v is not None]
-    if len(vals) < 3:
+    vals = sorted(((v, l) for v, l in vals if v is not None), key=lambda p: -p[0])
+    if len(vals) < 2 or vals[1][0] <= 0:
         return []
-    top_v, top_l = vals[0]
-    rest = [v for v, _ in vals[1:]]
-    med = _median(rest)
-    if not med or med <= 0:
+    (top_v, top_l), (next_v, next_l) = vals[0], vals[1]
+    x = top_v / next_v
+    sev = _severity(x)
+    if not sev:
         return []
-    ratio = top_v / med
-    if ratio >= k:
-        return [{
-            "severity": "high" if ratio >= k * 2 else "medium",
-            "headline": f"“{top_l}” is {ratio:.0f}× the median — a dominant cost outlier",
-            "detail": f"Top item {_fmt(top_v, unit)} vs a median of {_fmt(med, unit)} across the rest. "
-                      f"Concentrated cost is the highest-leverage place to look first.",
-        }]
-    return []
+    share = top_v / sum(v for v, _ in vals) * 100
+    return [{
+        "severity": sev,
+        "headline": f"“{top_l}” is {x:.1f}× the next-largest, a dominant cost outlier",
+        "detail": f"Top item {_fmt(top_v, unit)} against {_fmt(next_v, unit)} for “{next_l}”, "
+                  f"{share:.0f}% of the rows shown. Concentrated cost is the highest-leverage "
+                  f"place to look first.",
+    }]
 
 
 def _new_entity(spec, ci, rows):
@@ -231,28 +239,26 @@ def _new_entity(spec, ci, rows):
     }]
 
 
-def _threshold(spec, ci, rows):
-    """Count rows whose metric crosses a bar (e.g. clusters under 10% CPU)."""
-    vcol = spec["value_col"]
-    op = spec.get("op", "lt")
-    bar = spec["bar"]
-    unit = spec.get("unit", "count")
-    label = spec.get("label", "items")
-    if vcol not in ci:
+def _vs_typical(spec, ci, rows):
+    """Rows the SQL scored against the account's typical item: `x_col` is how many
+    times worse than typical each row is, and `typical_col` the typical value. The
+    headline and detail templates come from the panel, which knows what worse means."""
+    xcol, tcol, lcol, vcol = spec["x_col"], spec["typical_col"], spec["label_col"], spec["value_col"]
+    unit = spec.get("unit", "pct")
+    if any(c not in ci for c in (xcol, tcol, lcol, vcol)):
         return []
-    n = 0
-    for r in rows:
-        v = _f(r[ci[vcol]])
-        if v is None:
-            continue
-        if (op == "lt" and v < bar) or (op == "gt" and v > bar):
-            n += 1
-    if n == 0:
+    scored = [(_f(r[ci[xcol]]), r) for r in rows]
+    flagged = sorted(((x, r) for x, r in scored if _severity(x)), key=lambda p: -p[0])
+    if not flagged:
         return []
+    x, worst = flagged[0]
+    fill = {"n": len(flagged), "frac": f"1/{ANOMALY_MEDIUM_X:g}", "x": f"{x:.1f}×",
+            "typical": _fmt(_f(worst[ci[tcol]]), unit), "worst": worst[ci[lcol]],
+            "value": _fmt(_f(worst[ci[vcol]]), unit)}
     return [{
-        "severity": "medium",
-        "headline": f"{n} {label} crossed the {'below' if op == 'lt' else 'above'}-{_fmt(bar, unit)} line",
-        "detail": "These are the rows worth acting on first.",
+        "severity": _severity(x),
+        "headline": spec["headline"].format(**fill),
+        "detail": spec["detail"].format(**fill),
     }]
 
 
@@ -260,7 +266,8 @@ def _fmt(v, unit):
     if v is None:
         return "—"
     if unit == "usd":
-        return f"${v:,.0f}" if abs(v) >= 1 else f"${v:,.2f}"
+        # unit costs (per query) live in fractions of a cent; two decimals would hide them
+        return f"${v:,.0f}" if abs(v) >= 1 else f"${v:,.2f}" if abs(v) >= 0.1 else f"${v:,.4f}"
     if unit == "pct":
         return f"{v:,.1f}%"
     if unit == "tokens":
@@ -340,6 +347,20 @@ classed AS (
     CASE WHEN prev_cost>0 AND cur_cost>0 AND coalesce(prev_dbus,0)>0 AND coalesce(cur_dbus,0)>0 THEN cur_dbus*((cur_cost/cur_dbus)-(prev_cost/prev_dbus))
          ELSE 0 END AS rate_mix_effect
   FROM per_workload
+),
+weekly AS (   -- the nine complete weeks before last week, for the account's usual weekly move
+  SELECT date_trunc('WEEK', u.usage_date) AS week, sum(u.usage_quantity * pr.unit_usd) AS usd
+  FROM system.billing.usage u
+  LEFT JOIN price pr ON u.sku_name=pr.sku_name AND u.cloud=pr.cloud
+    AND u.usage_start_time>=pr.price_start_time AND (pr.price_end_time IS NULL OR u.usage_start_time<pr.price_end_time)
+  WHERE u.usage_date >= date_trunc('WEEK', current_date()) - INTERVAL 10 WEEKS
+    AND u.usage_date <  date_trunc('WEEK', current_date()) - INTERVAL 1 WEEKS
+  GROUP BY 1
+),
+typical AS (  -- median absolute week-over-week change across those eight week-pairs
+  SELECT percentile(change_usd, 0.5) AS typical_change_usd
+  FROM (SELECT abs(usd - lag(usd) OVER (ORDER BY week)) AS change_usd FROM weekly)
+  WHERE change_usd IS NOT NULL
 )
 SELECT round(sum(prev_cost),2)                                              AS prev_week_usd,
        round(sum(cur_cost),2)                                               AS this_week_usd,
@@ -349,8 +370,9 @@ SELECT round(sum(prev_cost),2)                                              AS p
        round(sum(volume_effect),2)                                          AS volume_growth_usd,
        round(sum(rate_mix_effect),2)                                        AS rate_mix_usd,
        count(CASE WHEN status='NEW' THEN 1 END)                             AS new_count,
-       count(CASE WHEN status='RETIRED' THEN 1 END)                         AS retired_count
-FROM classed
+       count(CASE WHEN status='RETIRED' THEN 1 END)                         AS retired_count,
+       round(max(t.typical_change_usd),2)                                   AS typical_change_usd
+FROM classed CROSS JOIN typical t
 """,
             },
             {
@@ -359,10 +381,8 @@ FROM classed
                 "eli5": "Total list-price $ per week across the account. A step-change up is the "
                         "first thing to explain.",
                 "chart": "line",
-                # Total weekly spend is large; only flag a materially large weekly jump.
                 "anomaly": {"type": "ts_spike", "time_col": "week", "value_col": "list_usd",
-                            "k": 2.0, "min_abs": 10000, "min_delta": 50000,
-                            "min_delta_high": 250000, "unit": "usd"},
+                            "unit": "usd"},
                 "sql": """
 WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
@@ -385,12 +405,8 @@ GROUP BY 1 ORDER BY 1
                 "title": "Spend by product (weekly)",
                 "eli5": "Weekly $ per billing product. Watch for a SKU accelerating week over week.",
                 "chart": "stacked_bar",
-                # Materiality floors so a big % on a tiny product never fires (accuracy > noise):
-                # a product must bill >= $10k in the latest week, move up >= $5k to flag, and
-                # >= $50k to be 'high'. Ranked by $ delta so the biggest mover leads.
                 "anomaly": {"type": "ts_spike", "time_col": "week", "value_col": "list_usd",
-                            "group_col": "product", "k": 2.0, "min_abs": 10000,
-                            "min_delta": 5000, "min_delta_high": 50000, "unit": "usd"},
+                            "group_col": "product", "unit": "usd"},
                 "sql": """
 WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
@@ -417,7 +433,7 @@ ORDER BY 1, list_usd DESC
                         "attribution effort pays off first.",
                 "chart": "bar",
                 "anomaly": {"type": "rank_outlier", "value_col": "list_usd",
-                            "label_col": "workspace", "k": 4.0, "unit": "usd"},
+                            "label_col": "workspace", "unit": "usd"},
                 "sql": """
 WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
@@ -499,14 +515,19 @@ ORDER BY week
             {
                 "id": "potential_savings",
                 "title": "Top 25 jobs by potential monthly saving",
-                "eli5": "Jobs running on All-Purpose compute ($0.55/DBU) that would cost far less on "
-                        "Jobs compute ($0.15/DBU). The saving is the rate difference on their own DBUs.",
+                "eli5": "Jobs running on All-Purpose compute that would cost less on Jobs compute. The "
+                        "saving is each job's share of the all-purpose cluster time it used, priced at "
+                        "your list price for that SKU minus the matching Jobs-compute SKU.",
                 "chart": "table",
+                "note": "Billing never tags all-purpose usage with a job, so a job's share of each "
+                        "all-purpose cluster-hour is the time its tasks ran in that hour, split fairly "
+                        "when jobs overlap. Idle time between runs is not counted, so the saving is a "
+                        "floor.",
                 "anomaly": {"type": "rank_outlier", "value_col": "est_monthly_saving_usd",
-                            "label_col": "job_name", "k": 4.0, "unit": "usd"},
+                            "label_col": "job_name", "unit": "usd"},
                 "sql": """
 WITH price AS (
-  SELECT sku_name, cloud, price_start_time, price_end_time,
+  SELECT sku_name, cloud, usage_unit, price_start_time, price_end_time,
          pricing.effective_list.default AS unit_usd FROM system.billing.list_prices
 ),
 job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
@@ -517,36 +538,54 @@ ap_clusters AS (   -- all-purpose clusters (interactive), latest config
     QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC)=1
   ) WHERE cluster_source IN ('UI','API')
 ),
-job_ap_runs AS (  -- job runs that used an all-purpose cluster
-  SELECT t.workspace_id, t.job_id, exploded.cluster_id
-  FROM system.lakeflow.job_task_run_timeline t
-  LATERAL VIEW explode(t.compute_ids) exploded AS cluster_id
-  WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS
-    AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
+job_ap_runs AS (  -- task time each job spent on an all-purpose cluster, per clock hour
+  SELECT r.workspace_id, r.job_id, r.cluster_id, r.hour, sum(r.run_ms) AS run_ms
+  FROM (
+    SELECT t.workspace_id, t.job_id, exploded.cluster_id, date_trunc('HOUR', t.period_start_time) AS hour,
+           unix_millis(t.period_end_time) - unix_millis(t.period_start_time) AS run_ms
+    FROM system.lakeflow.job_task_run_timeline t
+    LATERAL VIEW explode(t.compute_ids) exploded AS cluster_id
+    WHERE t.period_start_time >= current_date() - INTERVAL 30 DAYS
+      AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
+  ) r
+  JOIN ap_clusters c ON r.workspace_id=c.workspace_id AND r.cluster_id=c.cluster_id
+  GROUP BY 1,2,3,4
 ),
-ap_job_ids AS (
-  SELECT DISTINCT r.workspace_id, r.job_id
-  FROM job_ap_runs r JOIN ap_clusters c
-    ON r.workspace_id=c.workspace_id AND r.cluster_id=c.cluster_id
-),
-job_spend AS (  -- 30-day all-purpose $ for those jobs
-  SELECT u.workspace_id, u.usage_metadata.job_id AS job_id,
-         sum(u.usage_quantity * pr.unit_usd) AS ap_usd_30d
+ap_hour AS (  -- each all-purpose cluster-hour at its own list price and at the matching Jobs-compute price
+  SELECT u.workspace_id, u.usage_metadata.cluster_id AS cluster_id,
+         date_trunc('HOUR', u.usage_start_time) AS hour,
+         sum(u.usage_quantity * ap.unit_usd) AS ap_usd,
+         sum(u.usage_quantity * jp.unit_usd) AS jobs_usd
   FROM system.billing.usage u
-  JOIN price pr ON u.sku_name=pr.sku_name AND u.cloud=pr.cloud
-    AND u.usage_start_time >= pr.price_start_time
-    AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-  WHERE u.billing_origin_product='JOBS' AND u.usage_date >= current_date() - INTERVAL 30 DAYS
-    AND u.usage_metadata.job_id IS NOT NULL
-  GROUP BY 1,2
+  JOIN price ap ON u.sku_name=ap.sku_name AND u.cloud=ap.cloud AND u.usage_unit=ap.usage_unit
+    AND u.usage_start_time >= ap.price_start_time
+    AND (ap.price_end_time IS NULL OR u.usage_start_time < ap.price_end_time)
+  JOIN price jp ON jp.sku_name=replace(u.sku_name, 'ALL_PURPOSE_COMPUTE', 'JOBS_COMPUTE')
+    AND u.cloud=jp.cloud AND u.usage_unit=jp.usage_unit
+    AND u.usage_start_time >= jp.price_start_time
+    AND (jp.price_end_time IS NULL OR u.usage_start_time < jp.price_end_time)
+  WHERE u.sku_name LIKE '%ALL_PURPOSE_COMPUTE%' AND u.usage_metadata.cluster_id IS NOT NULL
+    AND u.usage_date >= current_date() - INTERVAL 30 DAYS
+  GROUP BY 1,2,3
+),
+job_share AS (  -- the hour's busy time across every job decides each job's fair share of it
+  SELECT j.*, h.ap_usd, h.jobs_usd,
+         j.run_ms / greatest(sum(j.run_ms) OVER (PARTITION BY j.workspace_id, j.cluster_id, j.hour),
+                             3600 * 1000.0) AS share
+  FROM job_ap_runs j
+  JOIN ap_hour h ON j.workspace_id=h.workspace_id AND j.cluster_id=h.cluster_id AND j.hour=h.hour
+),
+job_spend AS (
+  SELECT workspace_id, job_id, sum(ap_usd * share) AS ap_usd_30d,
+         sum((ap_usd - jobs_usd) * share) AS saving_usd_30d
+  FROM job_share GROUP BY 1,2
 )
 SELECT coalesce(jn.job_name, CAST(s.job_id AS STRING)) AS job_name,
        round(s.ap_usd_30d, 2)                          AS all_purpose_usd_30d,
-       round(s.ap_usd_30d * (0.55-0.15)/0.55, 2)       AS est_monthly_saving_usd
+       round(s.saving_usd_30d, 2)                      AS est_monthly_saving_usd
 FROM job_spend s
-JOIN ap_job_ids a ON s.workspace_id=a.workspace_id AND s.job_id=a.job_id
 LEFT JOIN job_names jn ON s.workspace_id=jn.workspace_id AND s.job_id=jn.job_id
-WHERE s.ap_usd_30d > 0
+WHERE s.saving_usd_30d > 0
 ORDER BY est_monthly_saving_usd DESC LIMIT 25
 """,
             },
@@ -554,10 +593,16 @@ ORDER BY est_monthly_saving_usd DESC LIMIT 25
                 "id": "cpu_efficiency",
                 "title": "Top 10 jobs with lowest avg CPU",
                 "eli5": "Job clusters running at low average CPU — cores you pay for that sit idle. "
-                        "A downsize candidate.",
+                        "A downsize candidate. Only your largest tenth of job clusters by node-minutes "
+                        "is listed, and each is set against your typical large job cluster.",
                 "chart": "table",
-                "anomaly": {"type": "threshold", "value_col": "avg_cpu_pct", "op": "lt",
-                            "bar": 20, "unit": "pct", "label": "job clusters under 20% CPU"},
+                "anomaly": {"type": "vs_typical", "x_col": "times_below_typical",
+                            "typical_col": "typical_cpu_pct", "label_col": "job_name",
+                            "value_col": "avg_cpu_pct", "unit": "pct",
+                            "headline": "{n} of these jobs use at most {frac} of the CPU of your "
+                                        "typical large job cluster",
+                            "detail": "Typical: {typical} CPU. Lowest: “{worst}” at {value}, {x} below "
+                                      "typical. These are the rows worth acting on first."},
                 "sql": """
 WITH job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
 job_clusters AS (
@@ -569,27 +614,42 @@ job_clusters AS (
 ),
 cpu AS (
   SELECT cluster_id, count(*) AS node_minutes,
-         round(avg(cpu_user_percent + cpu_system_percent), 1) AS avg_cpu_pct
+         avg(cpu_user_percent + cpu_system_percent) AS cpu_pct
   FROM system.compute.node_timeline
   WHERE start_time >= current_date() - INTERVAL 30 DAYS AND driver = false
-  GROUP BY 1 HAVING count(*) > 200
-)
+    AND cluster_id IN (SELECT cluster_id FROM job_clusters)
+  GROUP BY 1
+),
+large AS (   -- the largest tenth of job clusters by node-minutes, where idle cores cost real money
+  SELECT * FROM cpu WHERE node_minutes >= (SELECT percentile_approx(node_minutes, 0.9) FROM cpu)
+),
+typical AS (SELECT percentile_approx(cpu_pct, 0.5) AS typical_cpu_pct FROM large)
 SELECT coalesce(jn.job_name, CAST(jc.job_id AS STRING)) AS job_name,
-       cpu.avg_cpu_pct, cpu.node_minutes
+       round(l.cpu_pct, 1)                                  AS avg_cpu_pct,
+       round(t.typical_cpu_pct, 1)                          AS typical_cpu_pct,
+       round(try_divide(t.typical_cpu_pct, l.cpu_pct), 1)   AS times_below_typical,
+       l.node_minutes
 FROM job_clusters jc
-JOIN cpu ON jc.cluster_id = cpu.cluster_id
+JOIN large l ON jc.cluster_id = l.cluster_id
+CROSS JOIN typical t
 LEFT JOIN job_names jn ON jc.workspace_id=jn.workspace_id AND jc.job_id=jn.job_id
-ORDER BY cpu.avg_cpu_pct ASC, cpu.node_minutes DESC LIMIT 10
+ORDER BY l.cpu_pct ASC, l.node_minutes DESC LIMIT 10
 """,
             },
             {
                 "id": "memory_allocation",
                 "title": "Top 10 jobs with highest avg memory",
                 "eli5": "Job clusters running near their memory ceiling — memory-bound work that may "
-                        "need a different node type (more RAM), not more nodes.",
+                        "need a different node type (more RAM), not more nodes. The ceiling is physical, "
+                        "so each is judged on its free memory against your typical large job cluster.",
                 "chart": "table",
-                "anomaly": {"type": "threshold", "value_col": "avg_mem_pct", "op": "gt",
-                            "bar": 85, "unit": "pct", "label": "job clusters over 85% memory"},
+                "anomaly": {"type": "vs_typical", "x_col": "times_less_headroom",
+                            "typical_col": "typical_free_mem_pct", "label_col": "job_name",
+                            "value_col": "free_mem_pct", "unit": "pct",
+                            "headline": "{n} of these jobs keep at most {frac} of the free memory of "
+                                        "your typical large job cluster",
+                            "detail": "Typical: {typical} free. Tightest: “{worst}” at {value} free, "
+                                      "{x} less headroom. These are the rows worth acting on first."},
                 "sql": """
 WITH job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
 job_clusters AS (
@@ -601,18 +661,28 @@ job_clusters AS (
 ),
 mem AS (
   SELECT cluster_id, count(*) AS node_minutes,
-         round(avg(mem_used_percent), 1) AS avg_mem_pct,
-         round(max(mem_used_percent), 1) AS peak_mem_pct
+         avg(mem_used_percent) AS mem_pct, max(mem_used_percent) AS peak_mem_pct
   FROM system.compute.node_timeline
   WHERE start_time >= current_date() - INTERVAL 30 DAYS AND driver = false
-  GROUP BY 1 HAVING count(*) > 200
-)
+    AND cluster_id IN (SELECT cluster_id FROM job_clusters)
+  GROUP BY 1
+),
+large AS (   -- the largest tenth of job clusters by node-minutes
+  SELECT * FROM mem WHERE node_minutes >= (SELECT percentile_approx(node_minutes, 0.9) FROM mem)
+),
+typical AS (SELECT percentile_approx(100 - mem_pct, 0.5) AS typical_free_mem_pct FROM large)
 SELECT coalesce(jn.job_name, CAST(jc.job_id AS STRING)) AS job_name,
-       mem.avg_mem_pct, mem.peak_mem_pct, mem.node_minutes
+       round(l.mem_pct, 1)                                             AS avg_mem_pct,
+       round(l.peak_mem_pct, 1)                                        AS peak_mem_pct,
+       round(100 - l.mem_pct, 1)                                       AS free_mem_pct,
+       round(t.typical_free_mem_pct, 1)                                AS typical_free_mem_pct,
+       round(try_divide(t.typical_free_mem_pct, 100 - l.mem_pct), 1)   AS times_less_headroom,
+       l.node_minutes
 FROM job_clusters jc
-JOIN mem ON jc.cluster_id = mem.cluster_id
+JOIN large l ON jc.cluster_id = l.cluster_id
+CROSS JOIN typical t
 LEFT JOIN job_names jn ON jc.workspace_id=jn.workspace_id AND jc.job_id=jn.job_id
-ORDER BY mem.avg_mem_pct DESC LIMIT 10
+ORDER BY l.mem_pct DESC LIMIT 10
 """,
             },
             {
@@ -651,8 +721,9 @@ ORDER BY cfg.worker_count DESC LIMIT 50
             {
                 "id": "outdated_dbr",
                 "title": "Jobs on outdated DBR (last 30 days)",
-                "eli5": "Job clusters on old Databricks Runtime versions (below the current LTS). Newer "
-                        "runtimes are faster and get Photon/security fixes — upgrading is often free speed.",
+                "eli5": "Job clusters on an older Databricks Runtime major than your typical job cluster "
+                        "runs (typical_major, the median across your job clusters). Newer runtimes are "
+                        "faster and get Photon/security fixes — upgrading is often free speed.",
                 "chart": "table",
                 "anomaly": None,
                 "sql": """
@@ -669,14 +740,20 @@ cfg AS (
          try_cast(regexp_extract(dbr_version, '^(\\\\d+)\\\\.', 1) AS INT) AS major
   FROM system.compute.clusters
   QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC)=1
+),
+fleet AS (   -- the major your typical job cluster runs: the median over the job clusters seen
+  SELECT percentile_approx(cfg.major, 0.5) AS typical_major
+  FROM (SELECT DISTINCT workspace_id, cluster_id FROM job_clusters) jc
+  JOIN cfg ON jc.workspace_id=cfg.workspace_id AND jc.cluster_id=cfg.cluster_id
 )
 SELECT coalesce(jn.job_name, CAST(jc.job_id AS STRING)) AS job_name,
        coalesce(cfg.cluster_name, jc.cluster_id)        AS cluster_name,
-       cfg.dbr_version
+       cfg.dbr_version, f.typical_major
 FROM job_clusters jc
 JOIN cfg ON jc.workspace_id=cfg.workspace_id AND jc.cluster_id=cfg.cluster_id
+CROSS JOIN fleet f
 LEFT JOIN job_names jn ON jc.workspace_id=jn.workspace_id AND jc.job_id=jn.job_id
-WHERE cfg.major IS NOT NULL AND cfg.major < 15   -- below DBR 15.x LTS-era
+WHERE cfg.major < f.typical_major
 ORDER BY cfg.major ASC, job_name LIMIT 50
 """,
             },
@@ -703,7 +780,7 @@ ORDER BY cfg.major ASC, job_name LIMIT 50
                         "this rolls that up per user. A single heavy user is where a chat starts.",
                 "chart": "bar",
                 "anomaly": {"type": "rank_outlier", "value_col": "query_usd",
-                            "label_col": "executed_by", "k": 4.0, "unit": "usd"},
+                            "label_col": "executed_by", "unit": "usd"},
                 "sql": """
 WITH wh_hour AS (
   SELECT warehouse_id, hour, sum(usage_quantity * unit_usd) AS hour_usd FROM (
@@ -799,10 +876,10 @@ FROM alloc GROUP BY 1 ORDER BY query_usd DESC NULLS LAST
                 "chart": "table",
                 "note": "Cost = the query's share of its warehouse-hour $, by execution-time. Warehouses "
                         "bill by size, so a longer query on a small warehouse can cost LESS than a shorter "
-                        "one on a 2X-Large — that's why exec_min and query_usd don't always rank together. "
+                        "one on a much larger warehouse — that's why exec_min and query_usd don't always rank together. "
                         "The warehouse column shows which one ran it.",
                 "anomaly": {"type": "rank_outlier", "value_col": "query_usd",
-                            "label_col": "executed_by", "k": 5.0, "unit": "usd"},
+                            "label_col": "executed_by", "unit": "usd"},
                 "sql": """
 WITH wh_hour AS (
   SELECT warehouse_id, hour, sum(usage_quantity * unit_usd) AS hour_usd FROM (
@@ -864,8 +941,7 @@ ORDER BY query_usd DESC NULLS LAST LIMIT 50
                         "per-source views. A jump here is a day to investigate.",
                 "chart": "line",
                 "anomaly": {"type": "ts_spike", "time_col": "day", "value_col": "query_usd",
-                            "k": 2.0, "min_abs": 200, "min_delta": 100,
-                            "min_delta_high": 1000, "unit": "usd"},
+                            "unit": "usd"},
                 "sql": """
 WITH wh_hour AS (
   SELECT warehouse_id, hour, sum(usage_quantity * unit_usd) AS hour_usd FROM (
@@ -921,11 +997,8 @@ FROM alloc GROUP BY 1 ORDER BY 1
                 "eli5": "Weekly $ split into Batch Inference, Pay-per-token, Provisioned throughput, "
                         "and custom models — the three foundation-model modes bill very differently.",
                 "chart": "stacked_bar",
-                # Serving spend is smaller than total spend, so lower floors than the by-product panel
-                # but still material: >= $2k latest, >= $1k move to flag, >= $10k to be 'high'.
                 "anomaly": {"type": "ts_spike", "time_col": "week", "value_col": "list_usd",
-                            "group_col": "serving_type", "k": 2.0, "min_abs": 2000,
-                            "min_delta": 1000, "min_delta_high": 10000, "unit": "usd"},
+                            "group_col": "serving_type", "unit": "usd"},
                 "sql": """
 WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
@@ -958,7 +1031,7 @@ ORDER BY 1, list_usd DESC
                         "place to check batch size, caching, and whether it needs to be always-on.",
                 "chart": "bar",
                 "anomaly": {"type": "rank_outlier", "value_col": "list_usd",
-                            "label_col": "endpoint", "k": 4.0, "unit": "usd"},
+                            "label_col": "endpoint", "unit": "usd"},
                 "sql": """
 WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
@@ -982,7 +1055,7 @@ GROUP BY 1 ORDER BY list_usd DESC NULLS LAST LIMIT 20
                         "requests behind them. Output tokens usually cost several × input.",
                 "chart": "table",
                 "anomaly": {"type": "rank_outlier", "value_col": "total_tokens",
-                            "label_col": "endpoint_name", "k": 4.0, "unit": "tokens"},
+                            "label_col": "endpoint_name", "unit": "tokens"},
                 "sql": """
 WITH ent AS (   -- served_entities carries the endpoint name; endpoint_usage only has served_entity_id
   SELECT served_entity_id, max(endpoint_name) AS endpoint_name
@@ -1006,8 +1079,7 @@ GROUP BY 1 ORDER BY total_tokens DESC NULLS LAST LIMIT 25
                         "busy — the model-serving equivalent of an always-on warehouse.",
                 "chart": "line",
                 "anomaly": {"type": "ts_spike", "time_col": "week", "value_col": "list_usd",
-                            "group_col": "endpoint", "k": 2.0, "min_abs": 2000,
-                            "min_delta": 1000, "min_delta_high": 10000, "unit": "usd"},
+                            "group_col": "endpoint", "unit": "usd"},
                 "sql": """
 WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
@@ -1042,7 +1114,7 @@ ORDER BY 1, list_usd DESC
                         "the DBSQL board) — it's the SQL-compute cost of running the call, not a "
                         "separate model-serving token charge.",
                 "anomaly": {"type": "rank_outlier", "value_col": "query_usd",
-                            "label_col": "model_endpoint", "k": 4.0, "unit": "usd"},
+                            "label_col": "model_endpoint", "unit": "usd"},
                 "sql": r"""
 WITH wh_hour AS (
   SELECT warehouse_id, hour, sum(usage_quantity * unit_usd) AS hour_usd FROM (
@@ -1085,6 +1157,7 @@ ORDER BY query_usd DESC NULLS LAST LIMIT 10
             },
         ],
     },
+
 ]
 
 
