@@ -2153,13 +2153,13 @@ async function loadTagResources(view) {
     const wrap = document.createElement("div"); wrap.className = "tbl-wrap";
     const rowsHtml = d.rows.slice(0, 100).map(r => {
       const id = r[idCol], name = r[nameCol] || id;
-      const cells = r.map(c => `<td>${c===null?"—":String(c)}</td>`).join("");
-      return `<tr>${cells}<td><button class="btn tag-set-btn" data-type="${view.slice(0,-1)}" data-id="${id}" data-name="${String(name).replace(/"/g,'&quot;')}">+ Set tag</button></td></tr>`;
+      const cells = r.map(c => `<td>${c===null?"—":escapeHtml(c)}</td>`).join("");
+      return `<tr>${cells}<td><button class="btn tag-set-btn" data-type="${view.slice(0,-1)}" data-id="${escapeHtml(id)}" data-name="${escapeHtml(name)}">+ Set tag</button></td></tr>`;
     }).join("");
     wrap.innerHTML = `<table><thead><tr>${d.columns.map(c=>`<th>${c}</th>`).join("")}<th>Action</th></tr></thead><tbody>${rowsHtml}</tbody></table>`;
     host.appendChild(wrap);
     $$(".tag-set-btn", wrap).forEach(b => b.addEventListener("click", () => openTagModal(b.dataset.type, b.dataset.id, b.dataset.name)));
-  } catch(e) { host.innerHTML = `<div class="result-status err">✕ ${e.message}</div>`; }
+  } catch(e) { host.innerHTML = `<div class="result-status err">✕ ${escapeHtml(e.message)}</div>`; }
 }
 
 function openTagModal(type, id, name) {
@@ -2168,7 +2168,7 @@ function openTagModal(type, id, name) {
   modal.innerHTML = `
     <div class="tag-modal">
       <h3>Set a tag on this ${type}</h3>
-      <p class="tag-modal-sub">${name} <span class="mono">${id}</span></p>
+      <p class="tag-modal-sub">${escapeHtml(name)} <span class="mono">${escapeHtml(id)}</span></p>
       <div class="tag-modal-warn">⚠ This changes a workspace setting (the only action in this app that does).
         It runs as you, so it needs your edit permission on the ${type}.</div>
       <label>Tag key</label>
@@ -2197,7 +2197,7 @@ function openTagModal(type, id, name) {
       res.innerHTML = `<span style="color:var(--teal)">✓ ${d.note||'Tag set.'}</span>`;
       cb.style.display = "none";
       setTimeout(() => { close(); if (tagLoaded) { loadTagResources($(".tag-tab.active").dataset.tagview); loadTagCoverage(); } }, 2200);
-    } catch(e) { res.innerHTML = `<span style="color:var(--coral)">✕ ${e.message}</span>`; cb.disabled=false; cb.innerHTML="Set tag"; }
+    } catch(e) { res.innerHTML = `<span style="color:var(--coral)">✕ ${escapeHtml(e.message)}</span>`; cb.disabled=false; cb.innerHTML="Set tag"; }
   });
 }
 
