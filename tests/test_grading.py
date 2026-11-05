@@ -95,6 +95,12 @@ class SpecCatalogue(unittest.TestCase):
             if spec["kind"] == "anomaly":
                 self.assertIn(spec.get("aggregate"), ("additive", "peak"), hid)
 
+    def test_every_anomaly_hunt_returns_a_capped_list_of_contributors(self):
+        for h in hunts.HUNTS:
+            spec = hunts.ALERT_SPECS.get(h["id"])
+            if spec and spec["kind"] == "anomaly":
+                self.assertRegex(h["sql"], r"(?is)\bLIMIT\s+\d+\s*$", h["id"])
+
 
 if __name__ == "__main__":
     unittest.main()
