@@ -18,6 +18,8 @@ from typing import Literal, Optional, Union
 
 from typing_extensions import TypedDict
 
+from names import JOB, PIPELINE, WAREHOUSE, WORKSPACE, ctes
+
 
 # The six plain-English categories the hunts are grouped into on the Spot page.
 # label = what the customer sees; blurb = one ELI5 line under the category header.
@@ -1510,8 +1512,9 @@ MEASURES = [
                 "of capacity — so the shares never exceed the real cost. Use it to price a specific "
                 "expensive query (e.g. an investigation scan) and to show a per-query before/after.",
         "chart": "table",
-        "sql": """
-WITH wh_hour AS (
+        "sql": f"""
+WITH {ctes("warehouse")},
+wh_hour AS (
   SELECT warehouse_id, hour, sum(usage_quantity * unit_usd) AS hour_usd
   FROM (
     SELECT u.usage_metadata.warehouse_id          AS warehouse_id,
@@ -1536,7 +1539,7 @@ cfg_hist AS (
   FROM system.compute.warehouses
 ),
 q AS (
-  SELECT compute.warehouse_id AS warehouse_id, date_trunc('HOUR', start_time) AS hour,
+  SELECT compute.warehouse_id AS warehouse_id, workspace_id, date_trunc('HOUR', start_time) AS hour,
          statement_id, executed_by, execution_duration_ms,
          sum(execution_duration_ms) OVER (
            PARTITION BY compute.warehouse_id, date_trunc('HOUR', start_time)) AS busy_ms
@@ -1551,11 +1554,12 @@ alloc AS (
            ON  c.warehouse_id = q.warehouse_id
            AND q.hour >= c.valid_from AND q.hour < c.valid_to
 )
-SELECT statement_id, executed_by,
-       round(execution_duration_ms/60000.0, 2)     AS exec_min,
-       round(capacity_ms/3600000.0, 2)             AS capacity_cluster_hours,
-       round(hour_usd * execution_duration_ms / capacity_ms, 2) AS query_usd
-FROM alloc
+SELECT c.statement_id, c.executed_by, {WAREHOUSE.label} AS warehouse,
+       round(c.execution_duration_ms/60000.0, 2)     AS exec_min,
+       round(c.capacity_ms/3600000.0, 2)             AS capacity_cluster_hours,
+       round(c.hour_usd * c.execution_duration_ms / c.capacity_ms, 2) AS query_usd,
+       c.warehouse_id
+FROM alloc c {WAREHOUSE.join}
 ORDER BY query_usd DESC
 LIMIT 50
 """,
@@ -1572,20 +1576,26 @@ LIMIT 50
                 "here. Compare weeks of the same-shape workload. Remember classic warehouses "
                 "carry a separate cloud-infrastructure bill next to this usage line.",
         "chart": "line_by_warehouse",  # frontend renders this as a multi-line weekly chart
-        "sql": """
-SELECT u.usage_metadata.warehouse_id     AS warehouse_id,
-       date_trunc('WEEK', u.usage_date)  AS week,
-       sum(u.usage_quantity)             AS dbus,
-       round(sum(u.usage_quantity * lp.pricing.effective_list.default), 2) AS list_usd
-FROM system.billing.usage u
-JOIN system.billing.list_prices lp
-  ON  u.sku_name = lp.sku_name AND u.cloud = lp.cloud
-  AND u.usage_start_time >= lp.price_start_time
-  AND (lp.price_end_time IS NULL OR u.usage_start_time < lp.price_end_time)
-WHERE u.usage_metadata.warehouse_id IS NOT NULL
-  AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
-GROUP BY 1, 2
-ORDER BY 1, 2
+        "sql": f"""
+WITH {ctes("warehouse")},
+weekly AS (
+  SELECT u.usage_metadata.warehouse_id     AS warehouse_id,
+         date_trunc('WEEK', u.usage_date)  AS week,
+         max(u.workspace_id)               AS workspace_id,
+         sum(u.usage_quantity)             AS dbus,
+         round(sum(u.usage_quantity * lp.pricing.effective_list.default), 2) AS list_usd
+  FROM system.billing.usage u
+  JOIN system.billing.list_prices lp
+    ON  u.sku_name = lp.sku_name AND u.cloud = lp.cloud
+    AND u.usage_start_time >= lp.price_start_time
+    AND (lp.price_end_time IS NULL OR u.usage_start_time < lp.price_end_time)
+  WHERE u.usage_metadata.warehouse_id IS NOT NULL
+    AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
+  GROUP BY 1, 2
+)
+SELECT {WAREHOUSE.label} AS warehouse, c.warehouse_id, c.week, c.dbus, c.list_usd
+FROM weekly c {WAREHOUSE.join}
+ORDER BY c.warehouse_id, c.week
 """,
     },
     {
@@ -1602,13 +1612,14 @@ ORDER BY 1, 2
                 "a sound but simplified floor. The dollars are Databricks list-price DBU cost "
                 "— Finance applies your contract rate and (for classic) the separate cloud bill.",
         "chart": "table",
-        "sql": """
-WITH wh_hour AS (
-  SELECT warehouse_id, hour, sum(usage_quantity * unit_usd) AS hour_usd
+        "sql": f"""
+WITH {ctes("warehouse")},
+wh_hour AS (
+  SELECT warehouse_id, hour, sum(usage_quantity * unit_usd) AS hour_usd, max(workspace_id) AS workspace_id
   FROM (
     SELECT u.usage_metadata.warehouse_id AS warehouse_id,
            date_trunc('HOUR', u.usage_start_time) AS hour,
-           u.usage_quantity, lp.pricing.effective_list.default AS unit_usd
+           u.usage_quantity, lp.pricing.effective_list.default AS unit_usd, u.workspace_id
     FROM system.billing.usage u JOIN system.billing.list_prices lp
       ON u.sku_name=lp.sku_name AND u.cloud=lp.cloud
      AND u.usage_start_time>=lp.price_start_time AND (lp.price_end_time IS NULL OR u.usage_start_time<lp.price_end_time)
@@ -1632,7 +1643,7 @@ busy AS (
   GROUP BY 1,2
 ),
 hour_alloc AS (
-  SELECT w.warehouse_id, w.hour, w.hour_usd,
+  SELECT w.warehouse_id, w.workspace_id, w.hour, w.hour_usd,
          coalesce(b.busy_ms, 0) AS busy_ms,
          GREATEST(coalesce(c.max_clusters,1)*3600000.0, coalesce(b.busy_ms,0)) AS capacity_ms
   FROM wh_hour w
@@ -1640,14 +1651,19 @@ hour_alloc AS (
     ON  c.warehouse_id = w.warehouse_id
     AND w.hour >= c.valid_from AND w.hour < c.valid_to
   LEFT JOIN busy b USING (warehouse_id, hour)
+),
+per_warehouse AS (
+  SELECT warehouse_id, max(workspace_id) AS workspace_id,
+         round(sum(hour_usd), 2)                                AS total_usd,
+         round(sum(hour_usd * busy_ms / capacity_ms), 2)        AS attributed_usd,
+         round(sum(hour_usd * (1 - busy_ms / capacity_ms)), 2)  AS idle_usd,
+         round(avg(busy_ms / capacity_ms) * 100, 1)             AS avg_util_pct
+  FROM hour_alloc
+  GROUP BY 1
 )
-SELECT warehouse_id,
-       round(sum(hour_usd), 2)                                AS total_usd,
-       round(sum(hour_usd * busy_ms / capacity_ms), 2)        AS attributed_usd,
-       round(sum(hour_usd * (1 - busy_ms / capacity_ms)), 2)  AS idle_usd,
-       round(avg(busy_ms / capacity_ms) * 100, 1)             AS avg_util_pct
-FROM hour_alloc
-GROUP BY 1 ORDER BY idle_usd DESC
+SELECT {WAREHOUSE.label} AS warehouse, c.total_usd, c.attributed_usd, c.idle_usd, c.avg_util_pct, c.warehouse_id
+FROM per_warehouse c {WAREHOUSE.join}
+ORDER BY c.idle_usd DESC
 """,
     },
     {
@@ -1663,36 +1679,36 @@ GROUP BY 1 ORDER BY idle_usd DESC
                 "shared or serverless products) shows up as its own ‘unattributed’ row "
                 "rather than being dropped, so the dollars reconcile.",
         "chart": "table",
-        "sql": """
+        "sql": f"""
 WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
          pricing.effective_list.default AS unit_usd FROM system.billing.list_prices
 ),
-pipe_name AS (SELECT pipeline_id, max(name) AS name FROM system.lakeflow.pipelines GROUP BY 1),
-job_name  AS (SELECT workspace_id, job_id, max(name) AS name FROM system.lakeflow.jobs GROUP BY workspace_id, job_id)
-SELECT u.billing_origin_product                                            AS product,
-       u.workspace_id,
-       coalesce(u.usage_metadata.job_id, u.usage_metadata.dlt_pipeline_id,
-                '(unattributed — no entity id)')                           AS entity_id,
-       coalesce(jn.name, pn.name,
-                CASE WHEN u.usage_metadata.job_id IS NULL
-                      AND u.usage_metadata.dlt_pipeline_id IS NULL
-                     THEN '(unattributed — no entity id)'
-                     ELSE '(name unavailable)' END)                        AS entity_name,
-       date_trunc('WEEK', u.usage_date)                                    AS week,
-       sum(u.usage_quantity)                                               AS dbus,
-       round(sum(u.usage_quantity * pr.unit_usd), 2)                       AS list_usd
-FROM system.billing.usage u
-JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
-  AND u.usage_start_time >= pr.price_start_time
-  AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-LEFT JOIN pipe_name pn ON u.usage_metadata.dlt_pipeline_id = pn.pipeline_id
-LEFT JOIN job_name  jn ON u.usage_metadata.job_id = jn.job_id
-                      AND u.workspace_id          = jn.workspace_id
-WHERE u.billing_origin_product IN ('JOBS', 'DLT')
-  AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
-GROUP BY 1, 2, 3, 4, 5
-ORDER BY list_usd DESC
+{ctes("job", "pipeline")},
+weekly AS (
+  SELECT u.billing_origin_product                                            AS product,
+         u.workspace_id,
+         coalesce(u.usage_metadata.job_id, u.usage_metadata.dlt_pipeline_id,
+                  '(unattributed — no entity id)')                           AS entity_id,
+         date_trunc('WEEK', u.usage_date)                                    AS week,
+         max(u.usage_metadata.job_id)                                        AS job_id,
+         max(CASE WHEN u.usage_metadata.job_id IS NULL
+                  THEN u.usage_metadata.dlt_pipeline_id END)                 AS pipeline_id,
+         sum(u.usage_quantity)                                               AS dbus,
+         round(sum(u.usage_quantity * pr.unit_usd), 2)                       AS list_usd
+  FROM system.billing.usage u
+  JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
+    AND u.usage_start_time >= pr.price_start_time
+    AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
+  WHERE u.billing_origin_product IN ('JOBS', 'DLT')
+    AND u.usage_date >= current_date() - INTERVAL 8 WEEKS
+  GROUP BY 1, 2, 3, 4
+)
+SELECT c.product, {WORKSPACE.label} AS workspace,
+       coalesce({JOB.label}, {PIPELINE.label}, c.entity_id) AS entity_name,
+       c.week, c.dbus, c.list_usd, c.workspace_id, c.entity_id
+FROM weekly c {WORKSPACE.join} {JOB.join} {PIPELINE.join}
+ORDER BY c.list_usd DESC
 LIMIT 200
 """,
     },
@@ -1711,12 +1727,12 @@ LIMIT 200
                 "the same work. Limited to the top jobs by Performance-optimized spend so the table "
                 "stays legible. List-price DBU cost, directly attributed by job_id.",
         "chart": "table",
-        "sql": """
+        "sql": f"""
 WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
          pricing.effective_list.default AS unit_usd FROM system.billing.list_prices
 ),
-job_name AS (SELECT workspace_id, job_id, max(name) AS name FROM system.lakeflow.jobs GROUP BY 1, 2),
+{ctes("job")},
 sj AS (
   SELECT u.workspace_id,
          u.usage_metadata.job_id                    AS job_id,
@@ -1736,16 +1752,18 @@ sj AS (
 top_jobs AS (
   SELECT job_id FROM sj WHERE mode = 'PERFORMANCE_OPTIMIZED'
   GROUP BY 1 ORDER BY sum(usd) DESC LIMIT 12
+),
+weekly AS (
+  SELECT sj.workspace_id, sj.job_id, sj.week,
+         round(sum(CASE WHEN sj.mode = 'PERFORMANCE_OPTIMIZED' THEN sj.usd ELSE 0 END), 2) AS perf_optimized_usd,
+         round(sum(CASE WHEN sj.mode = 'STANDARD'              THEN sj.usd ELSE 0 END), 2) AS standard_usd,
+         round(sum(sj.dbus), 1)                                                    AS dbus
+  FROM sj JOIN top_jobs USING (job_id)
+  GROUP BY 1, 2, 3
 )
-SELECT coalesce(jn.name, CAST(sj.job_id AS STRING))                              AS job_name,
-       sj.week,
-       round(sum(CASE WHEN sj.mode = 'PERFORMANCE_OPTIMIZED' THEN sj.usd ELSE 0 END), 2) AS perf_optimized_usd,
-       round(sum(CASE WHEN sj.mode = 'STANDARD'              THEN sj.usd ELSE 0 END), 2) AS standard_usd,
-       round(sum(sj.dbus), 1)                                                    AS dbus
-FROM sj JOIN top_jobs USING (job_id)
-LEFT JOIN job_name jn ON sj.workspace_id = jn.workspace_id AND sj.job_id = jn.job_id
-GROUP BY 1, 2
-ORDER BY job_name, sj.week
+SELECT {JOB.label} AS job_name, c.week, c.perf_optimized_usd, c.standard_usd, c.dbus, c.job_id
+FROM weekly c {JOB.join}
+ORDER BY job_name, c.week
 """,
     },
     {
@@ -1761,16 +1779,24 @@ ORDER BY job_name, sj.week
                 "execution time — what a timeout would really have killed. Baseline now "
                 "(expect the multi-hour offenders); confirm zero after the caps go in.",
         "chart": "table",
-        "sql": """
-SELECT compute.warehouse_id,
-       date_trunc('WEEK', start_time)                          AS week,
-       count_if(execution_duration_ms > 3600*1000)             AS stmts_over_cap,
-       round(sum(CASE WHEN execution_duration_ms > 3600*1000
-                      THEN execution_duration_ms ELSE 0 END)/3600000.0, 1) AS over_cap_exec_hours,
-       round(max(execution_duration_ms)/3600000.0, 1)          AS longest_exec_hours
-FROM system.query.history
-WHERE start_time >= current_date() - INTERVAL 8 WEEKS
-GROUP BY 1, 2 ORDER BY over_cap_exec_hours DESC
+        "sql": f"""
+WITH {ctes("warehouse")},
+weekly AS (
+  SELECT compute.warehouse_id                                    AS warehouse_id,
+         date_trunc('WEEK', start_time)                          AS week,
+         max(workspace_id)                                       AS workspace_id,
+         count_if(execution_duration_ms > 3600*1000)             AS stmts_over_cap,
+         round(sum(CASE WHEN execution_duration_ms > 3600*1000
+                        THEN execution_duration_ms ELSE 0 END)/3600000.0, 1) AS over_cap_exec_hours,
+         round(max(execution_duration_ms)/3600000.0, 1)          AS longest_exec_hours
+  FROM system.query.history
+  WHERE start_time >= current_date() - INTERVAL 8 WEEKS
+  GROUP BY 1, 2
+)
+SELECT coalesce({WAREHOUSE.label}, 'no warehouse') AS warehouse, c.week, c.stmts_over_cap,
+       c.over_cap_exec_hours, c.longest_exec_hours, c.warehouse_id
+FROM weekly c {WAREHOUSE.join}
+ORDER BY c.over_cap_exec_hours DESC
 """,
     },
     {
@@ -1787,30 +1813,35 @@ GROUP BY 1, 2 ORDER BY over_cap_exec_hours DESC
                 "weeks after you ship it, while the row count (runs) holds — proof the work got "
                 "cheaper per run, not just quieter.",
         "chart": "table",
-        "sql": """
-WITH wh AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses
-            QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1 AND delete_time IS NULL),
+        "sql": f"""
+WITH {ctes("warehouse")},
 top_wh AS (   -- limit to the busiest warehouses so the table stays legible
   SELECT compute.warehouse_id AS warehouse_id
   FROM system.query.history
   WHERE start_time >= current_date() - INTERVAL 8 WEEKS AND execution_duration_ms > 0
   GROUP BY 1 ORDER BY sum(execution_duration_ms) DESC LIMIT 8
+),
+weekly AS (
+  SELECT q.warehouse_id,
+         date_trunc('WEEK', q.start_time)              AS week,
+         max(q.workspace_id)                           AS workspace_id,
+         count(*)                                      AS runs,
+         round(avg(q.read_bytes)/POW(1024,3), 1)       AS avg_read_gib,
+         round(avg(q.spilled_local_bytes)/POW(1024,3), 2) AS avg_spill_gib,
+         round(avg(q.execution_duration_ms)/60000.0, 2)   AS avg_exec_min
+  FROM (
+    SELECT compute.warehouse_id AS warehouse_id, workspace_id, start_time, read_bytes, spilled_local_bytes,
+           execution_duration_ms
+    FROM system.query.history
+    WHERE start_time >= current_date() - INTERVAL 8 WEEKS AND execution_duration_ms > 0
+  ) q
+  JOIN top_wh USING (warehouse_id)
+  GROUP BY 1, 2
 )
-SELECT coalesce(wh.warehouse_name, q.warehouse_id)   AS warehouse,
-       date_trunc('WEEK', q.start_time)              AS week,
-       count(*)                                      AS runs,
-       round(avg(q.read_bytes)/POW(1024,3), 1)       AS avg_read_gib,
-       round(avg(q.spilled_local_bytes)/POW(1024,3), 2) AS avg_spill_gib,
-       round(avg(q.execution_duration_ms)/60000.0, 2)   AS avg_exec_min
-FROM (
-  SELECT compute.warehouse_id AS warehouse_id, start_time, read_bytes, spilled_local_bytes, execution_duration_ms
-  FROM system.query.history
-  WHERE start_time >= current_date() - INTERVAL 8 WEEKS AND execution_duration_ms > 0
-) q
-JOIN top_wh USING (warehouse_id)
-LEFT JOIN wh ON q.warehouse_id = wh.warehouse_id
-GROUP BY 1, 2
-ORDER BY 1, 2
+SELECT {WAREHOUSE.label} AS warehouse, c.week, c.runs, c.avg_read_gib, c.avg_spill_gib, c.avg_exec_min,
+       c.warehouse_id
+FROM weekly c {WAREHOUSE.join}
+ORDER BY warehouse, c.week
 """,
     },
 ]

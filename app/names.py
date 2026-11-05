@@ -8,11 +8,11 @@ two of them it adds the id too, so a label never stands for two entities. An ent
 no system table names is labelled by its kind and id, and a warehouse by a short id
 and its workspace. Results keep the raw id in a column of its own for lookups.
 
-A query opens its WITH clause with ctes(...) and labels each id with ref(), after
-it has aggregated:
+A query opens its WITH clause with ctes(...) and joins one label per id after it has
+aggregated. In the usual shape a last CTE aliased c carries <kind>_id and workspace_id,
+and WORKSPACE, WAREHOUSE, JOB, PIPELINE and CLUSTER label it (ref() builds others):
 
-    job = ref("job", "c.job_id", "c.workspace_id")
-    f"WITH {ctes('job')}, ... SELECT {job.label} AS job_name, c.job_id FROM contrib c {job.join}"
+    f"WITH {ctes('job')}, ... SELECT {JOB.label} AS job_name, c.job_id FROM contrib c {JOB.join}"
 
 Every names CTE holds one row per (workspace_id, id), the key the join uses, so a
 label never changes a row count or a metric.
@@ -95,15 +95,16 @@ def _short(expr: str) -> str:
     return f"left({expr}, 4) || '…' || right({expr}, 4)"
 
 
-def ref(kind: str, id_expr: str, ws_expr: str = "", alias: str = "") -> Ref:
-    """Label one id. ws_expr is the row's workspace_id (a workspace is its own);
-    alias names the joins when one query labels two columns of the same kind."""
+def ref(kind: str, id_expr: str = "", ws_expr: str = "c.workspace_id", alias: str = "") -> Ref:
+    """Label one id, by default c.<kind>_id in workspace c.workspace_id. alias names
+    the joins when one query labels two columns of the same kind."""
     a = alias or f"{kind}_n"
+    id_expr = id_expr or f"c.{kind}_id"
     if kind == "workspace":
         label = _workspace(f"{a}.label", id_expr)
         return Ref(f"LEFT JOIN workspace_names {a} ON {a}.workspace_id = {id_expr}", label, label)
-    if kind not in SOURCES or not ws_expr:
-        raise ValueError(f"ref({kind!r}) needs a known kind and the row's workspace_id")
+    if kind not in SOURCES:
+        raise ValueError(f"no names for {kind!r}")
     join = f"LEFT JOIN {kind}_names {a} ON {a}.workspace_id = {ws_expr} AND {a}.id = {id_expr}"
     fallback = f"'{kind} ' || {id_expr}"
     if kind == "warehouse":
@@ -111,3 +112,6 @@ def ref(kind: str, id_expr: str, ws_expr: str = "", alias: str = "") -> Ref:
         fallback = (f"CASE WHEN {id_expr} IS NOT NULL THEN concat_ws(' · ', 'warehouse ' || {_short(id_expr)}, "
                     f"{_workspace(f'{a}_ws.label', ws_expr)}) END")
     return Ref(join, f"coalesce({a}.label, {fallback})", f"coalesce('{kind} ' || {a}.label, {fallback})")
+
+
+WORKSPACE, WAREHOUSE, JOB, PIPELINE, CLUSTER = (ref(k) for k in ("workspace", "warehouse", "job", "pipeline", "cluster"))

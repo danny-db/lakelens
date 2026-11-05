@@ -1308,15 +1308,17 @@ async function loadMeasure(m, block) {
   btn.disabled = false; btn.textContent = "Reload scoreboard";
 }
 
-// M3: pivot [warehouse_id, week, dbus, list_usd] into one line per (top) warehouse
+// M3: pivot [warehouse, warehouse_id, week, dbus, list_usd] into one line per (top) warehouse,
+// keyed by id and named by its label
 function renderWarehouseChart(id, data, res) {
   const ci = {}; data.columns.forEach((c,i)=>ci[c]=i);
-  const wIdx = ci.warehouse_id, weekIdx = ci.week, usdIdx = ci.list_usd;
+  const wIdx = ci.warehouse_id, nameIdx = ci.warehouse, weekIdx = ci.week, usdIdx = ci.list_usd;
   const weeks = [...new Set(data.rows.map(r => String(r[weekIdx]).slice(0,10)))].sort();
-  const byWh = {};
+  const byWh = {}, labelOf = {};
   data.rows.forEach(r => {
     const w = r[wIdx] || "(unknown)";
     if (!byWh[w]) byWh[w] = {};
+    labelOf[w] = r[nameIdx] || w;
     byWh[w][String(r[weekIdx]).slice(0,10)] = Number(r[usdIdx]) || 0;
   });
   // top 8 warehouses by total $
@@ -1325,7 +1327,7 @@ function renderWarehouseChart(id, data, res) {
   const top = totals.slice(0,8).map(t=>t[0]);
   const palette = ["#00d4b8","#4aa8ff","#9b8cff","#ffc043","#ff6b4a","#5ce1a0","#f078c8","#8aa0b8"];
   const datasets = top.map((w,i) => ({
-    label: w.length > 16 ? w.slice(0,8)+"…"+w.slice(-4) : w,
+    label: labelOf[w], _id: w,
     data: weeks.map(wk => byWh[w][wk] ?? null),
     borderColor: palette[i%palette.length],
     backgroundColor: palette[i%palette.length]+"22",
@@ -1345,7 +1347,7 @@ function renderWarehouseChart(id, data, res) {
       interaction: { mode: "index", intersect: false },
       plugins: {
         legend: { labels: { color: cs.getPropertyValue("--muted").trim(), boxWidth: 12, font: {size: 11, family: "PlexMono"} } },
-        tooltip: { callbacks: { label: c => `${c.dataset.label}: $${Number(c.parsed.y).toLocaleString()}` } },
+        tooltip: { callbacks: { label: c => `${c.dataset.label} (${c.dataset._id}): $${Number(c.parsed.y).toLocaleString()}` } },
       },
       scales: {
         x: { ticks: { color: tick, font:{size:11, family:"PlexMono"} }, grid: { color: grid } },
