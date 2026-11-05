@@ -8,10 +8,11 @@ fix, and which measure proves the before/after — dropped into a queue a
 FinOps admin works (acknowledge → in progress → resolved / dismissed).
 
 Design notes:
-- **Severity is deterministic**: each row is graded by the rule for its spec's
-  `kind` (see GRADERS and hunts.ALERT_SPECS), mostly "how many times this
-  entity's own normal". The AI only narrates; it never sets severity. We never
-  invent a dollar figure a query didn't produce.
+- **Severity is deterministic**: each hunt is graded by the rule for its spec's
+  `kind` (see GRADERS and hunts.ALERT_SPECS), mostly "how many times the
+  account's own normal", with the top contributors listed behind it. The AI only
+  narrates; it never sets severity. We never invent a dollar figure a query
+  didn't produce.
 - **Async**: a scan runs on a background thread so no single HTTP request is
   held past the Databricks Apps ~120s cap. The frontend polls and streams
   findings in as each hunt completes.
@@ -116,8 +117,8 @@ def _add_wall(scan_id: str, ms: float):
 
 # ── severity + formatting ─────────────────────────────────────────────────────
 
-# An anomaly row is high at ANOMALY_HIGH_X times its entity's normal and medium at
-# ANOMALY_MEDIUM_X. Read once at import; set them as bundle variables.
+# An anomaly hunt is high when the ACCOUNT runs at ANOMALY_HIGH_X times its own
+# normal and medium at ANOMALY_MEDIUM_X. Read once at import; set them as bundle variables.
 ANOMALY_HIGH_X = float(os.getenv("ANOMALY_HIGH_X", "3"))
 ANOMALY_MEDIUM_X = float(os.getenv("ANOMALY_MEDIUM_X", "2"))
 
@@ -125,10 +126,10 @@ ANOMALY_MEDIUM_X = float(os.getenv("ANOMALY_MEDIUM_X", "2"))
 class Grade(NamedTuple):
     severity: str           # high | medium | low
     reading: str            # anomaly | new | presence
-    x: Optional[float]      # vs_normal, for anomaly rows
+    x: Optional[float]      # the account's vs_normal, for anomaly hunts
 
 
-def _grade_anomaly(spec: dict, row: list, ci: dict) -> Grade:
+def _grade_anomaly(row: list, ci: dict) -> Grade:
     x = _num(row[ci["vs_normal"]])
     if x is None:
         return Grade("medium", "new", None)
@@ -139,17 +140,18 @@ def _grade_anomaly(spec: dict, row: list, ci: dict) -> Grade:
     return Grade("low", "anomaly", x)
 
 
-def _grade_presence(spec: dict, row: list, ci: dict) -> Grade:
+def _grade_presence(row: list, ci: dict) -> Grade:
     return Grade("medium", "presence", None)
 
 
-GRADERS: dict[str, Callable[[dict, list, dict], Grade]] = {
+GRADERS: dict[str, Callable[[list, dict], Grade]] = {
     "anomaly": _grade_anomaly,
     "presence": _grade_presence,
 }
 
 # Columns each kind needs in the hunt result, beyond the spec's own column names.
-REQUIRED_COLS = {"anomaly": ("vs_normal", "baseline"), "presence": ()}
+# Every anomaly row carries the same account columns, so the first row grades the hunt.
+REQUIRED_COLS = {"anomaly": ("account_value", "baseline", "vs_normal", "share_pct"), "presence": ()}
 
 
 def _fmt_metric(value: float, unit: str) -> str:
@@ -183,22 +185,23 @@ def _num(x) -> Optional[float]:
         return None
 
 
-def _headline(spec: dict, g: Grade, row: list, ci: dict, total: int, metric_str: str,
-              baseline_str: Optional[str]) -> str:
-    entity = str(row[ci[spec["entity_col"]]]) if spec.get("entity_col") in ci else ""
-    if g.reading == "new":
-        return spec["new_summary"].format(entity=entity, metric=metric_str, n=total)
-    x = "" if g.x is None else f"{g.x:,.0f}x" if g.x >= 10 else f"{g.x:.1f}x"
-    return spec["summary"].format(entity=entity, x=x, baseline=baseline_str, metric=metric_str, n=total)
+def _fmt_x(x: float) -> str:
+    return f"{x:,.0f}x" if x >= 10 else f"{x:.1f}x"
+
+
+def _fmt_share(share: Optional[float]) -> str:
+    if share is None:
+        return "share unknown"
+    return f"{share:.1f}%" if share < 10 else f"{share:.0f}%"
 
 
 def build_finding(hunt: dict, result: dict) -> Optional[dict]:
-    """Turn one hunt's query result into an alert finding, or None if no row
-    grades medium or worse (a clean hunt raises no alert).
+    """Turn one hunt's query result into an alert finding, or None when the hunt
+    grades low (a clean hunt raises no alert).
 
-    `result` = {columns, rows, total_rows} from _run_sql. Every row is graded;
-    the headline row is the first row with the worst severity, so the hunt's
-    ORDER BY breaks ties."""
+    `result` = {columns, rows, total_rows} from _run_sql. An anomaly hunt's rows are
+    the account's top contributors, each carrying the same account_value, baseline
+    and vs_normal, so the first row grades the hunt and names the top contributor."""
     spec = catalogue.ALERT_SPECS.get(hunt["id"])
     if not spec:
         return None
@@ -211,28 +214,33 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
     if any(c and c not in ci for c in needed):
         return None
 
-    grader = GRADERS[spec["kind"]]
-    graded = [grader(spec, r, ci) for r in rows]
-    top_i = min(range(len(rows)), key=lambda i: SEV_RANK[graded[i].severity])
-    top, g = rows[top_i], graded[top_i]
+    top = rows[0]
+    g = GRADERS[spec["kind"]](top, ci)
     if g.severity == "low":
         return None
 
     total = result.get("total_rows", len(rows))
-    mcol = spec.get("metric_col")
-    top_val = _num(top[ci[mcol]]) if mcol else None
-    metric_str = _fmt_metric(top_val, spec["unit"]) if mcol else ""
-    baseline_str = (_fmt_metric(_num(top[ci["baseline"]]), spec["unit"])
-                    if g.reading == "anomaly" else None)
-    summary = _headline(spec, g, top, ci, total, metric_str, baseline_str)
+    entity = str(top[ci[spec["entity_col"]]])
+    if spec["kind"] == "presence":
+        account_num, account_str, baseline_str = None, "", None
+        summary = spec["summary"].format(entity=entity, n=total)
+    else:
+        account_num = _num(top[ci["account_value"]])
+        account_str = _fmt_metric(account_num, spec["unit"])
+        baseline_str = (_fmt_metric(_num(top[ci["baseline"]]), spec["unit"])
+                        if g.reading == "anomaly" else None)
+        template = spec["new_summary"] if g.reading == "new" else spec["summary"]
+        summary = (template.format(account=account_str, x=_fmt_x(g.x) if g.x is not None else "",
+                                   baseline=baseline_str)
+                   + f" Top contributor: {entity} ({_fmt_share(_num(top[ci['share_pct']]))}).")
 
-    # Real dollars only if the hunt genuinely has a $ column (else None — we show
+    # Real dollars only if the hunt genuinely has a $ column (else None: we show
     # the magnitude metric instead, never a fabricated cost).
     impact_usd = None
     if spec.get("usd_col") and spec["usd_col"] in ci:
         impact_usd = _num(top[ci[spec["usd_col"]]])
 
-    # Keep the top-5 rows as evidence (the queue card shows these; the full
+    # Keep the top-5 contributors as evidence (the queue card shows these; the full
     # result stays available on the Spot tab).
     evidence = {"columns": cols, "rows": rows[:5]}
 
@@ -243,9 +251,9 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
         "severity": g.severity,
         "summary": summary,
         "metric_label": spec["metric_label"],
-        "metric_value": metric_str,
-        "metric_num": top_val,          # raw numeric — for reliable run-over-run comparison
-        # How the headline row compares with its own normal (the card's badge).
+        "metric_value": account_str,
+        "metric_num": account_num,      # raw account value, for run-over-run comparison
+        # How the account compares with its own normal (the card's badge).
         "vs": {"reading": g.reading, "x": g.x, "baseline": baseline_str},
         "impact_usd": impact_usd,
         "total_rows": total,

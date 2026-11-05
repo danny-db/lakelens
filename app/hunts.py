@@ -106,6 +106,38 @@ def _most_unusual(metric: str) -> str:
     return f"coalesce(vs_normal, try_divide({metric}, ws_normal)) DESC NULLS LAST"
 
 
+# ── The account-versus-its-own-normal columns every anomaly hunt returns ──────
+# Windows are trailing 7-day periods counted back from now, so the current window
+# (wk 0) and the four before it (wk 1-4, the prior 28 days) are the same length
+# and none is a partial calendar week.
+def _wk(ts: str) -> str:
+    """Window index for a timestamp: 0 = the last 7 x 24 hours, 1-4 = the 28 days before."""
+    return f"floor((unix_timestamp(current_timestamp()) - unix_timestamp({ts})) / 604800)"
+
+
+def _wk_day(day: str) -> str:
+    """Window index for a daily column, over complete days only (filter `{day} < current_date()`)."""
+    return f"floor((datediff(current_date(), {day}) - 1) / 7)"
+
+
+def _account_normal(weekly: str) -> str:
+    """CTE `acct` from a CTE of (wk, v), the account metric per window. A window
+    with no rows counts as 0, so a quiet week pulls the median down honestly."""
+    return f"""acct AS (
+  SELECT coalesce(max(CASE WHEN s.wk = 0 THEN a.v END), 0)      AS account_value,
+         percentile(CASE WHEN s.wk > 0 THEN coalesce(a.v, 0) END, 0.5) AS normal
+  FROM (SELECT explode(sequence(0, 4)) AS wk) s LEFT JOIN {weekly} a USING (wk)
+)"""
+
+
+def _vs_account(metric: str) -> str:
+    """SELECT columns: the contributor's share plus the account columns (FROM ... CROSS JOIN acct)."""
+    return (f"round(100 * {metric} / nullif(acct.account_value, 0), 1) AS share_pct,\n"
+            f"       acct.account_value,\n"
+            f"       nullif(acct.normal, 0) AS baseline,\n"
+            f"       round(try_divide(acct.account_value, nullif(acct.normal, 0)), 2) AS vs_normal")
+
+
 HUNTS = [
     # ── H0 · AI ──────────────────────────────────────────────────────────────
     {
@@ -1819,13 +1851,18 @@ ORDER BY 1, 2
 # with the rule for its `kind` (scan.GRADERS). We never invent a dollar figure
 # the query didn't produce.
 #
-# kind "anomaly": grade each row by how unusual it is versus that entity's OWN
-#   normal. The hunt SQL must return, per row:
-#     <metric_col>  this window's value
-#     baseline      the same metric for the same entity over the trailing 28 days
-#                   before this window, at the same period length, floored at the
-#                   workspace's own typical value (see each spec's `baseline` text)
-#     vs_normal     metric / baseline; NULL when the entity has no history (NEW)
+# kind "anomaly": is the ACCOUNT behaving abnormally, and who caused it? The hunt
+#   SQL computes one account-level metric (everything visible in the system
+#   tables) for the current window and for each of the 4 equivalent windows before
+#   it (28 days), then returns the current window's TOP CONTRIBUTORS, largest
+#   first. Every row carries the same account columns:
+#     <metric_col>   this contributor's value in the current window
+#     share_pct      that value as a % of account_value
+#     account_value  the account's metric in the current window
+#     baseline       the account's normal: the median of the 4 prior windows
+#                    (a total for additive metrics, the window's peak for peak
+#                    metrics, see `aggregate`); NULL when that median is 0
+#     vs_normal      account_value / baseline; NULL when there is no normal (NEW)
 #   vs_normal >= ANOMALY_HIGH_X is high, >= ANOMALY_MEDIUM_X is medium, NEW is
 #   medium, anything else is low (no alert).
 # kind "presence": a config state with no time series. Any row is a medium alert.
@@ -1833,13 +1870,14 @@ ORDER BY 1, 2
 
 class AnomalySpec(TypedDict):
     kind: Literal["anomaly"]
-    entity_col: str        # column that names the entity in the headline
-    metric_col: str        # this window's value of the metric
-    metric_label: str
+    aggregate: Literal["additive", "peak"]  # account = sum of contributors, or the window's peak
+    entity_col: str        # column that names the contributor in the headline
+    metric_col: str        # the contributor's value in the current window
+    metric_label: str      # what the account value is
     unit: str              # "usd" | "ratio" | "count" | "tib" | "hours" | "minutes"
-    baseline: str          # plain-English definition of the entity's normal
-    summary: str           # headline; may use {entity} {x} {baseline} {metric} {n}
-    new_summary: str       # headline for an entity with no history; {entity} {metric} {n}
+    baseline: str          # plain-English definition of the account's normal
+    summary: str           # headline; may use {account} {x} {baseline}
+    new_summary: str       # headline when the account has no normal yet; may use {account}
     usd_col: Optional[str]  # a real list-price $ column, or None
 
 
