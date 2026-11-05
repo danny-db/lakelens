@@ -343,18 +343,28 @@ def _failure_reason(e: Exception) -> str:
 def list_models(request: Request):
     """The chat models this workspace serves, for the explainer picker, by display name and
     group. Read straight from the REST API and parsed for the few fields used, so a change in
-    the SDK's endpoint model can't break it. If listing fails, only the configured default is
-    offered, with the reason."""
+    the SDK's endpoint model can't break it. Listed as the user; a sign-in from before the app
+    asked for the model-serving scope can't list them, so the app's own identity lists them
+    instead (the explainer still runs as the user, through SQL). If both fail, only the
+    configured default is offered, with the reason."""
+    client = _client_for(request)
     try:
-        raw = _client_for(request).api_client.do("GET", "/api/2.0/serving-endpoints")
-        listed = [m._asdict() for m in chat_catalogue.chat_models(raw)]
-        return {"models": listed, "groups": chat_catalogue.GROUPS, "default": AI_ENDPOINT, "error": None}
+        raw, source = client.api_client.do("GET", "/api/2.0/serving-endpoints"), "you"
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"list_models failed: {e}")
-        return {"models": [{"id": AI_ENDPOINT, "name": AI_ENDPOINT, "group": chat_catalogue.group_of(AI_ENDPOINT)}],
-                "groups": chat_catalogue.GROUPS, "default": AI_ENDPOINT,
-                "error": f"Couldn't list this workspace's models ({_failure_reason(e)}). "
-                         "Showing the configured default only."}
+        logger.warning(f"list_models as the user failed: {e}")
+        try:
+            if client is sp_client:
+                raise
+            raw, source = sp_client.api_client.do("GET", "/api/2.0/serving-endpoints"), "app"
+        except Exception as e2:  # noqa: BLE001
+            if e2 is not e:
+                logger.warning(f"list_models as the app failed: {e2}")
+            return {"models": [{"id": AI_ENDPOINT, "name": AI_ENDPOINT, "group": chat_catalogue.group_of(AI_ENDPOINT)}],
+                    "groups": chat_catalogue.GROUPS, "default": AI_ENDPOINT, "source": None,
+                    "error": f"Couldn't list this workspace's models ({_failure_reason(e)}). "
+                             "Showing the configured default only."}
+    listed = [m._asdict() for m in chat_catalogue.chat_models(raw)]
+    return {"models": listed, "groups": chat_catalogue.GROUPS, "default": AI_ENDPOINT, "source": source, "error": None}
 
 
 @app.get("/api/whoami")
