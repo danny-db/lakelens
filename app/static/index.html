@@ -1007,7 +1007,7 @@ function fmtNum(v) {
 }
 // heuristic: does a column hold numbers?
 function looksNumeric(col) {
-  return /_ms$|_gib$|_tib$|_usd$|dbus|ratio|mins|_min$|hours|_hour|pct|count|scans|execs|events|runs|clusters|tokens|in_tok|out_tok|node_minutes|sessions|stmts/i.test(col);
+  return /_ms$|_gib$|_tib$|_usd$|dbus|ratio|mins|_min$|hours|_hour|pct|count|scans|execs|events|runs|clusters|tokens|in_tok|out_tok|node_minutes|sessions|stmts|account_value|baseline|vs_normal/i.test(col);
 }
 function isUsdCol(col) { return /_usd$|list_usd|usd/i.test(col); }
 
@@ -1039,7 +1039,7 @@ function renderTable(columns, rows, total) {
       const col = columns[i];
       if (looksNumeric(col) && cell !== null && cell !== "" && !isNaN(Number(cell))) {
         td.className = "num";
-        td.textContent = isUsdCol(col) ? fmtUsd(cell) : fmtNum(cell);
+        td.textContent = isUsdCol(col) ? fmtUsd(cell) : col === "share_pct" ? `${Number(cell).toLocaleString(undefined, {maximumFractionDigits: 1})}%` : fmtNum(cell);
       } else {
         td.textContent = cell === null ? "—" : String(cell);
       }
@@ -1660,11 +1660,11 @@ function alertCard(f) {
   };
   const tr = f.trend ? trendMap[f.trend] : null;
   const trendBadge = tr ? `<span class="trend-badge ${tr.c}">${tr.t}</span>` : "";
-  // How the headline row compares with its own normal. Older saved scans have no `vs`.
+  // How the account compares with its own normal. Older saved scans have no `vs`.
   const vs = f.vs || {};
   const vsBadge = vs.reading === "anomaly" && vs.x != null
-      ? `<span class="vs-normal ${f.severity==='high'?'high':''}" title="this window versus the entity's own usual">${vs.x >= 10 ? Math.round(vs.x).toLocaleString() : vs.x.toFixed(1)}x normal</span>`
-    : vs.reading === "new" ? `<span class="vs-normal new" title="no history for this entity in the prior 28 days">NEW, first seen</span>`
+      ? `<span class="vs-normal ${f.severity==='high'?'high':''}" title="the account this window versus its own usual">${vs.x >= 10 ? Math.round(vs.x).toLocaleString() : vs.x.toFixed(1)}x normal</span>`
+    : vs.reading === "new" ? `<span class="vs-normal new" title="the account has no history for this metric in the prior 28 days">NEW, no prior history</span>`
     : vs.reading === "presence" ? `<span class="vs-normal presence" title="a configuration state, graded by presence">config present</span>` : "";
   const metricLine = vs.reading === "presence" ? ""
     : `<span>${f.metric_label}: <b>${f.metric_value}</b>${vs.baseline ? ` (normal ~${vs.baseline})` : ""}</span>`;
