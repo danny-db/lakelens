@@ -59,7 +59,7 @@ flowchart LR
 | ② **Tune** | 12 best-practice cards: job vs all-purpose compute, serverless, Photon, liquid clustering / PO / zstd, timeouts, policies, spot, AI guardrails, tagging, budgets. [Details](docs/CATALOGUE.md#tune-practices). |
 | ③ **Prove** | 7 measures that show the saving (see below). [Details](docs/CATALOGUE.md#measures). |
 | 🏷️ **Tagging** | Finds untagged warehouses, clusters and spend. You can set a tag in place (confirmed, runs as you). |
-| 💠 **Tokenomics** | Estimates AI cost before the bill: tokens → DBU → $, model comparison, live `list_prices` check, actual 30-day serving spend. |
+| 💠 **Tokenomics** | Estimates AI cost before the bill: tokens → DBU → $ for every model this workspace serves, at Databricks' published rates and the list $/DBU of the SKUs this workspace bills on its own cloud, tier and region. Also the actual 30-day serving spend. |
 | 💬 **Ask** | Natural-language cost questions through Genie One. No setup. Each answer shows its SQL, a result table and a link to open it in Genie One. |
 
 ### The 23 hunts
