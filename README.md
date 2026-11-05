@@ -65,9 +65,9 @@ flowchart LR
 | Category | Hunts |
 |---|---|
 | 🤖 AI & Model Serving | H0 Runaway AI spend |
-| 💤 Idle Compute | H3 Chatter keeps warehouses awake · H4 Warehouses that never sleep · H14 Idle cores · H16 Jobs on all-purpose compute · H18 Idle interactive clusters · H19 Always-on Databricks Apps |
-| 📖 Heavy Reads & Spill | H1 Read amplification · H2 Disk spill · H6 Unusually heavy scan hours by one person · H21 Tables still on snappy (not zstd) |
-| ⏱️ Long-Running & Repetitive | H5 Runaway statements (over 4 hours) · H7 Polling every 20 seconds |
+| 💤 Idle Compute | H3 Chatter keeps warehouses awake · H4 Warehouses that never sleep · H14 Idle cores · H16 Jobs on all-purpose compute · H18 Idle cores on interactive clusters · H19 Databricks Apps compute |
+| 📖 Heavy Reads & Spill | H1 Read amplification · H2 Disk spill · H6 Unusually heavy scan hours across the account · H21 Tables still on snappy (not zstd) |
+| ⏱️ Long-Running & Repetitive | H5 Statements far longer than the account's usual · H7 Repeated short queries (polling) |
 | ⚙️ Right-Sizing & Config | H8 Queue pressure vs capacity · H9 Warehouse config audit · H17 Auto-stop disabled · H22 Serverless jobs in performance-optimised mode |
 | 📈 Spend Trends & Attribution | H10 Spend by product (SKU) · H11 Jobs: weekly movers · H12 Jobs: who got slower? · H13 Cost per pipeline · H20 Frequently failing jobs · H23 Predictive Optimisation cost drivers |
 
@@ -122,14 +122,17 @@ Tip: pin `host`, `warehouse_id` and `results_catalog` in the `prod` target of `d
 | `anomaly_medium_x` | no | `2` | An alert is medium when it is at least this many times its own usual |
 
 ### How alerts are graded
-Each alert compares what an entity (a job, warehouse, person, client, table) did in this window with **its own normal**: the same metric for the same entity over the 28 days before the window, at the same period length. `vs_normal` is that multiple.
+Each alert answers two questions for an admin: is the **account** behaving abnormally, and who caused it?
 
-- **High** at `anomaly_high_x` times its normal (default 3), **medium** at `anomaly_medium_x` (default 2). Anything less raises no alert.
-- **NEW**: an entity with no history in those 28 days is medium, as long as it is at least the workspace's normal size.
-- **Floor**: an entity's normal never counts as smaller than the workspace's own typical value for that metric, so a near-zero normal can't turn noise into a huge multiple. The evidence table's `baseline_from` says which one applied.
+- **The account metric.** Each hunt computes one metric across everything the system tables show (every job, warehouse, person, client or table), for the last 7 days and for each of the four 7-day windows before it. Every window is a full 7 days counted back from now (complete days for billing data), so no window is a partial calendar week.
+- **Its normal.** The account's normal is the median of those four prior windows. Totals (DBUs, hours, $, runs, statements) use the weekly total. Peaks (the busiest hour, the longest statement) use each window's peak. A quiet window counts as 0.
+- **Severity.** `vs_normal` is this window's value over that normal. **High** at `anomaly_high_x` times (default 3), **medium** at `anomaly_medium_x` (default 2). Anything less raises no alert. **NEW**: when the account has no normal yet (the median of the four prior windows is 0), the alert is medium.
+- **Who caused it.** The rows are the top contributors this window, largest first, each with `share_pct` of the account value. For a total the shares add up to the account value; for the busiest hour they split that hour; for the longest statement each row is a source's longest as a % of the account's.
 - **Configuration hunts** (H17 auto-stop disabled, H21 likely-snappy tables) have no time series. Any row is medium.
 
-Because the rule is relative, it works the same in a small workspace and a large one. It catches change, not steady waste: a job that has run on All-Purpose compute every week for months reads about 1x its normal and raises no alert, though it still shows on the Spot tab. Each hunt's baseline is listed in the [catalogue](docs/CATALOGUE.md).
+No hunt hard-codes a size, duration or CPU cut-off: "short" (H7) is the account's own median SELECT duration, and "idle" (H18) weights node-minutes by unused CPU. So the rule works the same in a small account and a large one. It catches change, not steady waste: an account that has run the same All-Purpose jobs every week for months reads about 1x its normal and raises no alert, though the hunt still lists them on the Spot tab. Each hunt's metric and normal are listed in the [catalogue](docs/CATALOGUE.md).
+
+Saved scans show each hunt under its current title and fix, so a renamed hunt never reads under its old name. The headline and metric stay as that scan measured them.
 
 ### What users need
 Every query runs as the signed-in user (on-behalf-of-user), so there are no service-principal grants. Each user needs:

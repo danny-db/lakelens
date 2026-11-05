@@ -34,9 +34,10 @@ def threshold(spec: dict) -> str:
     label = clean(spec["metric_label"])
     if spec["kind"] == "presence":
         return f"{label}: medium whenever a row exists (a configuration state, no magnitude)"
-    return (f"{label} versus its own normal ({clean(spec['baseline'])}): high at "
-            f"{scan.ANOMALY_HIGH_X:g}x, medium at {scan.ANOMALY_MEDIUM_X:g}x; "
-            "an entity with no history is medium")
+    kind = "a total" if spec["aggregate"] == "additive" else "a peak"
+    return (f"{label} ({kind}) versus the account's normal ({clean(spec['baseline'])}): high at "
+            f"{scan.ANOMALY_HIGH_X:g}x, medium at {scan.ANOMALY_MEDIUM_X:g}x, medium when the account has "
+            "no prior history; rows are the top contributors with their share")
 
 
 def measure_title(mid: str) -> str:
