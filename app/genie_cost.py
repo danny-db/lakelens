@@ -53,8 +53,10 @@ INSTRUCTIONS = (
     "compute them by joining system.billing.usage to system.billing.list_prices on sku_name and cloud "
     "where usage_start_time is between price_start_time and coalesce(price_end_time, now()), then "
     "sum(usage_quantity * pricing.effective_list.default). These are pre-discount, pre-cloud-infra list "
-    "costs — say so. Prefer recent windows (last 7/30 days) unless asked otherwise. When you show a cost, "
-    "state the time window."
+    "costs — say so. Prefer recent windows (last 7/30 days) unless asked otherwise, count full days only "
+    "(leave today out, it is still loading), and state the time window when you show a cost. In a table, "
+    "write money as dollars with thousands separators rounded to cents, and leave a cell empty when it "
+    "has no value: never write None or null."
 )
 
 
