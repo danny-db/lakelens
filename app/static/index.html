@@ -1699,7 +1699,7 @@ function alertCard(f) {
           <span class="status-pill st-${st}">${st.replace('_',' ')}</span>
           ${trendBadge}
         </div>
-        <div class="alert-summary">${f.summary}</div>
+        <div class="alert-summary">${escapeHtml(f.summary)}</div>
         <div class="alert-metrics">
           ${vsBadge}
           ${metricLine}
