@@ -2171,8 +2171,9 @@ function fmtCell(v, col) {
     if (c.includes("pct")) return n.toLocaleString(undefined,{maximumFractionDigits:1}) + "%";
     return n.toLocaleString();
   }
+  // names come from users, so escape them; a label ends in the workspace or id that tells it apart, so keep it whole
   const s = String(v);
-  return s.length > 48 ? s.slice(0,46)+"…" : s;
+  return s.length > 96 ? `<span title="${escapeHtml(s)}">${escapeHtml(s.slice(0,94))}…</span>` : escapeHtml(s);
 }
 const NUMHINT = c => { c=String(c).toLowerCase(); return c.includes("usd")||c.includes("saving")||c.includes("cost")||c.includes("spend")||c.includes("price")||c.includes("dbu")||c.includes("token")||c.includes("pct")||c.includes("count")||c.includes("runs")||c.includes("min")||c.includes("statements")||c.includes("requests")||c.includes("node")||c.includes("worker"); };
 
@@ -2182,7 +2183,7 @@ function anomHtml(anoms) {
   return `<div class="anom-wrap">` + anoms.map(a => `
     <div class="anom ${a.severity}">
       <span class="ic">${a.severity==="high"?"🔴":"🟠"}</span>
-      <div><div class="h">${a.headline}</div><div class="d">${a.detail||""}</div></div>
+      <div><div class="h">${escapeHtml(a.headline)}</div><div class="d">${escapeHtml(a.detail||"")}</div></div>
     </div>`).join("") + `</div>`;
 }
 
