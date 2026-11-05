@@ -593,6 +593,7 @@
     <button data-page="obs-jobs"><span class="nav-ic">⚙️</span> Jobs</button>
     <button data-page="obs-dbsql"><span class="nav-ic">🗂️</span> DBSQL</button>
     <button data-page="obs-serving"><span class="nav-ic">🧠</span> Model Serving</button>
+    <button data-page="obs-econ"><span class="nav-ic">🧮</span> Unit economics</button>
     <div class="nav-label">③ Attribute</div>
     <button data-page="tagging"><span class="nav-ic">🏷️</span> Tagging</button>
     <div class="nav-label">④ Estimate</div>
@@ -782,6 +783,7 @@
   <section class="page" id="page-obs-jobs"></section>
   <section class="page" id="page-obs-dbsql"></section>
   <section class="page" id="page-obs-serving"></section>
+  <section class="page" id="page-obs-econ"></section>
 
   <!-- ── ASK (embedded Genie) ── -->
   <section class="page" id="page-ask">
@@ -2234,6 +2236,19 @@ function _boardChartDraw(panel, cols, rows, host, cid) {
     cfg = { type:"line", data:{ labels, datasets:[{ label: cols[cols.length-1], data: rows.map(r=>Number(r[r.length-1])),
               borderColor:BOARD_PALETTE[0], backgroundColor:BOARD_PALETTE[0]+"22", borderWidth:2, tension:.3, pointRadius:2, fill:true }] },
       options: baseOpts(muted, baseScales) };
+  } else if (chart === "lines") {
+    // rows = [period, metric_a, metric_b, ...]: one line per metric column. The metrics sit
+    // orders of magnitude apart (cents per query, hundreds per TiB), so the value axis is
+    // logarithmic: every line stays readable and a doubling is the same height on each.
+    const labels = rows.map(r => String(r[0]).slice(0,10));
+    const datasets = cols.slice(1).map((c, i) => ({ label: c,
+      data: rows.map(r => r[i+1] == null ? null : Number(r[i+1])),
+      borderColor: BOARD_PALETTE[i % BOARD_PALETTE.length], backgroundColor: "transparent",
+      borderWidth: 2, tension: .3, pointRadius: 2, spanGaps: true }));
+    cfg = { type:"line", data:{ labels, datasets },
+      options: baseOpts(muted, { x: baseScales.x, y: { type:"logarithmic", grid:{ color:grid },
+        ticks:{ color:tick, font:{size:10, family:"DM Mono"},
+          callback(v, i, ticks) { const s = Chart.Ticks.formatters.logarithmic.call(this, v, i, ticks); return s ? "$" + s : ""; } } } }) };
   } else if (chart === "bar") {
     // Many categories → horizontal bars (readable labels). With indexAxis:"y" Chart.js
     // swaps axes, so the $-formatter must go on the VALUE axis (x when horizontal),
@@ -2601,7 +2616,7 @@ $$("#nav button").forEach(b => b.addEventListener("click", () => {
   $$(".page").forEach(p => p.classList.remove("active"));
   $(`#page-${b.dataset.page}`).classList.add("active");
   // lazy-build observability boards on first view
-  const m = /^obs-(usage|jobs|dbsql|serving)$/.exec(b.dataset.page);
+  const m = /^obs-(usage|jobs|dbsql|serving|econ)$/.exec(b.dataset.page);
   if (m) buildBoard(m[1]);
   if (b.dataset.page === "ask") buildAsk();   // lazy-init the Genie tab on first view
   window.scrollTo({top:0, behavior:"smooth"});

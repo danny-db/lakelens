@@ -49,6 +49,8 @@ flowchart LR
 
 📖 **[Full catalogue](docs/CATALOGUE.md)**: every hunt, Tune practice and measure, with what it finds, how to read it, what to do, how it is graded and the system tables it reads.
 
+🧮 **[Unit economics](docs/UNIT-ECONOMICS.md)**: cost per query, per active user and per TiB read, and the effective discount, from system tables only. Also a [Genie One skill](docs/skills/unit-economics/SKILL.md).
+
 | Tab | What it does |
 |---|---|
 | 🚨 **Alerts** | **Run full cost scan** runs every hunt in the background and builds an alert queue: severity, plain-English explanation, recommended fix, and the measure that proves it. Work it as *acknowledge → in progress → resolve / dismiss*. Results are saved to Delta and shared. Each run is compared with the last (NEW / WORSE / BETTER / FLAT, or DEFINITION CHANGED when a hunt now measures something different, so the two numbers are not compared). It also shows what the scan itself cost, and exports to PDF. |
