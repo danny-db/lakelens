@@ -2210,6 +2210,17 @@ function inferChart(cols, rows) {
   return { chart, _labIdx: labIdx, _valIdx: valIdx, _topN: topN };
 }
 
+// rows = [period, group, value]: the periods, a "period|group" → value index, and the groups ranked
+// by their total over every period, the top n named and the rest left for one "Other" series.
+function groupRows(rows, n) {
+  const periods=[...new Set(rows.map(r=>String(r[0]).slice(0,10)))].sort();
+  const idx={}; const groupTotal={};
+  rows.forEach(r=>{ const g=String(r[1]); const v=Number(r[2])||0;
+    idx[String(r[0]).slice(0,10)+"|"+g]=v; groupTotal[g]=(groupTotal[g]||0)+v; });
+  const ranked=Object.keys(groupTotal).sort((a,b)=>groupTotal[b]-groupTotal[a]);
+  return { periods, idx, named: ranked.slice(0,n), rest: ranked.slice(n) };
+}
+
 function boardChart(panel, cols, rows, host, cid) {
   // If called from Ask with _labIdx/_valIdx, project rows to [label, value] first so the
   // generic line/bar branches (which assume col0=label, last=value) work on any result shape.
@@ -2234,7 +2245,16 @@ function _boardChartDraw(panel, cols, rows, host, cid) {
   const chart = panel.chart;
   let cfg;
 
-  if (chart === "line") {
+  if (chart === "line" && cols.length > 2) {
+    // rows = [period, group, value]: one line per group, the top 8 by total and the rest summed into "Other"
+    const {periods, idx, named, rest} = groupRows(rows, 8);
+    const line = (label, data, color, dash) => ({ label, data, borderColor:color, borderDash:dash,
+      backgroundColor:"transparent", borderWidth:2, tension:.3, pointRadius:2 });
+    const datasets = named.map((g,i)=>line(g, periods.map(p=>idx[p+"|"+g] ?? 0), BOARD_PALETTE[i%BOARD_PALETTE.length]));
+    if (rest.length) datasets.push(line(`Other (${rest.length})`,
+      periods.map(p=>rest.reduce((s,g)=>s+(idx[p+"|"+g]||0),0)), "#5b6b7a", [4,3]));
+    cfg = { type:"line", data:{ labels:periods, datasets }, options: baseOpts(muted, baseScales) };
+  } else if (chart === "line") {
     const labels = rows.map(r => String(r[0]).slice(0,10));
     cfg = { type:"line", data:{ labels, datasets:[{ label: cols[cols.length-1], data: rows.map(r=>Number(r[r.length-1])),
               borderColor:BOARD_PALETTE[0], backgroundColor:BOARD_PALETTE[0]+"22", borderWidth:2, tension:.3, pointRadius:2, fill:true }] },
@@ -2272,12 +2292,7 @@ function _boardChartDraw(panel, cols, rows, host, cid) {
     // Rank groups by TOTAL across all periods, name the top 8, and roll EVERYTHING
     // else into an "Other" band — so nothing (incl. a flagged small product) is
     // hidden and each bar's total stays honest (matches the trend chart).
-    const periods=[...new Set(rows.map(r=>String(r[0]).slice(0,10)))].sort();
-    const idx={}; const groupTotal={};
-    rows.forEach(r=>{ const g=String(r[1]); const v=Number(r[2])||0;
-      idx[String(r[0]).slice(0,10)+"|"+g]=v; groupTotal[g]=(groupTotal[g]||0)+v; });
-    const ranked=Object.keys(groupTotal).sort((a,b)=>groupTotal[b]-groupTotal[a]);
-    const named=ranked.slice(0,8), rest=ranked.slice(8);
+    const {periods, idx, named, rest} = groupRows(rows, 8);
     const datasets=named.map((g,i)=>({ label:g.length>20?g.slice(0,18)+"…":g, _full:g,
       data:periods.map(p=>idx[p+"|"+g] ?? 0), backgroundColor:BOARD_PALETTE[i%BOARD_PALETTE.length], borderRadius:3 }));
     if (rest.length) {   // "Other" = sum of every remaining group, per period
