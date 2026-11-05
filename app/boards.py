@@ -24,6 +24,7 @@ de-parameterised (the dashboards are parameter-bound; the app is not).
 """
 from typing import NamedTuple, Optional
 
+from names import JOB, WORKSPACE, ctes, ref
 from scan import ANOMALY_HIGH_X, ANOMALY_MEDIUM_X
 
 # ── Anomaly detectors ─────────────────────────────────────────────────────────
@@ -510,6 +511,10 @@ GROUP BY s.wk ORDER BY week
 # value = last numeric column — the frontend infers from `chart` + column types.
 # "lines" draws one line per column after the first, on a log axis.
 
+# The job-cluster panels label from job_clusters jc, the most expensive queries from alloc a (names.py).
+JOB_JC, CLUSTER_JC = ref("job", "jc.job_id", "jc.workspace_id"), ref("cluster", "jc.cluster_id", "jc.workspace_id")
+WAREHOUSE_A = ref("warehouse", "a.warehouse_id", "a.workspace_id")
+
 BOARDS = [
     # ══════════════════════════════════════════════════════════════════════════
     # USAGE — total spend, by SKU, by workspace, and an AI forecast.
@@ -658,23 +663,25 @@ ORDER BY 1, list_usd DESC
                 "chart": "bar",
                 "anomaly": {"type": "rank_outlier", "value_col": "list_usd",
                             "label_col": "workspace", "unit": "usd"},
-                "sql": """
+                "sql": f"""
 WITH price AS (
   SELECT sku_name, cloud, price_start_time, price_end_time,
          pricing.effective_list.default AS unit_usd
   FROM system.billing.list_prices
 ),
-ws AS (SELECT workspace_id, max(workspace_name) AS workspace_name
-       FROM system.access.workspaces_latest GROUP BY 1)
-SELECT coalesce(w.workspace_name, concat('id:', u.workspace_id)) AS workspace,
-       round(sum(u.usage_quantity * pr.unit_usd), 2)             AS list_usd
-FROM system.billing.usage u
-LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
-  AND u.usage_start_time >= pr.price_start_time
-  AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
-LEFT JOIN ws w ON u.workspace_id = w.workspace_id
-WHERE u.usage_date >= current_date() - INTERVAL 30 DAYS
-GROUP BY 1 ORDER BY list_usd DESC NULLS LAST LIMIT 20
+{ctes("workspace")},
+spend AS (
+  SELECT u.workspace_id, round(sum(u.usage_quantity * pr.unit_usd), 2) AS list_usd
+  FROM system.billing.usage u
+  LEFT JOIN price pr ON u.sku_name = pr.sku_name AND u.cloud = pr.cloud
+    AND u.usage_start_time >= pr.price_start_time
+    AND (pr.price_end_time IS NULL OR u.usage_start_time < pr.price_end_time)
+  WHERE u.usage_date >= current_date() - INTERVAL 30 DAYS
+  GROUP BY 1
+)
+SELECT {WORKSPACE.label} AS workspace, c.list_usd, c.workspace_id
+FROM spend c {WORKSPACE.join}
+ORDER BY c.list_usd DESC NULLS LAST LIMIT 20
 """,
             },
             {
@@ -749,12 +756,12 @@ ORDER BY week
                         "floor.",
                 "anomaly": {"type": "rank_outlier", "value_col": "est_monthly_saving_usd",
                             "label_col": "job_name", "unit": "usd"},
-                "sql": """
+                "sql": f"""
 WITH price AS (
   SELECT sku_name, cloud, usage_unit, price_start_time, price_end_time,
          pricing.effective_list.default AS unit_usd FROM system.billing.list_prices
 ),
-job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
+{ctes("job")},
 ap_clusters AS (   -- all-purpose clusters (interactive), latest config
   SELECT workspace_id, cluster_id FROM (
     SELECT workspace_id, cluster_id, cluster_source
@@ -804,12 +811,12 @@ job_spend AS (
          sum((ap_usd - jobs_usd) * share) AS saving_usd_30d
   FROM job_share GROUP BY 1,2
 )
-SELECT coalesce(jn.job_name, CAST(s.job_id AS STRING)) AS job_name,
-       round(s.ap_usd_30d, 2)                          AS all_purpose_usd_30d,
-       round(s.saving_usd_30d, 2)                      AS est_monthly_saving_usd
-FROM job_spend s
-LEFT JOIN job_names jn ON s.workspace_id=jn.workspace_id AND s.job_id=jn.job_id
-WHERE s.saving_usd_30d > 0
+SELECT {JOB.label}                                   AS job_name,
+       round(c.ap_usd_30d, 2)                          AS all_purpose_usd_30d,
+       round(c.saving_usd_30d, 2)                      AS est_monthly_saving_usd,
+       c.job_id
+FROM job_spend c {JOB.join}
+WHERE c.saving_usd_30d > 0
 ORDER BY est_monthly_saving_usd DESC LIMIT 25
 """,
             },
@@ -827,8 +834,8 @@ ORDER BY est_monthly_saving_usd DESC LIMIT 25
                                         "typical large job cluster",
                             "detail": "Typical: {typical} CPU. Lowest: “{worst}” at {value}, {x} below "
                                       "typical. These are the rows worth acting on first."},
-                "sql": """
-WITH job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
+                "sql": f"""
+WITH {ctes("job")},
 job_clusters AS (
   SELECT DISTINCT t.workspace_id, t.job_id, exploded.cluster_id
   FROM system.lakeflow.job_task_run_timeline t
@@ -848,15 +855,15 @@ large AS (   -- the largest tenth of job clusters by node-minutes, where idle co
   SELECT * FROM cpu WHERE node_minutes >= (SELECT percentile_approx(node_minutes, 0.9) FROM cpu)
 ),
 typical AS (SELECT percentile_approx(cpu_pct, 0.5) AS typical_cpu_pct FROM large)
-SELECT coalesce(jn.job_name, CAST(jc.job_id AS STRING)) AS job_name,
+SELECT {JOB_JC.label}                                AS job_name,
        round(l.cpu_pct, 1)                                  AS avg_cpu_pct,
        round(t.typical_cpu_pct, 1)                          AS typical_cpu_pct,
        round(try_divide(t.typical_cpu_pct, l.cpu_pct), 1)   AS times_below_typical,
-       l.node_minutes
+       l.node_minutes, jc.job_id
 FROM job_clusters jc
 JOIN large l ON jc.cluster_id = l.cluster_id
 CROSS JOIN typical t
-LEFT JOIN job_names jn ON jc.workspace_id=jn.workspace_id AND jc.job_id=jn.job_id
+{JOB_JC.join}
 ORDER BY l.cpu_pct ASC, l.node_minutes DESC LIMIT 10
 """,
             },
@@ -874,8 +881,8 @@ ORDER BY l.cpu_pct ASC, l.node_minutes DESC LIMIT 10
                                         "your typical large job cluster",
                             "detail": "Typical: {typical} free. Tightest: “{worst}” at {value} free, "
                                       "{x} less headroom. These are the rows worth acting on first."},
-                "sql": """
-WITH job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
+                "sql": f"""
+WITH {ctes("job")},
 job_clusters AS (
   SELECT DISTINCT t.workspace_id, t.job_id, exploded.cluster_id
   FROM system.lakeflow.job_task_run_timeline t
@@ -895,17 +902,17 @@ large AS (   -- the largest tenth of job clusters by node-minutes
   SELECT * FROM mem WHERE node_minutes >= (SELECT percentile_approx(node_minutes, 0.9) FROM mem)
 ),
 typical AS (SELECT percentile_approx(100 - mem_pct, 0.5) AS typical_free_mem_pct FROM large)
-SELECT coalesce(jn.job_name, CAST(jc.job_id AS STRING)) AS job_name,
+SELECT {JOB_JC.label}                                           AS job_name,
        round(l.mem_pct, 1)                                             AS avg_mem_pct,
        round(l.peak_mem_pct, 1)                                        AS peak_mem_pct,
        round(100 - l.mem_pct, 1)                                       AS free_mem_pct,
        round(t.typical_free_mem_pct, 1)                                AS typical_free_mem_pct,
        round(try_divide(t.typical_free_mem_pct, 100 - l.mem_pct), 1)   AS times_less_headroom,
-       l.node_minutes
+       l.node_minutes, jc.job_id
 FROM job_clusters jc
 JOIN large l ON jc.cluster_id = l.cluster_id
 CROSS JOIN typical t
-LEFT JOIN job_names jn ON jc.workspace_id=jn.workspace_id AND jc.job_id=jn.job_id
+{JOB_JC.join}
 ORDER BY l.mem_pct DESC LIMIT 10
 """,
             },
@@ -916,8 +923,8 @@ ORDER BY l.mem_pct DESC LIMIT 10
                         "for light runs or grow for heavy ones. Autoscaling usually saves money.",
                 "chart": "table",
                 "anomaly": None,
-                "sql": """
-WITH job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
+                "sql": f"""
+WITH {ctes("job", "cluster")},
 job_clusters AS (
   SELECT DISTINCT t.workspace_id, t.job_id, exploded.cluster_id
   FROM system.lakeflow.job_task_run_timeline t
@@ -926,17 +933,18 @@ job_clusters AS (
     AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
 ),
 cfg AS (
-  SELECT workspace_id, cluster_id, cluster_name, worker_count,
+  SELECT workspace_id, cluster_id, worker_count,
          min_autoscale_workers, max_autoscale_workers, worker_node_type
   FROM system.compute.clusters
   QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC)=1
 )
-SELECT coalesce(jn.job_name, CAST(jc.job_id AS STRING)) AS job_name,
-       coalesce(cfg.cluster_name, jc.cluster_id)        AS cluster_name,
-       cfg.worker_count, cfg.worker_node_type
+SELECT {JOB_JC.label}                            AS job_name,
+       {CLUSTER_JC.label}                        AS cluster_name,
+       cfg.worker_count, cfg.worker_node_type, jc.job_id, jc.cluster_id
 FROM job_clusters jc
 JOIN cfg ON jc.workspace_id=cfg.workspace_id AND jc.cluster_id=cfg.cluster_id
-LEFT JOIN job_names jn ON jc.workspace_id=jn.workspace_id AND jc.job_id=jn.job_id
+{JOB_JC.join}
+{CLUSTER_JC.join}
 WHERE cfg.min_autoscale_workers IS NULL AND cfg.max_autoscale_workers IS NULL
   AND cfg.worker_count >= 1
 ORDER BY cfg.worker_count DESC LIMIT 50
@@ -950,8 +958,8 @@ ORDER BY cfg.worker_count DESC LIMIT 50
                         "faster and get Photon/security fixes — upgrading is often free speed.",
                 "chart": "table",
                 "anomaly": None,
-                "sql": """
-WITH job_names AS (SELECT workspace_id, job_id, max(name) AS job_name FROM system.lakeflow.jobs GROUP BY 1,2),
+                "sql": f"""
+WITH {ctes("job", "cluster")},
 job_clusters AS (
   SELECT DISTINCT t.workspace_id, t.job_id, exploded.cluster_id
   FROM system.lakeflow.job_task_run_timeline t
@@ -960,7 +968,7 @@ job_clusters AS (
     AND t.compute_ids IS NOT NULL AND array_size(t.compute_ids) > 0
 ),
 cfg AS (
-  SELECT workspace_id, cluster_id, cluster_name, dbr_version,
+  SELECT workspace_id, cluster_id, dbr_version,
          try_cast(regexp_extract(dbr_version, '^(\\\\d+)\\\\.', 1) AS INT) AS major
   FROM system.compute.clusters
   QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC)=1
@@ -970,13 +978,14 @@ fleet AS (   -- the major your typical job cluster runs: the median over the job
   FROM (SELECT DISTINCT workspace_id, cluster_id FROM job_clusters) jc
   JOIN cfg ON jc.workspace_id=cfg.workspace_id AND jc.cluster_id=cfg.cluster_id
 )
-SELECT coalesce(jn.job_name, CAST(jc.job_id AS STRING)) AS job_name,
-       coalesce(cfg.cluster_name, jc.cluster_id)        AS cluster_name,
-       cfg.dbr_version, f.typical_major
+SELECT {JOB_JC.label}                            AS job_name,
+       {CLUSTER_JC.label}                        AS cluster_name,
+       cfg.dbr_version, f.typical_major, jc.job_id, jc.cluster_id
 FROM job_clusters jc
 JOIN cfg ON jc.workspace_id=cfg.workspace_id AND jc.cluster_id=cfg.cluster_id
 CROSS JOIN fleet f
-LEFT JOIN job_names jn ON jc.workspace_id=jn.workspace_id AND jc.job_id=jn.job_id
+{JOB_JC.join}
+{CLUSTER_JC.join}
 WHERE cfg.major < f.typical_major
 ORDER BY cfg.major ASC, job_name LIMIT 50
 """,
@@ -1104,8 +1113,9 @@ FROM alloc GROUP BY 1 ORDER BY query_usd DESC NULLS LAST
                         "The warehouse column shows which one ran it.",
                 "anomaly": {"type": "rank_outlier", "value_col": "query_usd",
                             "label_col": "executed_by", "unit": "usd"},
-                "sql": """
-WITH wh_hour AS (
+                "sql": f"""
+WITH {ctes("warehouse")},
+wh_hour AS (
   SELECT warehouse_id, hour, sum(usage_quantity * unit_usd) AS hour_usd FROM (
     SELECT u.usage_metadata.warehouse_id AS warehouse_id,
            date_trunc('HOUR', u.usage_start_time) AS hour,
@@ -1120,8 +1130,6 @@ WITH wh_hour AS (
 cfg AS (SELECT warehouse_id, max_clusters, change_time AS vf,
           coalesce(lead(change_time) OVER (PARTITION BY warehouse_id ORDER BY change_time), TIMESTAMP '9999-12-31') AS vt
         FROM system.compute.warehouses),
-wh_name AS (SELECT warehouse_id, warehouse_name FROM system.compute.warehouses
-            QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC)=1),
 ws AS (SELECT workspace_id, max(workspace_url) AS workspace_url FROM system.access.workspaces_latest GROUP BY 1),
 q AS (
   SELECT statement_id, workspace_id, compute.warehouse_id AS warehouse_id, date_trunc('HOUR', start_time) AS hour,
@@ -1148,12 +1156,12 @@ alloc AS (
          LEFT JOIN cfg c ON c.warehouse_id=q.warehouse_id AND q.hour>=c.vf AND q.hour<c.vt
 )
 SELECT a.statement_id, a.executed_by,
-       coalesce(wn.warehouse_name, a.warehouse_id)              AS warehouse,
+       {WAREHOUSE_A.label}                                      AS warehouse, a.warehouse_id,
        a.source_type, a.source_id, a.statement_type,
        round(a.execution_duration_ms/60000.0, 2)                    AS exec_min,
        round(a.hour_usd * a.execution_duration_ms / a.capacity_ms, 2) AS query_usd,
        ws.workspace_url   -- the workspace this statement actually ran in (system tables span the whole account)
-FROM alloc a LEFT JOIN wh_name wn ON a.warehouse_id = wn.warehouse_id
+FROM alloc a {WAREHOUSE_A.join}
              LEFT JOIN ws ON a.workspace_id = ws.workspace_id
 ORDER BY query_usd DESC NULLS LAST LIMIT 50
 """,
