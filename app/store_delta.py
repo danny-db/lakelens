@@ -22,6 +22,8 @@ import random
 import time
 from typing import Optional, Callable
 
+import hunts as catalogue
+
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -174,13 +176,13 @@ class DeltaStore:
                     ev = json.loads(x[12]) if x[12] else {}
                 except Exception:
                     ev = {}
-                findings.append({
+                findings.append(_with_current_text({
                     "hunt_id": x[0], "title": x[1], "category": x[2], "severity": x[3],
                     "summary": x[4], "metric_label": x[5], "metric_value": x[6],
                     "impact_usd": _f(x[7]), "total_rows": int(x[8] or 0), "measure": x[9] or None,
                     "action": x[10], "explanation": x[11] or None, "vs": ev.pop("vs", None), "evidence": ev,
                     "metric_num": _f(x[13]),
-                })
+                }))
             return {
                 "scan_id": r[0], "started_at": str(r[1]), "ended_at": str(r[2]),
                 "started_by": r[3], "total": int(r[4] or 0),
@@ -233,6 +235,21 @@ class DeltaStore:
             return {r[0]: {"status": r[1], "note": r[2] or "", "updated_by": r[3] or ""} for r in out["rows"]}
         except Exception:  # noqa: BLE001
             return {}
+
+
+_HUNTS_BY_ID = {h["id"]: h for h in catalogue.HUNTS}
+
+
+def _with_current_text(f: dict) -> dict:
+    """A saved finding shows the hunt as the catalogue describes it now (title, category,
+    fix, measure, eli5), so a renamed hunt never reads under its old name. The stored text
+    is the fallback for a hunt that no longer exists. summary, metric_label and
+    metric_value stay as saved: they describe the number that scan measured."""
+    h = _HUNTS_BY_ID.get(f["hunt_id"])
+    if h:
+        f.update(title=h["title"], category=h["category"], action=h["action"],
+                 measure=h.get("measure"), eli5=h["eli5"])
+    return f
 
 
 def _f(x) -> Optional[float]:
