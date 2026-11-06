@@ -433,11 +433,12 @@ ECON_KPIS = [
     Kpi("Cost per MAU, humans", "kpi", _usd("m.a_net_usd / nullif(m.mau_human, 0)", 2),
         _share("m.a_list_usd", "m.list_usd", "spend"),
         "Spend of the workspaces in the audit log / monthly active people, the audit identities that are emails"),
-    Kpi("Cost per TiB of data under management", "kpi",
-        f"CASE WHEN m.stored_tib > 0 THEN {_usd('m.net_usd / m.stored_tib', 2)} ELSE '' END",
+    Kpi("Cost per TiB of data under management, per month", "kpi",
+        f"CASE WHEN m.stored_tib > 0 THEN {_usd('m.net_usd / m.days * 30 / m.stored_tib', 2)} ELSE '' END",
         f"CASE WHEN m.stored_tib IS NULL THEN {_NO_STORAGE} "
-        f"ELSE concat('all spend · ', {_count('m.stored_tables', ' tables')}) END",
-        "Total spend / total TiB of table data in this metastore"),
+        f"ELSE concat('all spend / table data, not a storage price · ', {_count('m.stored_tables', ' tables')}) END",
+        "Total spend for a 30-day month / total TiB of table data in this metastore. It sets all platform "
+        "spend (compute, AI, apps) against the data you hold, so it is not what storage costs"),
     Kpi("Window", "input", "concat(m.start_date, ' to ', m.end_date)", "''",
         "28 full days, ending on the newest day whose billing has finished landing"),
     Kpi("Total spend", "input", _usd("m.net_usd"), _count("m.workspaces", " workspaces"),
@@ -503,6 +504,7 @@ users AS (
 ),
 m AS (   -- one row; each ratio's spend is limited to the workspaces its denominator can see
   SELECT max(w.start_date) AS start_date, max(w.end_date) AS end_date,
+         max(datediff(w.end_date, w.start_date)) + 1 AS days,
          sum(s.list_usd) AS list_usd, sum(s.net_usd) AS net_usd,
          sum(s.priced_list_usd) AS priced_list_usd, sum(s.priced_acct_usd) AS priced_acct_usd,
          sum(s.unpriced_rows) AS unpriced_rows,
@@ -556,7 +558,7 @@ users AS (SELECT floor(days_back / 7) AS wk, approx_count_distinct(identity) AS 
           FROM ids GROUP BY 1)
 SELECT date_sub(max(w.end_date), CAST(s.wk AS INT) * 7) AS week,
        round(sum(CASE WHEN q.queries > 0 THEN s.usd END) / sum(q.queries), 4) AS `cost per query`,
-       round(sum(s.usd) / nullif(max(st.tib), 0), 2) AS `cost per TiB under management`,
+       round(sum(s.usd) / 7 * 30 / nullif(max(st.tib), 0), 2) AS `cost per TiB managed, per month`,
        round(sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.usd END) / max(u.wau), 2)
          AS `cost per weekly active user`
 FROM spend s
@@ -1486,22 +1488,23 @@ ORDER BY query_usd DESC NULLS LAST LIMIT 10
             {
                 "id": "trend",
                 "title": "Weekly unit costs (12 weeks)",
-                "eli5": "Cost per query, per TiB of data under management and per weekly active user, one "
-                        "7-day bucket at a time, ending where the table above ends. A unit cost jumping "
-                        "above its own normal means the same work got pricier.",
+                "eli5": "Cost per query, per TiB of data under management (a week's spend scaled to a "
+                        "30-day month, like the tile above) and per weekly active user, one 7-day bucket "
+                        "at a time, ending where the table above ends. A unit cost jumping above its own "
+                        "normal means the same work got pricier.",
                 "chart": "lines",
                 "note": "Weekly buckets do not overlap, so a jump shows in full in the week it happens. "
                         "The user ratio uses weekly active users for that reason: a rolling monthly count "
                         "would spread one bad week across four.",
-                "short_series": {"column": "cost per TiB under management",
-                                 "notice": "Cost per TiB under management has {weeks} so far, because "
+                "short_series": {"column": "cost per TiB managed, per month",
+                                 "notice": "Cost per TiB managed has {weeks} so far, because "
                                            "system.storage.table_metrics_history only holds recent "
                                            "snapshots. Its line draws from its second week.",
-                                 "unreadable": "Cost per TiB under management needs "
+                                 "unreadable": "Cost per TiB managed needs "
                                                "system.storage.table_metrics_history, which this account "
                                                "can't read."},
                 "anomaly": {"type": "ts_spike", "time_col": "week", "unit": "usd",
-                            "value_cols": ["cost per query", "cost per TiB under management",
+                            "value_cols": ["cost per query", "cost per TiB managed, per month",
                                            "cost per weekly active user"]},
                 "sql": _econ_trend_sql(True),
                 "without_storage": _econ_trend_sql(False),

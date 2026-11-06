@@ -148,7 +148,7 @@ class UnitEconomicsTable(unittest.TestCase):
         cols, rows, extra = self.shown(priced=False)
         self.assertEqual([t["metric"] for t in extra["tiles"]],
                          ["Cost per query", "Cost per MAU, all identities", "Cost per MAU, humans",
-                          "Cost per TiB of data under management"])
+                          "Cost per TiB of data under management, per month"])
         self.assertEqual(cols, ["metric", "value", "coverage", "definition"])
         self.assertNotIn("Cost per query", [r[0] for r in rows])
         self.assertTrue(all(t["definition"] for t in extra["tiles"]))
@@ -165,7 +165,7 @@ class UnitEconomicsTable(unittest.TestCase):
 
     def test_a_one_week_storage_series_says_why_it_is_a_dot(self):
         _, panel = boards.find_panel("econ", "trend")
-        cols = ["week", "cost per query", "cost per TiB under management", "cost per weekly active user"]
+        cols = ["week", "cost per query", "cost per TiB managed, per month", "cost per weekly active user"]
         rows = [["2026-10-28", "0.03", None, "68.7"], ["2026-11-04", "0.04", "5975.52", "67.3"]]
         self.assertIn("one week so far", boards.present(panel, cols, rows)[2]["notice"])
         self.assertIn("can't read", boards.present(panel, cols, rows, storage=False)[2]["notice"])

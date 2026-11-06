@@ -7,7 +7,7 @@ works in any account with system tables enabled. The same SQL also ships as a Ge
 `tools/gen_unit_economics_skill.py` writes from `app/boards.py`. A test fails when the two drift.
 
 The board opens with four tiles: cost per query, cost per MAU (all identities), cost per MAU
-(humans) and cost per TiB of data under management. Each tile has an ⓘ that shows its definition on
+(humans) and cost per TiB of data under management, per month. Each tile has an ⓘ that shows its definition on
 hover and keeps it open on tap. The raw inputs they are built from sit in the table underneath.
 
 ## The window
@@ -56,13 +56,17 @@ is.
 | Cost per query | Spend of query workspaces / finished queries | Counts every finished query, including tiny metadata reads, so it is a fleet average. |
 | Cost per MAU, all identities | Spend of audit workspaces / distinct audit identities | People and service principals both count. |
 | Cost per MAU, humans | Spend of audit workspaces / identities that are emails | An email-like identity is a person; a UUID is a service principal. |
-| Cost per TiB of data under management | Total spend / total TiB of table data | See below. |
+| Cost per TiB of data under management, per month | Total spend for a 30-day month (the window's spend / its days × 30) / total TiB of table data | See below. |
 | Effective discount | 1 - account-priced spend / list spend, on SKUs with an account price | Shown only when the account has prices; partial with some. |
 
 **Data under management** comes from `system.storage.table_metrics_history`: each table at its
 newest snapshot in the window, unless it was dropped by the window's end, at its total size
 (`total_bytes`, active plus vacuumable files) where the table reports one and its `active_bytes`
-otherwise. Cost per TiB is total spend over that volume. The table lists only the current region's
+otherwise. Cost per TiB is a month of total spend over that volume. It sets all platform spend
+(compute, AI, apps) against the data held, so it is not a storage price, and the tile says so. On an
+account whose spend is mostly AI or apps and whose data is small, such as a demo account, it reads
+very high; on a data-heavy production account it reads in the low hundreds of dollars per TiB. The
+table lists only the current region's
 metastore, while total spend covers every workspace, so on an account with workspaces in several
 regions the ratio reads high. It is a new system table: on one large demo account its history began
 a week before this was written and was still filling in, and `total_bytes` was empty, so the board
@@ -85,8 +89,8 @@ warehouses, so serverless comes from `is_serverless`).
 The trend plots cost per query, cost per TiB of data under management and cost per weekly active
 user over twelve non-overlapping weeks, on a logarithmic axis because the three sit orders of
 magnitude apart. Weekly active users stand in for MAU there: a rolling 28-day count would spread one
-bad week across four and hide the jump. Cost per TiB under management is each week's total spend over
-that week's data volume. Its line starts when the table metrics history does, and while it has fewer
+bad week across four and hide the jump. Cost per TiB under management is each week's total spend,
+scaled to a 30-day month, over that week's data volume, so its last point matches the tile. Its line starts when the table metrics history does, and while it has fewer
 than two weeks the panel says so, because one point can't draw a line.
 
 The detector compares the latest week of each cost with the median of its earlier weeks. A week at

@@ -111,6 +111,7 @@ users AS (
 ),
 m AS (   -- one row; each ratio's spend is limited to the workspaces its denominator can see
   SELECT max(w.start_date) AS start_date, max(w.end_date) AS end_date,
+         max(datediff(w.end_date, w.start_date)) + 1 AS days,
          sum(s.list_usd) AS list_usd, sum(s.net_usd) AS net_usd,
          sum(s.priced_list_usd) AS priced_list_usd, sum(s.priced_acct_usd) AS priced_acct_usd,
          sum(s.unpriced_rows) AS unpriced_rows,
@@ -144,8 +145,8 @@ SELECT inline(array(
   named_struct('metric', 'Cost per MAU, humans', 'kind', 'kpi', 'value', concat('$', format_number(m.a_net_usd / nullif(m.mau_human, 0), 2)),
                'coverage', concat(format_number(100 * m.a_list_usd / nullif(m.list_usd, 0), 1), '% of spend'), 'definition', 'Spend of the workspaces in the audit log / monthly active people, the audit identities that are emails',
                'has_account_prices', m.priced_list_usd IS NOT NULL),
-  named_struct('metric', 'Cost per TiB of data under management', 'kind', 'kpi', 'value', CASE WHEN m.stored_tib > 0 THEN concat('$', format_number(m.net_usd / m.stored_tib, 2)) ELSE '' END,
-               'coverage', CASE WHEN m.stored_tib IS NULL THEN 'needs system.storage.table_metrics_history' ELSE concat('all spend · ', concat(format_number(m.stored_tables, 0), ' tables')) END, 'definition', 'Total spend / total TiB of table data in this metastore',
+  named_struct('metric', 'Cost per TiB of data under management, per month', 'kind', 'kpi', 'value', CASE WHEN m.stored_tib > 0 THEN concat('$', format_number(m.net_usd / m.days * 30 / m.stored_tib, 2)) ELSE '' END,
+               'coverage', CASE WHEN m.stored_tib IS NULL THEN 'needs system.storage.table_metrics_history' ELSE concat('all spend / table data, not a storage price · ', concat(format_number(m.stored_tables, 0), ' tables')) END, 'definition', 'Total spend for a 30-day month / total TiB of table data in this metastore. It sets all platform spend (compute, AI, apps) against the data you hold, so it is not what storage costs',
                'has_account_prices', m.priced_list_usd IS NOT NULL),
   named_struct('metric', 'Window', 'kind', 'input', 'value', concat(m.start_date, ' to ', m.end_date),
                'coverage', '', 'definition', '28 full days, ending on the newest day whose billing has finished landing',
@@ -196,7 +197,7 @@ If the account can't read `system.storage.table_metrics_history`, replace the `s
 
 ### Query 2. Weekly unit costs (12 weeks)
 
-Cost per query, per TiB of data under management and per weekly active user, one 7-day bucket at a time, ending where the table above ends. A unit cost jumping above its own normal means the same work got pricier.
+Cost per query, per TiB of data under management (a week's spend scaled to a 30-day month, like the tile above) and per weekly active user, one 7-day bucket at a time, ending where the table above ends. A unit cost jumping above its own normal means the same work got pricier.
 
 Weekly buckets do not overlap, so a jump shows in full in the week it happens. The user ratio uses weekly active users for that reason: a rolling monthly count would spread one bad week across four.
 
@@ -277,7 +278,7 @@ users AS (SELECT floor(days_back / 7) AS wk, approx_count_distinct(identity) AS 
           FROM ids GROUP BY 1)
 SELECT date_sub(max(w.end_date), CAST(s.wk AS INT) * 7) AS week,
        round(sum(CASE WHEN q.queries > 0 THEN s.usd END) / sum(q.queries), 4) AS `cost per query`,
-       round(sum(s.usd) / nullif(max(st.tib), 0), 2) AS `cost per TiB under management`,
+       round(sum(s.usd) / 7 * 30 / nullif(max(st.tib), 0), 2) AS `cost per TiB managed, per month`,
        round(sum(CASE WHEN array_contains(u.audit_workspaces, s.workspace_id) THEN s.usd END) / max(u.wau), 2)
          AS `cost per weekly active user`
 FROM spend s
@@ -455,7 +456,7 @@ Query 1 returns these rows already computed. `kind` is kpi for the headline unit
 | Cost per query | Spend of the workspaces with finished queries / those queries |
 | Cost per MAU, all identities | Spend of the workspaces in the audit log / monthly active identities, people and service principals |
 | Cost per MAU, humans | Spend of the workspaces in the audit log / monthly active people, the audit identities that are emails |
-| Cost per TiB of data under management | Total spend / total TiB of table data in this metastore |
+| Cost per TiB of data under management, per month | Total spend for a 30-day month / total TiB of table data in this metastore. It sets all platform spend (compute, AI, apps) against the data you hold, so it is not what storage costs |
 | Effective discount | 1 - account $ / list $, on priced SKUs |
 
 Raw inputs in the same table:
@@ -478,7 +479,7 @@ What the workspace sets mean:
 
 - Query-workspace spend is the spend of workspaces with at least one finished query in `system.query.history` in the window.
 - Audit-workspace spend is the spend of workspaces with at least one event in `system.access.audit` in the window.
-- Data under management comes from `system.storage.table_metrics_history`: each table at its newest snapshot in the window unless it was dropped by the window's end, at its total size (active plus vacuumable files) where it reports one and its active size otherwise. Cost per TiB is total spend over that volume. The table lists only the current region's metastore, so on an account with workspaces in several regions the ratio reads high; say so when you quote it.
+- Data under management comes from `system.storage.table_metrics_history`: each table at its newest snapshot in the window unless it was dropped by the window's end, at its total size (active plus vacuumable files) where it reports one and its active size otherwise. Cost per TiB is a 30-day month of total spend over that volume: all platform spend against the data held, not a storage price, so say so. The table lists only the current region's metastore, so on an account with workspaces in several regions the ratio reads high; say so when you quote it.
 
 ## Step 4. Visualise
 

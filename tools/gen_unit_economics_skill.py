@@ -106,8 +106,9 @@ def render() -> str:
         "`system.access.audit` in the window.",
         f"- Data under management comes from `{boards.STORAGE_TABLE}`: each table at its newest snapshot in "
         "the window unless it was dropped by the window's end, at its total size (active plus vacuumable "
-        "files) where it reports one and its active size otherwise. Cost per TiB is total spend over that "
-        "volume. The table lists only the current region's metastore, so on an account with workspaces "
+        "files) where it reports one and its active size otherwise. Cost per TiB is a 30-day month of total "
+        "spend over that volume: all platform spend against the data held, not a storage price, so say "
+        "so. The table lists only the current region's metastore, so on an account with workspaces "
         "in several regions the ratio reads high; say so when you quote it.",
         "",
         "## Step 4. Visualise",
