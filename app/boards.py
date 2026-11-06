@@ -1478,7 +1478,7 @@ ORDER BY query_usd DESC NULLS LAST LIMIT 10
                 "note": "Billing sees every workspace, but query history and audit only list the "
                         "workspaces they cover, so each ratio divides only the spend of the workspaces "
                         "its denominator can see. User counts are approximate (approx_count_distinct). "
-                        "Cost per TiB is total spend over the total size of the tables in "
+                        "Cost per TiB is a 30-day month of total spend over the total size of the tables in "
                         "system.storage.table_metrics_history, which lists the tables in this region's "
                         "metastore; on an account with workspaces in several regions it reads high.",
                 "anomaly": None,

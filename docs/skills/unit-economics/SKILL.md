@@ -19,7 +19,7 @@ The window holds full days only. Billing writes most of a day's records that day
 
 The headline unit costs, then the raw inputs they are built from, over one window of full days. Each figure uses your account price where one is set and list price otherwise. Coverage says which workspaces each figure rests on. Hover or tap ⓘ for a definition.
 
-Billing sees every workspace, but query history and audit only list the workspaces they cover, so each ratio divides only the spend of the workspaces its denominator can see. User counts are approximate (approx_count_distinct). Cost per TiB is total spend over the total size of the tables in system.storage.table_metrics_history, which lists the tables in this region's metastore; on an account with workspaces in several regions it reads high.
+Billing sees every workspace, but query history and audit only list the workspaces they cover, so each ratio divides only the spend of the workspaces its denominator can see. User counts are approximate (approx_count_distinct). Cost per TiB is a 30-day month of total spend over the total size of the tables in system.storage.table_metrics_history, which lists the tables in this region's metastore; on an account with workspaces in several regions it reads high.
 
 ```sql
 WITH latest AS (   -- the newest ingestion day; billing is still writing to it
