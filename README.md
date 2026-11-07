@@ -6,7 +6,7 @@ LakeLens is a Databricks App that runs a plain-English cost review of your works
 
 - **23 cost hunts** find waste across AI, idle compute, heavy reads, long-running work, config and spend trends
 - **One-click scan** turns the results into a triaged alert queue with severity, explanation, fix and proof
-- **4 observability boards** (19 panels) flag anomalies above each chart
+- **5 observability boards** (24 panels) flag anomalies above each chart, including **Unit economics** (cost per query, per active user and per TiB under management)
 - **7 measures** prove the saving before and after a fix
 - **Ask** tab: Genie One answers cost questions and shows the SQL behind every answer
 
@@ -18,7 +18,7 @@ flowchart LR
 
     subgraph APP["Databricks App: LakeLens"]
         UI["Single-page UI<br/>static/index.html"] -->|/api/*| API["FastAPI<br/>app.py"]
-        API --> CAT["Cost catalogue<br/>23 hunts · 7 measures · 19 panels<br/>hunts.py · boards.py · tune.py"]
+        API --> CAT["Cost catalogue<br/>23 hunts · 7 measures · 24 panels<br/>hunts.py · boards.py · tune.py"]
         API --> SCAN["Scan engine<br/>scan.py (background thread)"]
         API --> TOOLS["Tagging · Tokenomics<br/>tagging.py · tokenomics.py"]
         API --> ASK["Ask (Genie One)<br/>genie_cost.py"]
@@ -54,7 +54,7 @@ flowchart LR
 | Tab | What it does |
 |---|---|
 | 🚨 **Alerts** | **Run full cost scan** runs every hunt in the background and builds an alert queue: severity, plain-English explanation, recommended fix, and the measure that proves it. Work it as *acknowledge → in progress → resolve / dismiss*. Results are saved to Delta and shared. Each run is compared with the last (NEW / WORSE / BETTER / FLAT, or DEFINITION CHANGED when a hunt now measures something different, so the two numbers are not compared). It also shows what the scan itself cost, and exports to PDF. |
-| 📊 **Observability** | **Usage** (trend, SKU, workspace, AI forecast), **Jobs** (savings, low CPU, high memory, fixed workers, old DBR), **DBSQL** (by user, source, query, trend), **Model Serving** (batch, pay-per-token, provisioned, by endpoint). |
+| 📊 **Observability** | **Usage** (trend, SKU, workspace, AI forecast), **Jobs** (savings, low CPU, high memory, fixed workers, old DBR), **DBSQL** (by user, source, query, trend), **Model Serving** (batch, pay-per-token, provisioned, by endpoint), **Unit economics** (cost per query, per active user and per TiB under management as tiles, the inputs, a weekly trend and spend mix). |
 | ① **Spot** | The 23 hunts, grouped into 6 categories. Each card has a short summary, live results, an ✨ Explain button and PDF export. |
 | ② **Tune** | 12 best-practice cards: job vs all-purpose compute, serverless, Photon, liquid clustering / PO / zstd, timeouts, policies, spot, AI guardrails, tagging, budgets. [Details](docs/CATALOGUE.md#tune-practices). |
 | ③ **Prove** | 7 measures that show the saving (see below). [Details](docs/CATALOGUE.md#measures). |
