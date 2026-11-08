@@ -1,3 +1,4 @@
 fastapi>=0.110.0
 uvicorn>=0.29.0
 databricks-sdk>=0.56.0
+dbdemos-tracker==0.1.11

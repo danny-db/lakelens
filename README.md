@@ -203,3 +203,9 @@ Locally, queries run as your CLI profile (no per-user OBO).
 
 After editing any SQL, run `python3 validate.py` (every hunt, explainer and measure) and `python3 validate_boards.py` (every Observability panel). Both fail loudly on errors. Set the `PROFILE` / `WAREHOUSE` constants at the top first.
 </details>
+
+---
+
+## Data collection
+
+To improve users' experience and this asset's quality, the app reports a usage event when a page is opened. This information is captured for product improvement only, not for marketing purposes, and doesn't contain PII: the email of Databricks users is hashed, and nobody else's is sent. By using this asset, you consent to this data collection. If you wish to disable it, set the environment variable `DBDEMOS_TRACKER_DISABLED=1` (e.g. add `{ name: DBDEMOS_TRACKER_DISABLED, value: "1" }` to the app's `config.env` in `databricks.yml`, or to `app/app.yaml` for a deploy without the bundle).

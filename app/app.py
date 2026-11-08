@@ -103,6 +103,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LakeLens — FinOps for the Lakehouse", lifespan=lifespan)
+# Usage tracking, see "Data collection" in the README. Only "/" is matched, so it counts page loads,
+# not API or static calls. Apps runtime only: the X-Forwarded-Email header it reads comes from the
+# Apps proxy, and registering elsewhere (local runs, tests) would just open a workspace client.
+if IN_APPS_RUNTIME and os.getenv("DBDEMOS_TRACKER_DISABLED") != "1":
+    try:
+        from dbdemos_tracker import Tracker
+        Tracker.add_tracker_fastapi(app, "lakelens-finops-for-the-lakehouse-8afd", patterns=[r"^/$"])
+    except Exception as e:  # tracking must never stop the app
+        logger.warning("Usage tracking not enabled: %s", e)
 
 
 def _client_for(request: Request) -> WorkspaceClient:
