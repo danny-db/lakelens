@@ -14,6 +14,7 @@ system table — no jargon, no analogies, just what it means.
 
 `AI_ENDPOINT` is substituted into the explainer prompt at request time.
 """
+import re
 from typing import Literal, Optional, Union
 
 from typing_extensions import TypedDict
@@ -110,6 +111,30 @@ def _account_normal(weekly: str) -> str:
     LEFT JOIN {weekly} a USING (wk)
   )
 )"""
+
+
+def _with_peers(sql: str, metric: str) -> str:
+    """Wrap an anomaly hunt so every row also carries how the whole field of contributors this week
+    is spread: the count with a positive metric, its quartiles and the row's multiple of the median.
+    The stats cover every contributor, not just the rows the hunt's LIMIT returns. scan.py turns them
+    into the outlier rule; no cut-off lives in SQL.
+
+    Window functions keep it to one pass over the hunt. Joining a stats CTE back made the warehouse
+    run the hunt twice: on a large demo workspace +40% on H16 and +48% on H7 (198k pollers), against +1% and +10% here."""
+    found = re.search(r"(?is)\s+limit\s+(\d+)\s*$", sql.strip())
+    assert found, "an anomaly hunt ends with ORDER BY <metric> DESC LIMIT n"
+    base, limit = sql.strip()[:found.start()], found.group(1)
+    v = "CASE WHEN __m > 0 THEN __m END"
+    return f"""WITH h AS (
+{base}
+),
+hm AS (SELECT h.*, CAST(`{metric}` AS DOUBLE) AS __m FROM h)
+SELECT * EXCEPT (__m), round(try_divide(__m, peer_median), 1) AS vs_peers
+FROM (SELECT hm.*, count({v}) OVER () AS peer_n, percentile({v}, 0.5) OVER () AS peer_median,
+             percentile({v}, 0.25) OVER () AS peer_q1, percentile({v}, 0.75) OVER () AS peer_q3
+      FROM hm)
+ORDER BY __m DESC
+LIMIT {limit}"""
 
 
 def _vs_account(metric: str) -> str:
@@ -1948,6 +1973,9 @@ class AnomalySpec(TypedDict):
     metric_label: str      # what the account value is
     unit: str              # "usd" | "ratio" | "count" | "tib" | "hours" | "minutes"
     baseline: str          # plain-English definition of the account's normal
+    entity_noun: str       # one contributor, e.g. "job"; the "why" sentences are built from these
+    entity_nouns: str      # several contributors, e.g. "jobs"
+    metric_noun: str       # what the metric counts, read after its value, e.g. "runs on All-Purpose compute"
     summary: str           # headline; may use {account} {x} {baseline}
     new_summary: str       # headline when the account has no normal yet; may use {account}
     usd_col: Optional[str]  # a real list-price $ column, or None
@@ -1956,6 +1984,8 @@ class AnomalySpec(TypedDict):
 class PresenceSpec(TypedDict):
     kind: Literal["presence"]
     entity_col: str
+    entity_noun: str
+    entity_nouns: str
     metric_label: str
     summary: str           # headline; may use {entity} {n}
     usd_col: Optional[str]
@@ -1965,95 +1995,124 @@ AlertSpec = Union[AnomalySpec, PresenceSpec]
 
 ALERT_SPECS: dict[str, AlertSpec] = {
     "H0": {"kind": "anomaly", "aggregate": "peak", "entity_col": "caller", "metric_col": "tokens",
-           "metric_label": "Account tokens in its busiest hour this week", "unit": "count",
+           "metric_label": "Account tokens in its busiest hour this week",
+           "entity_noun": "endpoint and caller", "entity_nouns": "endpoint and caller pairs", "metric_noun": "tokens in the account's busiest hour", "unit": "count",
            "baseline": "median of the account's busiest hour in each of the prior four weeks",
            "summary": "Account used {account} AI tokens in its busiest hour this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of AI token use yet ({account} tokens in its busiest hour this week).",
            "usd_col": None},
     "H1": {"kind": "anomaly", "aggregate": "additive", "entity_col": "merge_target", "metric_col": "read_tib",
-           "metric_label": "Account MERGE reads this week", "unit": "tib",
+           "metric_label": "Account MERGE reads this week",
+           "entity_noun": "MERGE target", "entity_nouns": "MERGE targets", "metric_noun": "of MERGE reads", "unit": "tib",
            "baseline": "median of the account's prior four weekly MERGE read totals",
            "summary": "Account's MERGE statements read {account} this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of MERGE reads yet ({account} this week).",
            "usd_col": None},
     "H2": {"kind": "anomaly", "aggregate": "additive", "entity_col": "source", "metric_col": "spill_tib",
-           "metric_label": "Account disk spill this week", "unit": "tib",
+           "metric_label": "Account disk spill this week",
+           "entity_noun": "source", "entity_nouns": "sources", "metric_noun": "spilled to disk", "unit": "tib",
            "baseline": "median of the account's prior four weekly spill totals",
            "summary": "Account spilled {account} to disk this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of disk spill yet ({account} this week).",
            "usd_col": None},
     "H3": {"kind": "anomaly", "aggregate": "additive", "entity_col": "client", "metric_col": "stmts",
-           "metric_label": "Account zero-read statements this week", "unit": "count",
+           "metric_label": "Account zero-read statements this week",
+           "entity_noun": "client", "entity_nouns": "clients", "metric_noun": "zero-read statements", "unit": "count",
            "baseline": "median of the account's prior four weekly totals",
            "summary": "Account fired {account} statements that read no data this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of zero-read statements yet ({account} this week).",
            "usd_col": None},
     "H5": {"kind": "anomaly", "aggregate": "peak", "entity_col": "source", "metric_col": "total_min",
-           "metric_label": "Account's longest statement this week", "unit": "minutes",
+           "metric_label": "Account's longest statement this week",
+           "entity_noun": "source", "entity_nouns": "sources", "metric_noun": "in its longest statement", "unit": "minutes",
            "baseline": "median of the account's longest statement in each of the prior four weeks",
            "summary": "Account's longest statement this week ran {account}, {x} its usual longest (normal ~{baseline}).",
            "new_summary": "Account has no prior history of statement run times yet (longest this week {account}).",
            "usd_col": None},
     "H6": {"kind": "anomaly", "aggregate": "peak", "entity_col": "executed_by", "metric_col": "read_tib",
-           "metric_label": "Account's busiest scan hour this week", "unit": "tib",
+           "metric_label": "Account's busiest scan hour this week",
+           "entity_noun": "user", "entity_nouns": "users", "metric_noun": "read in the account's busiest scan hour", "unit": "tib",
            "baseline": "median of the account's busiest scan hour in each of the prior four weeks",
            "summary": "Account scanned {account} in its busiest hour this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of SELECT scans yet ({account} in its busiest hour this week).",
            "usd_col": None},
     "H7": {"kind": "anomaly", "aggregate": "additive", "entity_col": "poller", "metric_col": "repeats",
-           "metric_label": "Account repeat runs of identical SELECTs this week", "unit": "count",
+           "metric_label": "Account repeat runs of identical SELECTs this week",
+           "entity_noun": "poller", "entity_nouns": "pollers", "metric_noun": "repeat runs of identical SELECTs", "unit": "count",
            "baseline": "median of the account's prior four weekly totals of repeat runs",
            "summary": "Account re-ran identical SELECTs {account} times this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of repeated identical SELECTs yet ({account} repeat runs this week).",
            "usd_col": None},
     "H8": {"kind": "anomaly", "aggregate": "additive", "entity_col": "warehouse", "metric_col": "queued_hours",
-           "metric_label": "Account queue wait this week", "unit": "hours",
+           "metric_label": "Account queue wait this week",
+           "entity_noun": "warehouse", "entity_nouns": "warehouses", "metric_noun": "of queue wait", "unit": "hours",
            "baseline": "median of the account's prior four weekly queue-wait totals",
            "summary": "Account's statements waited {account} for capacity this week, {x} its usual (normal ~{baseline}).",
            "new_summary": "Account has no prior history of queueing yet ({account} waiting this week).",
            "usd_col": None},
     # ── H16–H20 (Aug 2026 thread additions) ──
     "H16": {"kind": "anomaly", "aggregate": "additive", "entity_col": "job_name", "metric_col": "run_count",
-            "metric_label": "Account job runs on All-Purpose compute this week", "unit": "count",
+            "metric_label": "Account job runs on All-Purpose compute this week",
+            "entity_noun": "job", "entity_nouns": "jobs", "metric_noun": "runs on All-Purpose compute", "unit": "count",
             "baseline": "median of the account's prior four weekly totals",
             "summary": "Account ran {account} jobs on All-Purpose compute this week, {x} its usual (normal ~{baseline}).",
             "new_summary": "Account has no prior history of jobs on All-Purpose compute yet ({account} runs this week).",
             "usd_col": None},
     "H17": {"kind": "presence", "entity_col": "warehouse",
-            "metric_label": "Classic warehouses with auto-stop off", "usd_col": None,
+            "metric_label": "Classic warehouses with auto-stop off",
+            "entity_noun": "classic warehouse", "entity_nouns": "classic warehouses", "usd_col": None,
             "summary": "{n} classic warehouse(s) never auto-stop, including {entity}."},
     "H18": {"kind": "anomaly", "aggregate": "additive", "entity_col": "cluster", "metric_col": "idle_node_minutes",
-            "metric_label": "Account idle node-minutes on interactive clusters this week", "unit": "count",
+            "metric_label": "Account idle node-minutes on interactive clusters this week",
+            "entity_noun": "cluster", "entity_nouns": "clusters", "metric_noun": "idle node-minutes", "unit": "count",
             "baseline": "median of the account's prior four weekly totals",
             "summary": "Account's interactive clusters idled {account} node-minutes this week, {x} its usual (normal ~{baseline}).",
             "new_summary": "Account has no prior history of interactive clusters yet ({account} idle node-minutes this week).",
             "usd_col": None},
     "H19": {"kind": "anomaly", "aggregate": "additive", "entity_col": "app_name", "metric_col": "dbus_7d",
-            "metric_label": "Account Databricks Apps DBUs this week", "unit": "count",
+            "metric_label": "Account Databricks Apps DBUs this week",
+            "entity_noun": "app", "entity_nouns": "apps", "metric_noun": "DBUs", "unit": "count",
             "baseline": "median of the account's prior four weekly totals (complete days)",
             "summary": "Account's Databricks Apps billed {account} DBUs this week, {x} its usual (normal ~{baseline}).",
             "new_summary": "Account has no prior history of Databricks Apps billing yet ({account} DBUs this week).",
             "usd_col": None},
     "H20": {"kind": "anomaly", "aggregate": "additive", "entity_col": "job_name", "metric_col": "wasted_hours",
-            "metric_label": "Account compute on failed job runs this week", "unit": "hours",
+            "metric_label": "Account compute on failed job runs this week",
+            "entity_noun": "job", "entity_nouns": "jobs", "metric_noun": "of compute on failed runs", "unit": "hours",
             "baseline": "median of the account's prior four weekly totals",
             "summary": "Account spent {account} on failed job runs this week, {x} its usual (normal ~{baseline}).",
             "new_summary": "Account has no prior history of failed job runs yet ({account} on failed runs this week).",
             "usd_col": None},
     "H21": {"kind": "presence", "entity_col": "schema_name",
-            "metric_label": "Schemas with likely-snappy Delta tables", "usd_col": None,
+            "metric_label": "Schemas with likely-snappy Delta tables",
+            "entity_noun": "schema", "entity_nouns": "schemas", "usd_col": None,
             "summary": "{n} schema(s) hold Delta tables that predate the zstd default, including {entity}."},
     "H22": {"kind": "anomaly", "aggregate": "additive", "entity_col": "job_name", "metric_col": "usd_7d",
-            "metric_label": "Account Performance-optimized serverless job spend this week", "unit": "usd",
+            "metric_label": "Account Performance-optimized serverless job spend this week",
+            "entity_noun": "job", "entity_nouns": "jobs", "metric_noun": "of Performance-optimized serverless spend", "unit": "usd",
             "baseline": "median of the account's prior four weekly totals (complete days)",
             "summary": "Account spent {account} on Performance-optimized serverless jobs this week, {x} its usual (normal ~{baseline}).",
             "new_summary": "Account has no prior history of Performance-optimized serverless jobs yet ({account} this week).",
             "usd_col": "account_value"},
     "H23": {"kind": "anomaly", "aggregate": "additive", "entity_col": "po_target", "metric_col": "dbus_last_7d",
-            "metric_label": "Account Predictive Optimization DBUs, last 7 complete days", "unit": "count",
+            "metric_label": "Account Predictive Optimization DBUs, last 7 complete days",
+            "entity_noun": "table", "entity_nouns": "tables", "metric_noun": "Predictive Optimization DBUs", "unit": "count",
             "baseline": "median of the account's four prior 7-day totals",
             "summary": "Account's Predictive Optimization used {account} DBUs in the last 7 days, {x} its usual (normal ~{baseline}).",
             "new_summary": "Account has no prior history of Predictive Optimization yet ({account} DBUs in the last 7 days).",
             "usd_col": None},
 }
 
+
+# Every anomaly hunt also returns its peer stats (see _with_peers), so a contributor far above the
+# others shows up even when the account as a whole is at its normal.
+PEER_RUBRIC = (" vs_peers is the row's metric as a multiple of the median contributor this week, over all "
+               "peer_n contributors with a positive value (peer_median, peer_q1 and peer_q3 describe that spread). "
+               "A contributor far above the others is worth a look even when the account is at its normal: if "
+               "the top rows stand out like that, say so and name them.")
+for _h in HUNTS:
+    _spec = ALERT_SPECS.get(_h["id"])
+    if _spec and _spec["kind"] == "anomaly":
+        _h["sql"] = _with_peers(_h["sql"], _spec["metric_col"])
+        if _h.get("explain_rubric"):
+            _h["explain_rubric"] += PEER_RUBRIC

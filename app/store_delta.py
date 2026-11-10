@@ -110,7 +110,8 @@ class DeltaStore:
                     {"name": "measure", "value": f.get("measure") or ""},
                     {"name": "action", "value": f.get("action", "")},
                     {"name": "explanation", "value": f.get("explanation") or ""},
-                    {"name": "evidence_json", "value": json.dumps({**f.get("evidence", {}), "vs": f.get("vs")})[:60000]},
+                    {"name": "evidence_json", "value": json.dumps({**f.get("evidence", {}), "vs": f.get("vs"),
+                                                                "lens": f.get("lens"), "why": f.get("why")})[:60000]},
                 ])
             # Run row LAST — the commit marker.
             self._run_write(f"""
@@ -193,7 +194,8 @@ class DeltaStore:
                     "hunt_id": x[0], "title": x[1], "category": x[2], "severity": x[3],
                     "summary": x[4], "metric_label": x[5], "metric_value": x[6],
                     "impact_usd": _f(x[7]), "total_rows": int(x[8] or 0), "measure": x[9] or None,
-                    "action": x[10], "explanation": x[11] or None, "vs": ev.pop("vs", None), "evidence": ev,
+                    "action": x[10], "explanation": x[11] or None, "vs": ev.pop("vs", None),
+                    "lens": ev.pop("lens", None), "why": ev.pop("why", None), "evidence": ev,
                     "metric_num": _f(x[13]),
                 }))
             return {

@@ -475,6 +475,14 @@
   .vs-normal.high { color: var(--coral); background: rgba(255,107,74,.14); }
   .vs-normal.new { color: var(--blue); background: rgba(74,168,255,.14); }
   .vs-normal.presence { color: var(--muted); background: var(--panel-2); }
+  .vs-normal.outlier { color: var(--violet); background: rgba(90,75,158,.12); }
+  .why-line { font-size: 12.5px; color: var(--muted); line-height: 1.55; margin: 0 0 8px; }
+  .why-line .why-k { font-weight: 800; color: var(--text); margin-right: 6px; }
+  .hunt-body .judged { font-size: 12px; color: var(--muted-2); margin: 0 0 6px; }
+  .queue-group-head { margin: 22px 0 10px; }
+  .queue-group-head:first-child { margin-top: 4px; }
+  .queue-group-head h3 { font-size: 15px; margin: 0 0 2px; }
+  .queue-group-head p { font-size: 12.5px; color: var(--muted); margin: 0; }
   .vs-prev { color: var(--muted-2); font-size: 12px; }
   .vs-prev b { color: var(--muted); font-family: ui-monospace, monospace; font-weight: 600; }
   .cost-strip { display: flex; align-items: center; gap: 10px; padding: 10px 16px; margin-bottom: 16px; background: rgba(0,212,184,.05); border: 1px solid rgba(0,212,184,.16); border-radius: 10px; font-size: 13.5px; color: var(--muted); }
@@ -1144,6 +1152,7 @@ function huntCard(h) {
       <div class="hunt-body">
         <h4>${h.title}</h4>
         <div class="eli5">${h.eli5}</div>
+        ${h.judged_short ? `<div class="judged">⚖ ${escapeHtml(h.judged_short)}</div>` : ""}
         <div class="details-toggle">▸ What it means & how to fix it</div>
       </div>
       <div class="hunt-actions">
@@ -1154,6 +1163,7 @@ function huntCard(h) {
     </div>
     <div class="hunt-details">
       <div class="detail-row"><div class="k">How to read it</div><div class="v">${h.what}</div></div>
+      ${h.how_judged ? `<div class="detail-row"><div class="k">How it's judged</div><div class="v">${escapeHtml(h.how_judged)}</div></div>` : ""}
       <div class="detail-row action"><div class="k">Recommended action</div><div class="v">${h.action}</div></div>
       ${cautionTxt}
       <div class="detail-row">${measureTxt}</div>
@@ -1203,6 +1213,14 @@ async function runHunt(h, card) {
         status.innerHTML = `<span>⚠ ${n.toLocaleString()} row${n>1?'s':''} to review — see below.</span>`;
       }
       inner.appendChild(status);
+      if (data.why) {
+        const w = document.createElement("div");
+        w.className = "why-line";
+        const flagged = data.why.severity && data.why.severity !== "low";
+        w.innerHTML = `<span class="why-k">${flagged ? `Why it's flagged (${data.why.severity})` : "Why it isn't flagged"}</span>`
+          + escapeHtml(data.why.basis) + (data.why.peers ? " " + escapeHtml(data.why.peers) : "");
+        inner.appendChild(w);
+      }
       inner.appendChild(renderTable(data.columns, data.rows, data.total_rows));
       res.appendChild(inner);
       const eb = $(".explain-btn", card);
@@ -1716,8 +1734,27 @@ function renderQueue() {
     return;
   }
   host.innerHTML = "";
-  items.forEach(f => host.appendChild(alertCard(f)));
+  // Each finding answers one question, so each gets its own section. Older saved scans carry no lens.
+  const lensOf = f => f.lens || (f.vs?.reading === "presence" ? "presence" : "normal");
+  QUEUE_GROUPS.forEach(g => {
+    const inGroup = items.filter(f => lensOf(f) === g.lens);
+    if (!inGroup.length) return;
+    const head = document.createElement("div");
+    head.className = "queue-group-head";
+    head.innerHTML = `<h3>${g.title} <span class="rowcount">(${inGroup.length})</span></h3><p>${g.blurb}</p>`;
+    host.appendChild(head);
+    inGroup.forEach(f => host.appendChild(alertCard(f)));
+  });
 }
+
+const QUEUE_GROUPS = [
+  {lens: "normal", title: "Changed this week",
+   blurb: "The account is above its own normal: the median of its prior four weeks."},
+  {lens: "peers", title: "Standing outliers",
+   blurb: "The account is at its normal, but one contributor stands far above its peers. A problem that has been there for weeks shows up here."},
+  {lens: "presence", title: "Configuration",
+   blurb: "A setting that costs money whatever the history."},
+];
 
 // A finding nobody has triaged yet is stored as "new", which read like the NEW trend badge
 // beside "= FLAT". Show it as untriaged; the stored value stays the same.
@@ -1751,7 +1788,9 @@ function alertCard(f) {
   const vsBadge = vs.reading === "anomaly" && vs.x != null
       ? `<span class="vs-normal ${f.severity==='high'?'high':''}" title="the account this window versus its own usual">${vs.x >= 10 ? Math.round(vs.x).toLocaleString() : vs.x.toFixed(1)}x normal</span>`
     : vs.reading === "new" ? `<span class="vs-normal new" title="the account has no history for this metric in the prior 28 days">NEW, no prior history</span>`
-    : vs.reading === "presence" ? `<span class="vs-normal presence" title="a configuration state, graded by presence">config present</span>` : "";
+    : vs.reading === "presence" ? `<span class="vs-normal presence" title="a configuration state, graded by presence">config present</span>`
+    : vs.reading === "outlier" ? `<span class="vs-normal outlier" title="far above its peers this week; the account as a whole is at its normal">outlier vs peers</span>` : "";
+  const why = f.why ? `<div class="why-line"><span class="why-k">Why it's flagged</span>${escapeHtml(f.why.basis)}${f.why.peers ? " " + escapeHtml(f.why.peers) : ""}</div>` : "";
   const metricLine = vs.reading === "presence" ? ""
     : `<span>${f.metric_label}: <b>${f.metric_value}</b>${vs.baseline ? ` (normal ~${vs.baseline})` : ""}</span>`;
   const vsPrev = (f.prev_metric_value && f.trend && f.trend!=="new")
@@ -1769,6 +1808,7 @@ function alertCard(f) {
           ${trendBadge}
         </div>
         <div class="alert-summary">${escapeHtml(f.summary)}</div>
+        ${why}
         <div class="alert-metrics">
           ${vsBadge}
           ${metricLine}

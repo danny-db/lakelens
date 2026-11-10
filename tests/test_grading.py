@@ -13,13 +13,15 @@ import scan  # noqa: E402
 HUNT = {"id": "T1", "title": "Test hunt", "category": "spend", "action": "fix it",
         "measure": "M2", "eli5": "test"}
 ANOMALY = {"kind": "anomaly", "aggregate": "additive", "entity_col": "job", "metric_col": "runs",
+           "entity_noun": "job", "entity_nouns": "jobs", "metric_noun": "runs on All-Purpose compute",
            "metric_label": "All-Purpose job runs this week", "unit": "count",
            "baseline": "median of the account's prior four weekly totals",
            "summary": "Account ran {account} jobs on All-Purpose compute this week, {x} its usual "
                       "(normal ~{baseline}).",
            "new_summary": "Account has no prior history for All-Purpose job runs yet ({account} this week).",
            "usd_col": None}
-PRESENCE = {"kind": "presence", "entity_col": "wh", "metric_label": "Warehouses",
+PRESENCE = {"kind": "presence", "entity_col": "wh", "entity_noun": "warehouse", "entity_nouns": "warehouses",
+            "metric_label": "Warehouses",
             "summary": "{n} warehouse(s) never stop, including {entity}.", "usd_col": None}
 COLS = ["job", "runs", "share_pct", "account_value", "baseline", "vs_normal"]
 

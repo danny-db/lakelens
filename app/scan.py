@@ -10,7 +10,9 @@ FinOps admin works (acknowledge → in progress → resolved / dismissed).
 Design notes:
 - **Severity is deterministic**: each hunt is graded by the rule for its spec's
   `kind` (see GRADERS and hunts.ALERT_SPECS), mostly "how many times the
-  account's own normal", with the top contributors listed behind it. The AI only
+  account's own normal", with the top contributors listed behind it. When the
+  account is at its normal, a contributor far above its peers (peers_of) still
+  raises a medium alert, and every finding says why in words (_why). The AI only
   narrates; it never sets severity. We never invent a dollar figure a query
   didn't produce.
 - **Async**: a scan runs on a background thread so no single HTTP request is
@@ -20,6 +22,7 @@ Design notes:
   hunt id so an admin's decisions survive a re-scan. The STORE object is the
   only stateful thing — swap it for a Delta/Lakebase table to persist.
 """
+import math
 import os
 import threading
 import traceback
@@ -123,10 +126,28 @@ ANOMALY_HIGH_X = float(os.getenv("ANOMALY_HIGH_X", "3"))
 ANOMALY_MEDIUM_X = float(os.getenv("ANOMALY_MEDIUM_X", "2"))
 
 
+# A contributor is an outlier against its peers this week when it is above the box-plot fence on a
+# log scale, Q3 x (Q3 / Q1) ^ OUTLIER_IQR_K, and never below ANOMALY_HIGH_X times the median. Cost data
+# is heavy-tailed: on a demo account a fixed 3x the median flagged 30-40% of contributors, the log-scale
+# fence 1 to 16 per hunt. The floor stops a field where most contributors are alike flagging half of them.
+OUTLIER_IQR_K = 1.5         # the box-plot rule's standard whisker length
+OUTLIER_MIN_PEERS = 5       # fewer contributors than this and "the median" says nothing
+OUTLIER_SHOWN = 5           # outliers a finding names
+PEER_COLS = ("peer_n", "peer_median", "peer_q1", "peer_q3")
+
+
 class Grade(NamedTuple):
     severity: str           # high | medium | low
-    reading: str            # anomaly | new | presence
+    reading: str            # anomaly | new | presence | outlier
     x: Optional[float]      # the account's vs_normal, for anomaly hunts
+
+
+class Peers(NamedTuple):
+    n: int                  # contributors with a positive metric this week
+    median: Optional[float]
+    fence: Optional[float]  # a metric above this is an outlier; None when there are too few peers
+    outliers: list          # indexes of rows above the fence (rows are sorted by the metric, so a prefix)
+    more: bool              # every returned row is an outlier and the hunt's LIMIT cut the list
 
 
 def _grade_anomaly(row: list, ci: dict) -> Grade:
@@ -195,6 +216,171 @@ def _fmt_share(share: Optional[float]) -> str:
     return f"{share:.1f}%" if share < 10 else f"{share:.0f}%"
 
 
+def _fmt_small(value, unit: str) -> str:
+    """Like _fmt_metric, but a median or a fence far below the headline values stays readable."""
+    v = _num(value)
+    if v is None:
+        return "—"
+    if unit == "tib":
+        for scale, name in ((1, "TiB"), (1024, "GiB"), (1024 ** 2, "MiB"), (1024 ** 3, "KiB")):
+            if v * scale >= 0.01:
+                return f"{v * scale:,.2f} {name}"
+        return "under 0.01 KiB"
+    if unit == "minutes" and v < 1:
+        return f"{v * 60:,.0f} s"
+    if unit == "hours" and v < 0.1:
+        return f"{v * 60:,.1f} min"
+    if unit == "usd" and v < 0.01:
+        return "under $0.01"
+    if unit == "count" and v < 10 and v != int(v):
+        return f"{v:,.1f}"
+    return _fmt_metric(v, unit)
+
+
+def _x(v: float) -> str:
+    return f"{v:g}x"
+
+
+def peers_of(spec: dict, ci: dict, rows: list, total_rows: int) -> Optional[Peers]:
+    """How an anomaly hunt's contributors spread this week, or None for a result without peer stats
+    (a hunt that isn't wrapped by hunts._with_peers, or a scan saved before it was)."""
+    if spec["kind"] != "anomaly" or not rows or any(c not in ci for c in PEER_COLS):
+        return None
+    first = rows[0]
+    n = int(_num(first[ci["peer_n"]]) or 0)
+    median, q1, q3 = (_num(first[ci[c]]) for c in ("peer_median", "peer_q1", "peer_q3"))
+    if n < OUTLIER_MIN_PEERS or not median or median <= 0:
+        return Peers(n, median, None, [], False)
+    fence = ANOMALY_HIGH_X * median
+    if q1 and q3 and q1 > 0 and q3 >= q1:
+        fence = max(fence, math.exp(math.log(q3) + OUTLIER_IQR_K * (math.log(q3) - math.log(q1))))
+    outliers = []
+    for i, r in enumerate(rows):
+        v = _num(r[ci[spec["metric_col"]]])
+        if v is None or v <= fence:
+            break
+        outliers.append(i)
+    return Peers(n, median, fence, outliers, bool(outliers) and len(outliers) == len(rows) and total_rows > len(rows))
+
+
+def _a(noun: str) -> str:
+    """The noun with its article: "an app", "a user" (every noun here that starts with a u says "you")."""
+    return ("an " if noun[:1].lower() in "aeio" else "a ") + noun
+
+
+def judging(spec: Optional[dict]) -> str:
+    """How a hunt is judged, in words, before it runs (Spot's card and the catalogue). The cut-offs come
+    from the same settings that grade it."""
+    if not spec:
+        return "Not graded: a reference view that raises no alert."
+    if spec["kind"] == "presence":
+        return (f"Judged by presence: every {spec['entity_noun']} in this state raises a medium alert, "
+                "whatever its history.")
+    return (f"Judged two ways. Against the account's own normal, the {spec['baseline']}: medium from "
+            f"{_x(ANOMALY_MEDIUM_X)} that, high from {_x(ANOMALY_HIGH_X)}. And against its peers this week: "
+            f"{_a(spec['entity_noun'])} above the outlier fence (the box-plot rule on a log scale, never below "
+            f"{_x(ANOMALY_HIGH_X)} the median {spec['entity_noun']}) raises a medium alert even when the "
+            "account is at its normal.")
+
+
+def judging_short(spec: Optional[dict]) -> str:
+    """judging() in one line, for the hunt card before it's opened."""
+    if not spec:
+        return "Not graded"
+    if spec["kind"] == "presence":
+        return "Judged by presence, whatever its history"
+    return (f"Judged against the account's 4-week median ({_x(ANOMALY_MEDIUM_X)} medium, {_x(ANOMALY_HIGH_X)} high) "
+            "and against its peers (outliers)")
+
+
+def _outlier_parts(spec: dict, ci: dict, rows: list, peers: Peers) -> dict:
+    """The words for the first outlier: who, how much, its share and the median it's set against."""
+    top = rows[peers.outliers[0]]
+    share = (f", {_fmt_share(_num(top[ci['share_pct']]))} of the account's total"
+             if spec.get("aggregate") == "additive" and "share_pct" in ci else "")
+    count = f"at least {len(peers.outliers)}" if peers.more else f"{len(peers.outliers)}"
+    one = len(peers.outliers) == 1 and not peers.more
+    return {"entity": str(top[ci[spec["entity_col"]]]),
+            "value": f"{_fmt_metric(_num(top[ci[spec['metric_col']]]), spec['unit'])} {spec['metric_noun']}",
+            "share": share, "median": _fmt_small(peers.median, spec["unit"]),
+            "others": f"{peers.n - 1:,} {spec['entity_nouns'] if peers.n - 1 != 1 else spec['entity_noun']}",
+            "count": count, "verb": "is" if one else "are", "fence": _fmt_small(peers.fence, spec["unit"])}
+
+
+def _why(spec: dict, g: Grade, peers: Optional[Peers], ci: dict, rows: list,
+         baseline_str: Optional[str], headline_names_outlier: bool = False) -> dict:
+    """Why a result is or isn't flagged: the basis it's judged on, with the cut-offs, and what its
+    peers show. Alerts cards and Spot both show exactly these lines; an outlier card's headline already
+    names the outlier, so its peers line keeps only the count and the rule."""
+    if spec["kind"] == "presence":
+        return {"lens": "presence", "basis": f"Judged by presence: every {spec['entity_noun']} in this state "
+                "is flagged, whatever its history.", "peers": None}
+    normal = f"the {spec['baseline']}"
+    if g.reading == "new":
+        basis = (f"Judged against the account's own normal, {normal}, but the account had none of this in "
+                 "those weeks, so it's flagged as new.")
+    elif g.x is not None and g.x >= ANOMALY_MEDIUM_X:
+        basis = (f"Judged against the account's own normal, {normal} ({baseline_str}). This week is {_fmt_x(g.x)} "
+                 f"that: medium from {_x(ANOMALY_MEDIUM_X)}, high from {_x(ANOMALY_HIGH_X)}.")
+    else:
+        basis = (f"Against the account's own normal, {normal} ({baseline_str}), this week is {_fmt_x(g.x)} that: "
+                 f"below the {_x(ANOMALY_MEDIUM_X)} medium cut-off, so the trend alone raises nothing.")
+    lens = "peers" if g.reading == "outlier" else "normal"
+    if g.reading == "outlier":
+        basis = "Judged against its peers this week. " + basis
+    if peers is None:
+        return {"lens": lens, "basis": basis, "peers": None}
+    rule = f"the box-plot rule on a log scale, never below {_x(ANOMALY_HIGH_X)} the median"
+    if peers.fence is None:
+        line = (f"Only {peers.n:,} {spec['entity_nouns'] if peers.n != 1 else spec['entity_noun']} this week, too few "
+                f"to compare with peers (it takes {OUTLIER_MIN_PEERS}).")
+    elif not peers.outliers:
+        line = (f"No {spec['entity_noun']} stands apart from the other {peers.n - 1:,}: none is above the outlier "
+                f"fence of {_fmt_small(peers.fence, spec['unit'])} ({rule}).")
+    else:
+        p = _outlier_parts(spec, ci, rows, peers)
+        line = (f"{p['count'].capitalize()} of the {peers.n:,} {spec['entity_nouns']} {p['verb']} above the "
+                f"outlier fence of {p['fence']} ({rule}).")
+        if not headline_names_outlier:
+            line = (f"{p['entity']} stands far above the other {p['others']}: {p['value']}{p['share']}, against "
+                    f"a median of {p['median']}. " + line)
+    return {"lens": lens, "basis": basis, "peers": line}
+
+
+def present_peers(cols: list, rows: list, peers: Optional[Peers]) -> tuple[list, list]:
+    """Rows for display: the spread columns go (the why line says them), each row keeps vs_peers, and
+    the outliers are marked."""
+    keep = [i for i, c in enumerate(cols) if c not in PEER_COLS]
+    out_cols, out_rows = [cols[i] for i in keep], [[r[i] for i in keep] for r in rows]
+    if peers is not None and peers.fence is not None:
+        marked = set(peers.outliers)
+        out_cols.append("peer_outlier")
+        out_rows = [r + ["outlier" if j in marked else ""] for j, r in enumerate(out_rows)]
+    return out_cols, out_rows
+
+
+def judge_result(hunt: dict, result: dict) -> tuple[list, list, Optional[dict]]:
+    """A hunt result for Spot: its rows as displayed, and why they are or aren't flagged (None for a
+    hunt that doesn't alert)."""
+    spec = catalogue.ALERT_SPECS.get(hunt["id"])
+    cols, rows = result["columns"], result["rows"]
+    if not spec or not rows:
+        return cols, rows, None
+    ci = {c: i for i, c in enumerate(cols)}
+    if spec["kind"] == "presence":
+        g = _grade_presence(rows[0], ci)
+        return cols, rows, {**_why(spec, g, None, ci, rows, None), "severity": g.severity}
+    if any(c not in ci for c in REQUIRED_COLS["anomaly"]):
+        return cols, rows, None
+    g = _grade_anomaly(rows[0], ci)
+    peers = peers_of(spec, ci, rows, result.get("total_rows", len(rows)))
+    if g.severity == "low" and peers and peers.outliers:
+        g = Grade("medium", "outlier", g.x)
+    baseline = _fmt_metric(_num(rows[0][ci["baseline"]]), spec["unit"]) if g.reading != "new" else None
+    out_cols, out_rows = present_peers(cols, rows, peers)
+    return out_cols, out_rows, {**_why(spec, g, peers, ci, rows, baseline), "severity": g.severity}
+
+
 def build_finding(hunt: dict, result: dict) -> Optional[dict]:
     """Turn one hunt's query result into an alert finding, or None when the hunt
     grades low (a clean hunt raises no alert).
@@ -215,11 +401,15 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
         return None
 
     top = rows[0]
-    g = GRADERS[spec["kind"]](top, ci)
-    if g.severity == "low":
-        return None
-
     total = result.get("total_rows", len(rows))
+    g = GRADERS[spec["kind"]](top, ci)
+    peers = peers_of(spec, ci, rows, total)
+    if g.severity == "low":
+        # The account is at its normal; a contributor far above its peers still raises a medium alert.
+        if not (peers and peers.outliers):
+            return None
+        g = Grade("medium", "outlier", g.x)
+
     entity = str(top[ci[spec["entity_col"]]])
     if spec["kind"] == "presence":
         account_num, account_str, baseline_str = None, "", None
@@ -228,11 +418,17 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
         account_num = _num(top[ci["account_value"]])
         account_str = _fmt_metric(account_num, spec["unit"])
         baseline_str = (_fmt_metric(_num(top[ci["baseline"]]), spec["unit"])
-                        if g.reading == "anomaly" else None)
-        template = spec["new_summary"] if g.reading == "new" else spec["summary"]
-        summary = (template.format(account=account_str, x=_fmt_x(g.x) if g.x is not None else "",
-                                   baseline=baseline_str)
-                   + f" Top contributor: {entity} ({_fmt_share(_num(top[ci['share_pct']]))}).")
+                        if g.reading in ("anomaly", "outlier") else None)
+        if g.reading == "outlier":
+            p = _outlier_parts(spec, ci, rows, peers)
+            summary = (f"{p['entity']} stands far above the other {p['others']} this week: {p['value']}"
+                       f"{p['share']}, against a median of {p['median']}.")
+        else:
+            template = spec["new_summary"] if g.reading == "new" else spec["summary"]
+            summary = (template.format(account=account_str, x=_fmt_x(g.x) if g.x is not None else "",
+                                       baseline=baseline_str)
+                       + f" Top contributor: {entity} ({_fmt_share(_num(top[ci['share_pct']]))}).")
+    why = _why(spec, g, peers, ci, rows, baseline_str, headline_names_outlier=g.reading == "outlier")
 
     # Real dollars only if the hunt genuinely has a $ column (else None: we show
     # the magnitude metric instead, never a fabricated cost).
@@ -242,7 +438,8 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
 
     # Keep the top-5 contributors as evidence (the queue card shows these; the full
     # result stays available on the Spot tab).
-    evidence = {"columns": cols, "rows": rows[:5]}
+    ev_cols, ev_rows = present_peers(cols, rows[:OUTLIER_SHOWN], peers)
+    evidence = {"columns": ev_cols, "rows": ev_rows}
 
     return {
         "hunt_id": hunt["id"],
@@ -255,6 +452,9 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
         "metric_num": account_num,      # raw account value, for run-over-run comparison
         # How the account compares with its own normal (the card's badge).
         "vs": {"reading": g.reading, "x": g.x, "baseline": baseline_str},
+        # Which question flagged it (its own normal, its peers, or presence) and why, in words.
+        "lens": why["lens"],
+        "why": {"basis": why["basis"], "peers": why["peers"]},
         "impact_usd": impact_usd,
         "total_rows": total,
         "action": hunt["action"],          # the recommended fix (static, from the notebook)

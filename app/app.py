@@ -415,6 +415,8 @@ def get_meta():
         return {
             "id": h["id"], "category": h["category"], "title": h["title"],
             "eli5": h["eli5"], "what": h["what"], "action": h["action"],
+            "how_judged": scan_engine.judging(catalogue.ALERT_SPECS.get(h["id"])),
+            "judged_short": scan_engine.judging_short(catalogue.ALERT_SPECS.get(h["id"])),
             "measure": h.get("measure"),
             "has_explainer": bool(h.get("explain_rubric") or h.get("explain_is_trend")),
             "caution": h.get("caution"),
@@ -544,8 +546,9 @@ def run_hunt(hunt_id: str, request: Request):
         raise HTTPException(404, f"unknown hunt {hunt_id}")
     try:
         out = _run_sql(h["sql"], _client_for(request))
-        return {"id": hunt_id, "columns": out["columns"], "rows": out["rows"],
-                "total_rows": out["total_rows"], "truncated": out["truncated"]}
+        columns, rows, why = scan_engine.judge_result(h, out)
+        return {"id": hunt_id, "columns": columns, "rows": rows,
+                "total_rows": out["total_rows"], "truncated": out["truncated"], "why": why}
     except HTTPException:
         raise
     except Exception as e:
