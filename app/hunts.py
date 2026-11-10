@@ -456,7 +456,6 @@ LIMIT 50
             "Call out warehouses that appear to start but never stop; do not assert waste - recommend "
             "confirming against actual billed usage."
         ),
-        "inventory": True,  # lists all warehouses' events — a reference view, not a waste list
         "sql": f"""
 WITH {ctes("warehouse")},
 events AS (
@@ -726,7 +725,6 @@ LIMIT 50
         "measure": "M3",
         "explain_hunt_desc": "the account's queue wait this week versus its usual week, and the "
                              "warehouses it happened on",
-        "inventory": True,  # ranks every warehouse — a reference view, not a waste list
         "explain_rubric": (
             "account_value is the hours statements across the account waited for capacity this week; "
             "baseline is the median of the prior four weekly totals; vs_normal = account_value / "
@@ -788,7 +786,6 @@ LIMIT 50
             "undocumented config drift). Name the notable outliers; this is a reference audit, so "
             "frame findings as 'worth a conversation', not proven waste."
         ),
-        "inventory": True,  # lists every warehouse's config — a reference view, not a waste list
         "sql": f"""
 WITH {ctes("warehouse")},
 cfg AS (
@@ -933,7 +930,6 @@ LIMIT 100
             "waste. Name any clear risers; suggest cross-checking them against the weekly-movers hunt "
             "and idle-cores hunt. This is a reference trend, not proven waste."
         ),
-        "inventory": True,  # lists all jobs by run count — a reference view, not a waste list
         "sql": f"""
 WITH {ctes("job")},
 runs AS (
@@ -1026,7 +1022,6 @@ ORDER BY c.dbus DESC
             "clusters as the ones to drill into (per-node utilisation) and right-size. This is a "
             "discovery list; recommend confirming a cluster's hour-by-hour utilisation before resizing."
         ),
-        "inventory": True,  # busiest-clusters discovery list — a reference view, not a waste list
         "sql": f"""
 WITH {ctes("cluster")},
 busiest AS (
@@ -1938,9 +1933,10 @@ ORDER BY warehouse, c.week
 
 # ── Alert specs — what turns a hunt result into a triage-queue alert ──────────
 #
-# Only the WASTE-SIGNAL hunts raise alerts. The inventory/reference hunts
-# (H4/H9/H12/H14) are excluded — they list every warehouse/job by design, so a
-# row is not a finding. The full-scan engine runs each hunt below and grades it
+# Only the WASTE-SIGNAL hunts raise alerts. The reference hunts (H4, H9-H14)
+# are excluded — they list every warehouse, job, pipeline or SKU by design, so a
+# row is not a finding, and Spot shows a hunt missing here as a reference view.
+# The full-scan engine runs each hunt below and grades it
 # with the rule for its `kind` (scan.GRADERS). We never invent a dollar figure
 # the query didn't produce.
 #

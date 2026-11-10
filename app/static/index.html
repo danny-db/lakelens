@@ -1203,11 +1203,15 @@ async function runHunt(h, card) {
       inner.className = "result-inner";
       const status = document.createElement("div");
       const n = data.total_rows ?? data.rows.length;   // true total from the warehouse
-      if (h.inventory) {
+      // A graded hunt below its cut-offs still lists its top rows, but raises no alarm.
+      const notFlagged = data.why?.severity === "low";
+      if (h.inventory || notFlagged) {
         // reference/inventory hunts list everything — neutral, not an alarm
         status.className = "result-status"; status.style.color = "var(--muted)";
         status.style.padding = "0 0 12px 0";
-        status.innerHTML = `<span>📋 ${n.toLocaleString()} row${n>1?'s':''} — this is a reference view; scan it for the outliers described above.</span>`;
+        status.innerHTML = notFlagged
+          ? `<span>✓ Not flagged. ${n.toLocaleString()} row${n>1?'s':''} listed below, with the reason.</span>`
+          : `<span>📋 ${n.toLocaleString()} row${n>1?'s':''} — this is a reference view; scan it for the outliers described above.</span>`;
       } else {
         status.className = "result-status found"; status.style.padding = "0 0 12px 0";
         status.innerHTML = `<span>⚠ ${n.toLocaleString()} row${n>1?'s':''} to review — see below.</span>`;

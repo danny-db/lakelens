@@ -435,7 +435,7 @@ def get_meta():
             "measure": h.get("measure"),
             "has_explainer": bool(h.get("explain_rubric") or h.get("explain_is_trend")),
             "caution": h.get("caution"),
-            "inventory": bool(h.get("inventory")),
+            "inventory": h["id"] not in catalogue.ALERT_SPECS,   # a reference view: the scan doesn't grade it
         }
 
     def measure_card(m):
