@@ -17,6 +17,7 @@ Some hunts scan 14 days of query history. So every query is submitted with
 a short server-side wait, then POLLED to completion via get_statement — no
 single request is ever held open long enough to be cut.
 """
+import json
 import os
 import re
 import logging
@@ -265,9 +266,9 @@ def _execute_sql(sql: str, client: WorkspaceClient, max_rows: Optional[int],
     }
 
 
-def _run_scalar(sql: str, client: WorkspaceClient) -> Optional[str]:
+def _run_scalar(sql: str, client: WorkspaceClient, params: Optional[list] = None) -> Optional[str]:
     """Run a one-cell query and return the single value (or None)."""
-    out = _run_sql(sql, client)
+    out = _run_sql(sql, client, params=params)
     if out["rows"] and out["rows"][0]:
         return out["rows"][0][0]
     return None
@@ -308,14 +309,9 @@ def _explainer_model(model: Optional[str]) -> str:
     return AI_ENDPOINT
 
 
-def _ai_explain(rubric: str, hunt_desc: str, rows_sql: str, client: WorkspaceClient,
-                model: Optional[str] = None) -> str:
-    """Ask the model for a neutral, cost-aware gloss over a hunt's top rows.
-    Mirrors the notebook's explainer: deterministic rubric injected, model only
-    narrates. Runs ai_query via SQL so it works under the `sql` scope. `model`
-    optionally overrides the endpoint (the UI model picker)."""
-    ep = _explainer_model(model)
-    prompt = (
+def _explain_prompt(rubric: str, hunt_desc: str) -> str:
+    """The explainer's instruction, which the rows (as JSON) follow."""
+    return (
         "You are a Databricks cost analyst. Interpret the result using THIS rubric: \""
         + rubric
         + "\" In 2-3 neutral sentences, explain what the result shows and whether it "
@@ -323,13 +319,32 @@ def _ai_explain(rubric: str, hunt_desc: str, rows_sql: str, client: WorkspaceCli
         "If the row list is empty, say the hunt found nothing notable this period. Hunt = "
         + hunt_desc + ". Rows: "
     )
-    esc_prompt = prompt.replace("\\", "\\\\").replace("'", "''")
+
+
+def _ai_explain(rubric: str, hunt_desc: str, rows_sql: str, client: WorkspaceClient,
+                model: Optional[str] = None) -> str:
+    """Ask the model for a neutral, cost-aware gloss over a hunt's top rows.
+    Mirrors the notebook's explainer: deterministic rubric injected, model only
+    narrates. Runs ai_query via SQL so it works under the `sql` scope. `model`
+    optionally overrides the endpoint (the UI model picker)."""
+    ep = _explainer_model(model)
+    esc_prompt = _explain_prompt(rubric, hunt_desc).replace("\\", "\\\\").replace("'", "''")
     wrapped = f"""
 SELECT ai_query('{ep}',
   CONCAT('{esc_prompt}', coalesce(to_json(collect_list(struct(t.*))), '[]'))) AS explanation
 FROM ( {rows_sql} ) t
 """
     return _run_scalar(wrapped, client) or "(no explanation returned)"
+
+
+def _ai_explain_rows(rubric: str, hunt_desc: str, rows: list, client: WorkspaceClient,
+                     model: Optional[str] = None) -> str:
+    """_ai_explain over rows the caller already holds (a scan's own hunt result). They go in as a
+    parameter, so the hunt doesn't run a second time inside ai_query."""
+    sql = f"SELECT ai_query('{_explainer_model(model)}', CONCAT(:prompt, :rows)) AS explanation"
+    params = [{"name": "prompt", "value": _explain_prompt(rubric, hunt_desc)},
+              {"name": "rows", "value": json.dumps(rows)}]
+    return _run_scalar(sql, client, params) or "(no explanation returned)"
 
 
 def _ai_explain_trend(instruction: str, rows_sql: str, client: WorkspaceClient,
@@ -770,8 +785,8 @@ def scan_start(request: Request, model: Optional[str] = None):
     who = request.headers.get("x-forwarded-email") or request.headers.get("x-forwarded-user") or ""
     # The model the explanations will use, recorded so the self-cost prices that model.
     explainer = _explainer_model(model)
-    def _explain_bound(rubric, desc, rows_sql, cli):
-        return _ai_explain(rubric, desc, rows_sql, cli, explainer)
+    def _explain_bound(rubric, desc, rows, cli):
+        return _ai_explain_rows(rubric, desc, rows, cli, explainer)
     scan_id, created = scan_engine.STORE.start_scan({
         "status": "starting", "total": 0, "done": 0, "clean": 0,
         "findings": [], "started_by": who, "model": explainer,
@@ -797,7 +812,7 @@ def scan_start(request: Request, model: Optional[str] = None):
 
     t = threading.Thread(
         target=scan_engine.run_scan,
-        args=(scan_id, client, _run_sql, _explain_bound, _bounded, logger),
+        args=(scan_id, client, _run_sql, _explain_bound, logger),
         kwargs={"on_complete": _save, "price": _price},
         daemon=True,
     )

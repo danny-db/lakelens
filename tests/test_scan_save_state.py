@@ -16,7 +16,7 @@ def finished_scan(on_complete):
     sid, _ = scan.STORE.start_scan({"status": "starting", "total": 0, "done": 0, "clean": 0,
                                     "findings": [], "started_by": ""})
     scan.run_scan(sid, None, lambda sql, client: {"columns": [], "rows": [], "total_rows": 0},
-                  lambda *a: None, lambda sql, n: sql, logging.getLogger("test"), on_complete=on_complete)
+                  lambda *a: None, logging.getLogger("test"), on_complete=on_complete)
     return scan.scan_view(sid)
 
 

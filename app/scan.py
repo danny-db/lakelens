@@ -465,15 +465,14 @@ def build_finding(hunt: dict, result: dict) -> Optional[dict]:
     }
 
 
-def run_scan(scan_id: str, client, run_sql: Callable, ai_explain: Callable, bounded: Callable,
+def run_scan(scan_id: str, client, run_sql: Callable, ai_explain: Callable,
              logger, on_complete: Optional[Callable] = None, price: Optional[Callable] = None) -> None:
     """Execute every alerting hunt, build findings, attach AI explanations.
     Runs on a background thread. Streams results into STORE as it goes so the
     frontend can render the queue progressively.
 
       run_sql(sql, client) -> {columns, rows, total_rows}
-      ai_explain(rubric, hunt_desc, rows_sql, client) -> str
-      bounded(sql, n) -> sql capped to top-n
+      ai_explain(rubric, hunt_desc, rows, client) -> str, rows = the hunt's top 10 as {column: value}
       on_complete(scan_id, client) -> called after the scan finishes (persist to Delta);
                                       returns None once saved, else why it wasn't
       price(scan_id, client, saved) -> the scan's self-cost, called once the save settles
@@ -493,14 +492,16 @@ def run_scan(scan_id: str, client, run_sql: Callable, ai_explain: Callable, boun
             if finding is None:
                 STORE.bump_progress(scan_id)
                 continue
-            # Attach the plain-English explanation (bounded input, same as the
-            # per-hunt explainer). If it fails, the finding still lands.
+            # Attach the plain-English explanation over the top 10 rows (the same input as the
+            # per-hunt explainer). If it fails, the finding still lands. The rows go in as fetched:
+            # re-running the hunt inside ai_query doubled the scan's warehouse time once most hunts
+            # raised a finding.
             try:
                 if h.get("explain_rubric") and h.get("explain_hunt_desc"):
-                    rows_sql = h.get("explain_sql") or bounded(h["sql"], 10)
+                    top = [dict(zip(result["columns"], r)) for r in result["rows"][:10]]
                     _e0 = _time.monotonic()
                     finding["explanation"] = ai_explain(
-                        h["explain_rubric"], h["explain_hunt_desc"], rows_sql, client)
+                        h["explain_rubric"], h["explain_hunt_desc"], top, client)
                     _add_wall(scan_id, (_time.monotonic() - _e0) * 1000.0)
                     with STORE._lock:
                         if scan_id in STORE.scans:
