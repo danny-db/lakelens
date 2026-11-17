@@ -1,0 +1,9 @@
+[
+  {
+    "where": "H24",
+    "field": "sql",
+    "literal": "0.5",
+    "kind": "definition",
+    "reason": "The collapse rule itself, not a magnitude: a MERGE target counts only if it normally skips at least half its files (base_share >= 0.5) and this week skips at most half of that (prune_share <= base_share / 2). Both bounds are dimensionless shares of a target's own files, so the rule scales with the table instead of hard-coding a size."
+  }
+]

@@ -1579,6 +1579,143 @@ ORDER BY dbus_last_7d DESC
 LIMIT 50
 """,
     },
+
+    # ── H24 · reads ────────────────────────────────────────────────────────────
+    {
+        "id": "H24",
+        "category": "reads",
+        "title": "Pruning collapse",
+        "eli5": "Watches each MERGE target's file-skipping: when a table that normally skips most of "
+                "its files suddenly stops, its MERGEs re-read everything and get slow and expensive. "
+                "This catches the drop the week it starts.",
+        "what": "Each row is a MERGE target whose file-skipping collapsed this week: it usually skipped "
+                "at least half its files (base_share, the median of its other recent weeks) and this "
+                "week skips less than half of that (prune_share). read_tib is what the target's MERGEs "
+                "read this week, and share_pct is its slice of the account's collapsed reads. Only "
+                "targets behind at least one hundredth of the week's MERGE reads count, so a collapse "
+                "on a tiny table does not cry wolf.",
+        "action": "Open the target's DESCRIBE HISTORY and look for a change to "
+                  "delta.dataSkippingStatsColumns or to its clustering columns near the collapse — a "
+                  "pipeline setup or a Predictive Optimization run can rewrite them. Restore the stats "
+                  "columns so they cover the columns the MERGE filters on, then re-cluster (or let "
+                  "Predictive Optimization do it). If the table's stats look right, diff the MERGE "
+                  "itself for a dropped filter.",
+        "measure": "M4",
+        "explain_hunt_desc": "MERGE targets whose file-skipping (data pruning) collapsed this week "
+                             "versus their own normal, and the reads that drove it",
+        "explain_rubric": (
+            "each row is a MERGE target (or the job, notebook or person behind it) whose file-skipping "
+            "collapsed: base_share is the share of files it usually skips (the median of its other four "
+            "weeks, always at least half for a row to appear) and prune_share is this week's share, "
+            "at most half of its normal. read_tib is what the target's MERGEs read this week; "
+            "share_pct is its share of the account's collapsed reads. Name the biggest targets first. "
+            "The usual causes: delta.dataSkippingStatsColumns rewritten to exclude the columns the "
+            "MERGE filters on (a pipeline setup or Predictive Optimization run can do this), clustering "
+            "columns changed, or a selective filter dropped from the MERGE. Suggest DESCRIBE HISTORY on "
+            "the target and checking what changed around the collapse."
+        ),
+        "sql": f"""
+WITH {ctes("job")},
+merges AS (
+  SELECT coalesce(merge_table, 'job ' || job_id, 'notebook ' || notebook_id, executed_by) AS merge_target,
+         merge_table, executed_by, workspace_id, job_id, read_bytes, read_files, pruned_files,
+         {_wk("start_time")} AS wk
+  FROM (
+    SELECT statement_text, executed_by, workspace_id, read_bytes, read_files, pruned_files, start_time,
+           nullif(regexp_extract(statement_text, '(?i)MERGE\\s+INTO\\s+([`\\w.]+)', 1), '') AS merge_table,
+           query_source.job_info.job_id AS job_id, query_source.notebook_id AS notebook_id
+    FROM system.query.history
+    WHERE statement_type = 'MERGE' AND read_files > 0
+      AND start_time >= current_timestamp() - INTERVAL 35 DAYS
+  )
+),
+by_week AS (
+  SELECT merge_target, wk, count(*) AS runs,
+         sum(read_bytes)/POW(1024,4) AS read_tib,
+         sum(read_files) AS read_files, sum(pruned_files) AS pruned_files,
+         CAST(sum(pruned_files) AS DOUBLE) / (sum(read_files) + sum(pruned_files)) AS prune_share,
+         max_by(executed_by, read_bytes) AS executed_by,
+         max(CASE WHEN merge_table IS NULL THEN job_id END) AS job_id,
+         max(workspace_id) AS workspace_id
+  FROM merges
+  GROUP BY 1, 2
+),
+totals AS (SELECT wk, sum(read_tib) AS acct_tib FROM by_week GROUP BY 1),
+normed AS (
+  SELECT a.merge_target, a.wk, a.runs, a.read_tib, a.read_files, a.pruned_files, a.prune_share,
+         a.executed_by, a.job_id, a.workspace_id,
+         percentile(b.prune_share, 0.5) AS base_share
+  FROM by_week a
+  JOIN by_week b ON b.merge_target = a.merge_target AND b.wk <> a.wk
+  GROUP BY a.merge_target, a.wk, a.runs, a.read_tib, a.read_files, a.pruned_files, a.prune_share,
+           a.executed_by, a.job_id, a.workspace_id
+),
+collapsed AS (
+  SELECT n.*
+  FROM normed n JOIN totals t ON t.wk = n.wk
+  WHERE n.base_share >= 0.5
+    AND n.prune_share <= n.base_share / 2
+    AND n.read_tib * 100 >= t.acct_tib
+),
+weekly AS (SELECT wk, sum(read_tib) AS v FROM collapsed GROUP BY 1),
+{_account_normal("weekly")},
+contrib AS (SELECT * FROM collapsed WHERE wk = 0)
+SELECT coalesce({JOB.tagged}, c.merge_target) AS merge_target, c.executed_by, c.runs,
+       round(c.read_tib, 3) AS read_tib, c.read_files, c.pruned_files,
+       round(c.prune_share, 3) AS prune_share, round(c.base_share, 3) AS base_share,
+       c.job_id, c.workspace_id,
+       {_vs_account("c.read_tib")}
+FROM contrib c {JOB.join} CROSS JOIN acct
+ORDER BY c.read_tib DESC
+LIMIT 20
+""",
+    },
+
+    # ── H25 · reads ────────────────────────────────────────────────────────────
+    {
+        "id": "H25",
+        "category": "reads",
+        "title": "Queries that never prune",
+        "eli5": "Lists the people and statement types whose queries skipped nothing this week — every "
+                "file they touched was read in full — ranked by how much they read.",
+        "what": "Each row is one person or service principal and statement type (SELECT or MERGE) whose "
+                "queries this week pruned zero files: no file-skipping at all. stmts is how many "
+                "queries, and read_gib and read_files are what they read. Skipping nothing is normal "
+                "on small or unfiltered reads, so this is a worklist, not an alert — start at the top, "
+                "where the reads are biggest, and check whether those tables are clustered on the "
+                "columns the queries filter by.",
+        "action": "Take the top rows and find their queries in system.query.history (filter by "
+                  "executed_by). For the tables they hit: turn on liquid clustering (or ZORDER) on the "
+                  "filter columns, make sure delta.dataSkippingStatsColumns covers those columns, and "
+                  "add a selective filter where the query has none. Re-run this hunt after the fix and "
+                  "watch the row drop down the list.",
+        "measure": "M4",
+        "explain_hunt_desc": "people and statement types whose queries pruned zero files this week "
+                             "(a redesign worklist, ranked by reads)",
+        "explain_rubric": (
+            "each row is one executed_by identity and statement type whose queries this week pruned "
+            "zero files. stmts is the query count, read_gib the volume read, read_files the files "
+            "touched. Zero pruning on a big reader means full scans: the fix is table clustering on "
+            "the filtered columns, stats columns that cover them, or a more selective query. This is a "
+            "worklist, not proven waste — small tables legitimately prune nothing, so weigh read_gib "
+            "before acting. Service principal rows show as UUIDs; map them to the app or job they "
+            "belong to."
+        ),
+        "sql": f"""
+SELECT statement_type, executed_by, count(*) AS stmts,
+       round(sum(read_bytes)/POW(1024,3), 1) AS read_gib,
+       sum(read_files) AS read_files
+FROM system.query.history
+WHERE start_time >= current_timestamp() - INTERVAL 7 DAYS
+  AND statement_type IN ('MERGE','SELECT')
+  AND read_files > 0
+  AND coalesce(from_result_cache, false) = false
+GROUP BY 1, 2
+HAVING sum(pruned_files) = 0
+ORDER BY read_gib DESC
+LIMIT 50
+""",
+    },
 ]
 
 # ── The measures (Prove page) ────────────────────────────────────────────────
@@ -2096,6 +2233,13 @@ ALERT_SPECS: dict[str, AlertSpec] = {
             "baseline": "median of the account's four prior 7-day totals",
             "summary": "Account's Predictive Optimization used {account} DBUs in the last 7 days, {x} its usual (normal ~{baseline}).",
             "new_summary": "Account has no prior history of Predictive Optimization yet ({account} DBUs in the last 7 days).",
+            "usd_col": None},
+    "H24": {"kind": "anomaly", "aggregate": "additive", "entity_col": "merge_target", "metric_col": "read_tib",
+            "metric_label": "Account reads through MERGE targets whose file-skipping collapsed this week",
+            "entity_noun": "MERGE target", "entity_nouns": "MERGE targets", "metric_noun": "read through collapsed MERGE targets", "unit": "tib",
+            "baseline": "median of the account's prior four weekly totals of reads through collapsed MERGE targets",
+            "summary": "Account read {account} this week through MERGE targets whose file-skipping collapsed, {x} its usual (normal ~{baseline}).",
+            "new_summary": "Account has no prior history of MERGE file-skipping collapses ({account} read through collapsed targets this week).",
             "usd_col": None},
 }
 

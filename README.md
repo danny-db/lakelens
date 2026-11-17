@@ -18,7 +18,7 @@ flowchart LR
 
     subgraph APP["Databricks App: LakeLens"]
         UI["Single-page UI<br/>static/index.html"] -->|/api/*| API["FastAPI<br/>app.py"]
-        API --> CAT["Cost catalogue<br/>23 hunts · 7 measures · 24 panels<br/>hunts.py · boards.py · tune.py"]
+        API --> CAT["Cost catalogue<br/>25 hunts · 7 measures · 24 panels<br/>hunts.py · boards.py · tune.py"]
         API --> SCAN["Scan engine<br/>scan.py (background thread)"]
         API --> TOOLS["Tagging · Tokenomics<br/>tagging.py · tokenomics.py"]
         API --> ASK["Ask (Genie One)<br/>genie_cost.py"]
@@ -55,20 +55,20 @@ flowchart LR
 |---|---|
 | 🚨 **Alerts** | **Run full cost scan** runs every hunt in the background and builds an alert queue: severity, plain-English explanation, recommended fix, and the measure that proves it. Work it as *acknowledge → in progress → resolve / dismiss*. Results are saved to Delta and shared. Each run is compared with the last (NEW / WORSE / BETTER / FLAT, or DEFINITION CHANGED when a hunt now measures something different, so the two numbers are not compared). It also shows what the scan itself cost, and exports to PDF. |
 | 📊 **Observability** | **Usage** (trend, SKU, workspace, AI forecast), **Jobs** (savings, low CPU, high memory, fixed workers, old DBR), **DBSQL** (by user, source, query, trend), **Model Serving** (batch, pay-per-token, provisioned, by endpoint), **Unit economics** (cost per query, per active user and per TiB under management as tiles, the inputs, a weekly trend and spend mix). |
-| ① **Spot** | The 23 hunts, grouped into 6 categories. Each card has a short summary, live results, an ✨ Explain button and PDF export. |
+| ① **Spot** | The 25 hunts, grouped into 6 categories. Each card has a short summary, live results, an ✨ Explain button and PDF export. |
 | ② **Tune** | 12 best-practice cards: job vs all-purpose compute, serverless, Photon, liquid clustering / PO / zstd, timeouts, policies, spot, AI guardrails, tagging, budgets. [Details](docs/CATALOGUE.md#tune-practices). |
 | ③ **Prove** | 7 measures that show the saving (see below). [Details](docs/CATALOGUE.md#measures). |
 | 🏷️ **Tagging** | Finds untagged warehouses, clusters and spend. You can set a tag in place (confirmed, runs as you). |
 | 💠 **Tokenomics** | Estimates AI cost before the bill: tokens → DBU → $ for every model this workspace serves, at Databricks' published rates and the list $/DBU of the SKUs this workspace bills on its own cloud, tier and region. Also the actual 30-day serving spend. |
 | 💬 **Ask** | Natural-language cost questions through Genie One. No setup. Each answer shows its SQL, a result table and a link to open it in Genie One. |
 
-### The 23 hunts
+### The 25 hunts
 
 | Category | Hunts |
 |---|---|
 | 🤖 AI & Model Serving | H0 Runaway AI spend |
 | 💤 Idle Compute | H3 Chatter keeps warehouses awake · H4 Warehouses that never sleep · H14 Idle cores · H16 Jobs on all-purpose compute · H18 Idle cores on interactive clusters · H19 Databricks Apps compute |
-| 📖 Heavy Reads & Spill | H1 Read amplification · H2 Disk spill · H6 Unusually heavy scan hours across the account · H21 Tables still on snappy (not zstd) |
+| 📖 Heavy Reads & Spill | H1 Read amplification · H2 Disk spill · H6 Unusually heavy scan hours across the account · H21 Tables still on snappy (not zstd) · H24 Pruning collapse · H25 Queries that never prune |
 | ⏱️ Long-Running & Repetitive | H5 Statements far longer than the account's usual · H7 Repeated identical queries (polling) |
 | ⚙️ Right-Sizing & Config | H8 Queue pressure vs capacity · H9 Warehouse config audit · H17 Auto-stop disabled · H22 Serverless jobs in performance-optimised mode |
 | 📈 Spend Trends & Attribution | H10 Spend by product (SKU) · H11 Jobs: weekly movers · H12 Jobs: who got slower? · H13 Cost per pipeline · H20 Frequently failing jobs · H23 Predictive Optimisation cost drivers |
