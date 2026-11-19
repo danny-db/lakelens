@@ -40,6 +40,14 @@ SEV_RANK = {"high": 0, "medium": 1, "low": 2, "info": 3}
 TRIAGE_STATES = ("new", "acknowledged", "in_progress", "resolved", "dismissed")
 
 
+def finding_sort_key(f: dict) -> tuple:
+    """One queue order for every view (live poll, saved scan, PDF). Most findings tie on
+    (severity, impact_usd) — no $ column — so without the metric + id tiebreakers their
+    order comes from wherever the list was built, and the saved-copy swap reshuffles it."""
+    return (SEV_RANK.get(f["severity"], 9), -(f["impact_usd"] or 0),
+            -(f["metric_num"] or 0), f["hunt_id"])
+
+
 class Store:
     """In-memory scan + triage store. Thread-safe for the app's needs.
     Swap this class for a Delta/Lakebase-backed one to persist across restarts."""
@@ -543,10 +551,7 @@ def scan_view(scan_id: str) -> Optional[dict]:
     rec = STORE.get_scan(scan_id)
     if not rec:
         return None
-    findings = sorted(
-        rec["findings"],
-        key=lambda f: (SEV_RANK.get(f["severity"], 9), -(f["impact_usd"] or 0)),
-    )
+    findings = sorted(rec["findings"], key=finding_sort_key)
     # refresh triage on each finding (an admin may have actioned mid-poll)
     for f in findings:
         f["triage"] = STORE.get_triage(f["hunt_id"])

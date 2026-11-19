@@ -838,8 +838,7 @@ def scan_latest(request: Request):
     triage = DELTA.all_triage(client)
     for f in current["findings"]:
         f["triage"] = triage.get(f["hunt_id"], {"status": "new", "note": "", "updated_by": ""})
-    current["findings"].sort(key=lambda f: (scan_engine.SEV_RANK.get(f["severity"], 9),
-                                            -(f["impact_usd"] or 0)))
+    current["findings"].sort(key=scan_engine.finding_sort_key)
     store_delta.compare_runs(current, previous)
     current["available"] = True
     current["status"] = "complete"
