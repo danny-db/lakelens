@@ -41,6 +41,7 @@ import tune as tune_content
 import tokenomics as token_content
 import scan as scan_engine
 import store_delta
+import store_lakebase
 import tagging as tagging_content
 import boards as boards_content
 import genie_cost
@@ -56,14 +57,23 @@ WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
 # The model-serving endpoint for the plain-English explainers. A cheap tier is plenty.
 # A scan's AI cost is priced from the rate card for whichever model it used (pricing.py).
 AI_ENDPOINT = os.getenv("AI_ENDPOINT", "databricks-gpt-6-luna")
-# Where scan results are persisted (shared, durable). The app
-# writes here AS THE LOGGED-IN USER, so they need CREATE on this catalog/schema.
-# REQUIRED: set RESULTS_CATALOG to a catalog the app's users can write to (e.g. a
-# dedicated `lakelens` catalog, or `main`). No default — must be set per workspace so
+# Where scan results are persisted (shared, durable) when no Lakebase instance is
+# configured (see LAKEBASE_INSTANCE below). The app writes here AS THE LOGGED-IN
+# USER, so they need CREATE on this catalog/schema. REQUIRED for Delta persistence:
+# set RESULTS_CATALOG to a catalog the app's users can write to (e.g. a dedicated
+# `lakelens` catalog, or `main`). No default — must be set per workspace so
 # we never silently write to someone else's catalog. If unset, persistence is skipped
 # (the app still runs; scans just aren't shared across users/restarts).
 RESULTS_CATALOG = os.getenv("RESULTS_CATALOG", "")
 RESULTS_SCHEMA = os.getenv("RESULTS_SCHEMA", "lakelens")
+# Lakebase (managed Postgres) scan history. When LAKEBASE_INSTANCE is set, the
+# scan store lives there: the APP'S OWN identity owns the tables (one shared
+# history, no per-user grants) and reads/writes are milliseconds, not a warehouse
+# round-trip. When unset, the Delta store above is used instead (the app's users
+# need CREATE on RESULTS_CATALOG), and with neither, persistence is skipped.
+LAKEBASE_INSTANCE = os.getenv("LAKEBASE_INSTANCE", "")
+LAKEBASE_DATABASE = os.getenv("LAKEBASE_DATABASE", "databricks_postgres")
+LAKEBASE_SCHEMA = os.getenv("LAKEBASE_SCHEMA", "lakelens")
 # How long the SQL engine may run before we start polling (seconds, 5-50 allowed).
 FIRST_WAIT = "30s"
 # How many times we poll after that, and the gap between polls (seconds).
@@ -284,9 +294,13 @@ def _write_for_store(sql: str, client, params=None) -> None:
     _run_sql(sql, client, max_rows=1, params=params)
 
 
-# Delta-backed shared store (created per-request with the OBO client). One instance
-# is cheap; it holds no state itself — the OBO client is passed into each call.
-DELTA = store_delta.DeltaStore(RESULTS_CATALOG, RESULTS_SCHEMA, _sql_for_store, _write_for_store)
+# Shared scan store: Lakebase when an instance is configured (the app SP owns the
+# tables, so writes don't depend on the calling user's permissions), else Delta via
+# the per-user OBO client. One instance is cheap; it holds no state itself.
+STORE = (store_lakebase.LakebaseStore(LAKEBASE_INSTANCE, LAKEBASE_DATABASE, LAKEBASE_SCHEMA,
+                                      lambda: sp_client or WorkspaceClient())
+         if LAKEBASE_INSTANCE
+         else store_delta.DeltaStore(RESULTS_CATALOG, RESULTS_SCHEMA, _sql_for_store, _write_for_store))
 
 
 def _bounded(sql: str, n: int = 10) -> str:
@@ -796,17 +810,17 @@ def scan_start(request: Request, model: Optional[str] = None):
 
     def _save(sid: str, cli: WorkspaceClient) -> Optional[str]:
         """Called on the scan thread when it finishes: write the run + findings to the
-        shared Delta store (best-effort). Returns None once saved, else why it wasn't."""
+        shared store (best-effort). Returns None once saved, else why it wasn't."""
         view = scan_engine.scan_view(sid)
         if not view:
             return "scan not found"
-        return None if DELTA.save_scan(cli, view) else DELTA.last_error
+        return None if STORE.save_scan(cli, view) else STORE.last_error
 
     def _price(sid: str, cli: WorkspaceClient, saved: bool) -> dict[str, Any]:
         """Called after the save settles: the scan's self-cost, attached to its saved run."""
         cost = _compute_scan_cost(scan_engine.scan_view(sid), cli)
-        if saved and not DELTA.save_cost(cli, sid, cost):
-            logger.warning(f"scan {sid}: self-cost not saved: {DELTA.last_error}")
+        if saved and not STORE.save_cost(cli, sid, cost):
+            logger.warning(f"scan {sid}: self-cost not saved: {STORE.last_error}")
         logger.info(f"scan {sid}: self-cost {cost.get('total_usd')} USD ({'attached' if saved else 'not saved'})")
         return cost
 
@@ -822,20 +836,20 @@ def scan_start(request: Request, model: Optional[str] = None):
 
 @app.get("/api/scan/latest")
 def scan_latest(request: Request):
-    """The latest persisted scan from the shared Delta store, WITH run-over-run
+    """The latest persisted scan from the shared store, WITH run-over-run
     comparison against the prior run. This is what the Alerts tab loads on open, so
     every user sees the same durable view (survives restarts). Returns
     {available: false} if nothing is persisted yet (or the store isn't writable)."""
     client = _client_for(request)
-    ids = DELTA.latest_two_run_ids(client)
+    ids = STORE.latest_two_run_ids(client)
     if not ids:
-        return {"available": False, "store_error": DELTA.last_error}
-    current = DELTA.load_run(client, ids[0])
+        return {"available": False, "store_error": STORE.last_error}
+    current = STORE.load_run(client, ids[0])
     if not current:
-        return {"available": False, "store_error": DELTA.last_error}
-    previous = DELTA.load_run(client, ids[1]) if len(ids) > 1 else None
+        return {"available": False, "store_error": STORE.last_error}
+    previous = STORE.load_run(client, ids[1]) if len(ids) > 1 else None
     # merge shared triage + sort + compare
-    triage = DELTA.all_triage(client)
+    triage = STORE.all_triage(client)
     for f in current["findings"]:
         f["triage"] = triage.get(f["hunt_id"], {"status": "new", "note": "", "updated_by": ""})
     current["findings"].sort(key=scan_engine.finding_sort_key)
@@ -1001,9 +1015,9 @@ def finding_triage(hunt_id: str, body: TriageUpdate, request: Request):
     who = request.headers.get("x-forwarded-email") or request.headers.get("x-forwarded-user") or ""
     client = _client_for(request)
     rec = scan_engine.STORE.set_triage(hunt_id, body.status, body.note, who)  # in-memory (fast path)
-    persisted = DELTA.set_triage(client, hunt_id, body.status, body.note, who)  # shared/durable
+    persisted = STORE.set_triage(client, hunt_id, body.status, body.note, who)  # shared/durable
     return {"hunt_id": hunt_id, **rec, "persisted": persisted,
-            "store_error": None if persisted else DELTA.last_error}
+            "store_error": None if persisted else STORE.last_error}
 
 
 # ── API: Tokenomics live SQL (this workspace's prices + actual spend) ────────

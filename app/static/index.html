@@ -1515,9 +1515,17 @@ function exportAlertsReport() {
 }
 
 async function loadLatestScan() {
+  const before = SCAN;   // a scan that starts while this read is in flight must not be clobbered
   try {
     const d = await (await fetch("/api/scan/latest")).json();
     if (!d || !d.available) return;   // nothing persisted yet → leave the empty state
+    if (SCAN !== before) {
+      // A scan started (or a fresher load landed) while this read was in flight. Painting the
+      // stale saved run over the live one flashes its trend badges and hijacks the poll's scan
+      // id. Skip the render; just teach the shared-view fallback what "newer" means.
+      if (SCAN.baselineScanId == null) SCAN.baselineScanId = d.scan_id;
+      return;
+    }
     SCAN = { id: d.scan_id, poll: null, findings: d.findings, status: "complete", meta: d };
     $("#alertEmpty").style.display = "none";
     $("#alertFilters").style.display = d.findings.length ? "flex" : "none";
@@ -1639,12 +1647,13 @@ function pollLatestUntilDone() {
   SCAN.mode = "latest";
   clearInterval(SCAN.poll); SCAN.poll = null;
   $("#scanProgressLabel").textContent = "Scan running on the workspace — waiting for the shared result…";
-  const startedWith = SCAN.baselineScanId || null;
   SCAN.poll = setInterval(async () => {
     if (SCAN.finished) { clearInterval(SCAN.poll); SCAN.poll = null; return; }
     try {
       const d = await (await fetch("/api/scan/latest")).json();
-      if (d && d.available && d.scan_id && d.scan_id !== startedWith) {
+      // The baseline is read at compare time: a boot load that lands late hands it off
+      // (see loadLatestScan), so it may only exist from now on.
+      if (d && d.available && d.scan_id && d.scan_id !== SCAN.baselineScanId) {
         clearInterval(SCAN.poll); SCAN.poll = null;
         finishScan(d, false);
       }

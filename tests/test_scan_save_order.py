@@ -21,13 +21,13 @@ class SaveBeforeCost(unittest.TestCase):
     def setUp(self):
         import app
         self.app, self.events, self.saved_while_pricing = app, [], "never priced"
-        self.real = (app._run_sql, app._compute_scan_cost, app.DELTA)
+        self.real = (app._run_sql, app._compute_scan_cost, app.STORE)
         app._run_sql = lambda sql, client, max_rows=None, params=None: {"columns": [], "rows": [], "total_rows": 0}
         app._compute_scan_cost = self.compute_cost
-        app.DELTA = SimpleNamespace(save_scan=self.save_scan, save_cost=self.save_cost, last_error=None)
+        app.STORE = SimpleNamespace(save_scan=self.save_scan, save_cost=self.save_cost, last_error=None)
 
     def tearDown(self):
-        self.app._run_sql, self.app._compute_scan_cost, self.app.DELTA = self.real
+        self.app._run_sql, self.app._compute_scan_cost, self.app.STORE = self.real
 
     def save_scan(self, client, view, *cost):
         self.events.append("save")
